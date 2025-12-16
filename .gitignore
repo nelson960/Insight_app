@@ -46,3 +46,6 @@ target/
 *.md
 .env
 .env.*
+
+samples/
+*.pdf
