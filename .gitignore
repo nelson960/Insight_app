@@ -1,0 +1,48 @@
+# ---- Local data / runtime state ----
+/storage/
+/models/
+/backend/em_models/
+*.kv
+*.enc
+*.sqlite
+*.sqlite3
+*.db
+
+# ---- Logs / traces ----
+*.log
+*.log.*
+/logs/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pycache_tmp/
+
+# ---- Node / frontend ----
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.vite/
+**/.vite/
+.turbo/
+**/.turbo/
+
+# ---- Rust / Tauri ----
+target/
+**/target/
+
+# ---- Editor / OS ----
+.DS_Store
+.idea/
+.vscode/
+
+# ---- Misc ----
+*.md
+.env
+.env.*
