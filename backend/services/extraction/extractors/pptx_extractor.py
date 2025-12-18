@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Optional
 
 from ..base import ExtractedDocument, ExtractionError, SimpleExtractor
-from ..normalizer import normalize_text
 
 try:
     from pptx import Presentation  # type: ignore
@@ -40,7 +39,7 @@ class PptxExtractor(SimpleExtractor):
             "content_type": mime_type,
         }
         logger.debug("PPTX extraction processed %d slides for %s", metadata["slide_count"], file_path)
-        return ExtractedDocument(text=normalize_text("\n".join(texts)), metadata=metadata)
+        return ExtractedDocument(text="\n".join(texts), metadata=metadata)
 
 
 __all__ = ["PptxExtractor"]

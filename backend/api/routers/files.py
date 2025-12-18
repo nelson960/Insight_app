@@ -12,6 +12,7 @@ from backend.api.deps import AppDependencies
 from backend.services.ingestion import IngestionRequest, FilePolicy
 from backend.services.extraction.detector import detect_mime_type
 from backend.services.security import encrypt_bytes
+from backend.services.extraction.service import blocks_from_text
 
 import logging
 
@@ -155,3 +156,68 @@ async def ingest_paths(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=400, detail="No valid paths provided")
 
     return {"files": stored_files}
+
+
+@router.get("/chat/{chat_id}")
+async def list_files_for_chat(chat_id: str):
+    """
+    List files associated with a chat (used by the desktop Documents pane).
+    """
+    store, _ = AppDependencies.storage()
+    rows = store.list_files_for_chat(chat_id)
+    files: list[dict[str, object]] = []
+    for row in rows:
+        file_id = row.get("id")
+        if not isinstance(file_id, str) or not file_id:
+            continue
+        record = store.get_file(file_id) or {}
+        files.append(
+            {
+                "file_id": file_id,
+                "filename": record.get("filename") or row.get("filename") or "",
+                "mime": record.get("mime") or "",
+                "size_bytes": record.get("size_bytes") or 0,
+                "status": record.get("status") or "",
+                "pages": record.get("pages"),
+            }
+        )
+    return {"files": files}
+
+@router.get("/extracted/{file_id}")
+async def get_extracted_view(file_id: str):
+    """
+    Return a display-ready extracted representation for a file.
+
+    The desktop UI should render these blocks instead of attempting to embed PDFs/DOCX directly.
+    """
+    store, _ = AppDependencies.storage()
+    record = store.get_file(file_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="file not found")
+
+    file_text = store.get_file_text(file_id) or {}
+    blocks = file_text.get("blocks") or []
+    plain_text = file_text.get("plain_text") or ""
+
+    # Backfill for older ingestions: reconstruct from stored chunks if we don't have
+    # persisted extraction output yet.
+    if not blocks and not plain_text:
+        chunk_texts = store.fetch_chunk_texts_for_file(file_id)
+        if chunk_texts:
+            reconstructed = "\n\n".join(chunk_texts)
+            extracted_blocks = [
+                {"kind": b.kind, "text": b.text, "metadata": b.metadata} for b in blocks_from_text(reconstructed)
+            ]
+            store.upsert_file_text(file_id, text=reconstructed, blocks=extracted_blocks)
+            blocks = extracted_blocks
+            plain_text = reconstructed
+
+    return {
+        "file_id": file_id,
+        "filename": record.get("filename") or "",
+        "mime": record.get("mime") or "application/octet-stream",
+        "status": record.get("status") or "",
+        "pages": record.get("pages"),
+        "blocks": blocks,
+        "plain_text": plain_text,
+    }

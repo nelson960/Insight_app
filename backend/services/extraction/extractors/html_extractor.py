@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Optional
 
 from ..base import ExtractedDocument, ExtractionError, SimpleExtractor
-from ..normalizer import normalize_text
 
 try:
     from bs4 import BeautifulSoup  # type: ignore
@@ -34,7 +33,7 @@ class HtmlExtractor(SimpleExtractor):
             "content_type": mime_type or "text/html",
         }
         logger.debug("HTML extraction captured title=%s for %s", metadata["title"], file_path)
-        return ExtractedDocument(text=normalize_text(extracted), metadata=metadata)
+        return ExtractedDocument(text=extracted, metadata=metadata)
 
 
 __all__ = ["HtmlExtractor"]

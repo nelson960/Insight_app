@@ -65,6 +65,17 @@ class SQLiteMetadataStore:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS file_text (
+                file_id TEXT PRIMARY KEY,
+                blocks_json TEXT,
+                plain_text TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 job_type TEXT,
@@ -320,6 +331,43 @@ class SQLiteMetadataStore:
             )
             self._connection.commit()
 
+    def upsert_file_text(self, file_id: str, *, text: str, blocks: Sequence[dict]) -> None:
+        now = _now_iso()
+        blocks_json = json.dumps(list(blocks) if blocks else [])
+        with self._lock:
+            cursor = self._connection.execute("SELECT created_at FROM file_text WHERE file_id=?", (file_id,))
+            row = cursor.fetchone()
+            created_at = row["created_at"] if row else now
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO file_text (file_id, blocks_json, plain_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (file_id, blocks_json, text or "", created_at, now),
+            )
+            self._connection.commit()
+
+    def get_file_text(self, file_id: str) -> Optional[dict[str, object]]:
+        cursor = self._connection.execute(
+            "SELECT file_id, blocks_json, plain_text, created_at, updated_at FROM file_text WHERE file_id=?",
+            (file_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        blocks = []
+        try:
+            blocks = json.loads(row["blocks_json"]) if row["blocks_json"] else []
+        except Exception:
+            blocks = []
+        return {
+            "file_id": row["file_id"],
+            "blocks": blocks,
+            "plain_text": row["plain_text"] or "",
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
     def stage_chunks(
         self,
         file_id: str,
@@ -521,6 +569,26 @@ class SQLiteMetadataStore:
                 )
         return results
 
+    def fetch_chunk_texts_for_file(self, file_id: str, *, limit: Optional[int] = None) -> list[str]:
+        sql = """
+            SELECT text
+            FROM chunks
+            WHERE file_id=?
+            ORDER BY seq ASC
+        """
+        params: list[object] = [file_id]
+        if isinstance(limit, int) and limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+        cursor = self._connection.execute(sql, tuple(params))
+        rows = cursor.fetchall()
+        out: list[str] = []
+        for row in rows:
+            t = row["text"] if isinstance(row, sqlite3.Row) else row[0]
+            if isinstance(t, str) and t.strip():
+                out.append(t)
+        return out
+
     def bump_chunk_usage(self, _chunk_ids: Sequence[str], _weight: int = 1) -> None:  # pragma: no cover - usage accounting not required
         return
 
@@ -547,6 +615,14 @@ class SQLiteMetadataStore:
         return [dict(row) for row in cursor.fetchall()]
 
     def delete_files_for_chat(self, chat_id: str) -> int:
+        # Also delete extracted text payloads for files tied to this chat.
+        file_ids = [f.get("id") for f in self.list_files_for_chat(chat_id)]
+        ids = [x for x in file_ids if isinstance(x, str) and x]
+        if ids:
+            placeholders = ",".join(["?"] * len(ids))
+            with self._lock:
+                self._connection.execute(f"DELETE FROM file_text WHERE file_id IN ({placeholders})", ids)
+                self._connection.commit()
         with self._lock:
             cur = self._connection.execute("DELETE FROM files WHERE chat_id=?", (chat_id,))
             self._connection.commit()

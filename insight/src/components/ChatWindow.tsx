@@ -15,10 +15,19 @@ type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   attachments?: string[];
+  selection?: { text: string; file_id?: string; page?: number };
+  focus_document_id?: string;
 };
 
 type Props = {
   chatId: string | null;
+  active?: boolean;
+  embedded?: boolean;
+  showTopbar?: boolean;
+  activeDocumentId?: string | null;
+  selection?: { file_id: string; text: string } | null;
+  onClearSelection?: () => void;
+  onRequestDocsRefresh?: () => void;
 };
 
 type ContextStatus = {
@@ -29,7 +38,16 @@ type ContextStatus = {
   compacted?: boolean;
 };
 
-export function ChatWindow({ chatId }: Props) {
+export function ChatWindow({
+  chatId,
+  active = true,
+  embedded = false,
+  showTopbar = true,
+  activeDocumentId = null,
+  selection = null,
+  onClearSelection,
+  onRequestDocsRefresh,
+}: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -48,6 +66,17 @@ export function ChatWindow({ chatId }: Props) {
   const contextReqSeqRef = useRef(0);
   const inputElRef = useRef<HTMLTextAreaElement | null>(null);
   const INPUT_MAX_HEIGHT_PX = 120;
+
+  useEffect(() => {
+    function onFocusChat(e: Event) {
+      const ce = e as CustomEvent;
+      const targetChatId = ce?.detail?.chatId;
+      if (typeof targetChatId === "string" && chatId && targetChatId !== chatId) return;
+      inputElRef.current?.focus?.();
+    }
+    window.addEventListener("insight:focus-chat", onFocusChat as any);
+    return () => window.removeEventListener("insight:focus-chat", onFocusChat as any);
+  }, [chatId]);
 
   function autosizeInput() {
     const el = inputElRef.current;
@@ -128,7 +157,15 @@ export function ChatWindow({ chatId }: Props) {
     let cancelled = false;
     async function loadHistory() {
       try {
-        const res = await invoke<{ messages?: { role: string; content: string; attachments?: string[] }[] }>(
+        const res = await invoke<{
+          messages?: {
+            role: string;
+            content: string;
+            attachments?: string[];
+            selection?: { text: string; file_id?: string; page?: number };
+            focus_document_id?: string;
+          }[];
+        }>(
           "get_session_messages",
           { chatId }
         );
@@ -138,6 +175,9 @@ export function ChatWindow({ chatId }: Props) {
             role: m.role === "assistant" ? "assistant" : "user",
             content: m.content ?? "",
             attachments: Array.isArray(m.attachments) ? m.attachments : undefined,
+            selection: m.selection && typeof m.selection === "object" ? m.selection : undefined,
+            focus_document_id:
+              typeof m.focus_document_id === "string" ? m.focus_document_id : undefined,
           })) as ChatMessage[];
           setMessages(msgs);
         }
@@ -170,6 +210,7 @@ export function ChatWindow({ chatId }: Props) {
   }
 
   useEffect(() => {
+    if (!active) return;
     if (!chatId) return;
     let cancelled = false;
     // Show a neutral state immediately so we don't display the previous chat's status.
@@ -177,8 +218,8 @@ export function ChatWindow({ chatId }: Props) {
 
     // Avoid calling engine_request while any stream is still finalizing; the stream reader
     // can consume non-stream responses and make engine_request hang.
-    const active = getActiveStream();
-    if (!active) {
+    const activeStream = getActiveStream();
+    if (!activeStream) {
       refreshContextStatus(chatId).catch(() => {
         if (!cancelled) setContextStatus(null);
       });
@@ -188,7 +229,7 @@ export function ChatWindow({ chatId }: Props) {
     }
 
     // If another chat is still streaming/finalizing, wait for it to end then refresh.
-    waitForStreamToFinish(active.requestId)
+    waitForStreamToFinish(activeStream.requestId)
       .then(() => {
         if (!cancelled && chatId) {
           refreshContextStatus(chatId).catch(() => {
@@ -227,7 +268,7 @@ export function ChatWindow({ chatId }: Props) {
       setError("Select or create a chat first.");
       return;
     }
-    if (isStreaming) return;
+    if (isStreaming || !active) return;
 
     setError(null);
     try {
@@ -280,7 +321,7 @@ export function ChatWindow({ chatId }: Props) {
 
   async function sendMessage() {
     const trimmed = input.trim();
-    if (!trimmed || isStreaming) return;
+    if (!trimmed || isStreaming || !active) return;
     if (!chatId) {
       setError("Select or create a chat first.");
       return;
@@ -292,13 +333,13 @@ export function ChatWindow({ chatId }: Props) {
     // If any stream is still active/finalizing, we must wait before starting a new one.
     // Otherwise the old Rust stream reader can still be holding stdout and swallow
     // the new stream's tokens (appears as "no response").
-    const active = getActiveStream();
-    if (active) {
+    const activeStream = getActiveStream();
+    if (activeStream) {
       try {
         setIsStreaming(true);
-        if (active.chatId === chatId) {
+        if (activeStream.chatId === chatId) {
           // Same chat: likely user pressed Stop. Don't spam cancel; just wait for stream_end.
-          await waitForStreamToFinish(active.requestId);
+          await waitForStreamToFinish(activeStream.requestId);
         } else {
           // Different chat: cancel and wait for clean stream_end before starting.
           await cancelActiveStreamAndWait();
@@ -312,17 +353,23 @@ export function ChatWindow({ chatId }: Props) {
 
     const attached = attachedPaths.slice();
     const attachedNames = attached.map(filenameFromPath);
+    const selectionPayload = selection?.text
+      ? { text: selection.text, file_id: selection.file_id }
+      : undefined;
 
     const userMsg: ChatMessage = {
       id: `${Date.now()}-user`,
       role: "user",
       content: trimmed,
       attachments: attachedNames.length ? attachedNames : undefined,
+      selection: selectionPayload,
     };
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setIsStreaming(true);
     setAttachedPaths([]);
+    // Selection is a one-shot context for this turn; clear the input-bar snippet after send.
+    if (selectionPayload) onClearSelection?.();
 
     const assistantId = `${Date.now()}-assistant`;
     assistantIdRef.current = assistantId;
@@ -339,6 +386,7 @@ export function ChatWindow({ chatId }: Props) {
           : `${Date.now()}-${Math.random()}`) as string;
       activeRequestIdRef.current = requestId;
       const paths = attached;
+      const documents = activeDocumentId ? [activeDocumentId] : undefined;
 
       unlistenTokenRef.current = await listen<{ token: string; chat_id?: string; request_id?: string }>(
         "llm-token",
@@ -379,6 +427,7 @@ export function ChatWindow({ chatId }: Props) {
           if (chatId) {
             refreshContextStatus(chatId).catch(() => {});
           }
+          if (onRequestDocsRefresh) onRequestDocsRefresh();
         }
       );
 
@@ -398,11 +447,21 @@ export function ChatWindow({ chatId }: Props) {
           if (chatId) {
             refreshContextStatus(chatId).catch(() => {});
           }
+          if (onRequestDocsRefresh) onRequestDocsRefresh();
         }
       );
 
       // Starts stream in the background and returns immediately.
-      await engineStreamChat({ chatId, query: trimmed, requestId, paths });
+      await engineStreamChat({
+        chatId,
+        query: trimmed,
+        requestId,
+        paths,
+        documents,
+        focusDocumentId: activeDocumentId,
+        selection: selectionPayload,
+      });
+      if (paths.length && onRequestDocsRefresh) onRequestDocsRefresh();
     } catch (err: any) {
       console.error("Chat error", err);
       setError(err?.message ?? String(err));
@@ -414,12 +473,13 @@ export function ChatWindow({ chatId }: Props) {
   }
 
   async function stopStreaming() {
+    if (!active) return;
     const rid = activeRequestIdRef.current;
     if (!rid) {
       // Fallback: if another chat started a stream, still allow stop to cancel it.
-      const active = getActiveStream();
-      if (active) {
-        engineCancel(active.requestId).catch(() => {});
+      const activeStream = getActiveStream();
+      if (activeStream) {
+        engineCancel(activeStream.requestId).catch(() => {});
       }
       return;
     }
@@ -444,8 +504,8 @@ export function ChatWindow({ chatId }: Props) {
   }
 
   return (
-    <div className="chat-root">
-      <div className="chat-topbar" aria-hidden="true" />
+    <div className={`chat-root ${embedded ? "chat-root-embedded" : ""}`}>
+      {showTopbar ? <div className="chat-topbar" aria-hidden="true" /> : null}
 
       <div className="chat-messages">
         {messages.map((m) => (
@@ -454,6 +514,13 @@ export function ChatWindow({ chatId }: Props) {
               {m.role === "user" ? "You" : "Insight"}
             </div>
             <div className="chat-message-content">{m.content}</div>
+            {!!m.selection?.text && (
+              <div className="chat-message-selection">
+                <span className="chat-selection-chip" title={m.selection.text}>
+                  Selection
+                </span>
+              </div>
+            )}
             {!!m.attachments?.length && (
               <div className="chat-message-attachments">
                 {m.attachments.map((name) => (
@@ -494,25 +561,60 @@ export function ChatWindow({ chatId }: Props) {
 
       <div className="chat-input-row">
         <div className="chat-input-shell">
-          <button
-            className="chat-input-attach"
-            onClick={pickAttachments}
-            disabled={!chatId || isStreaming}
-            aria-label="Attach files"
-            title={attachedPaths.length ? `Attached: ${attachedPaths.length}` : "Attach files"}
-            type="button"
-          >
-            +
-          </button>
-          <textarea
-            className="chat-input"
-            placeholder="Ask Insight anything about your data…"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            rows={1}
-            ref={inputElRef}
-          />
+          {selection?.text ? (
+            <div
+              className="chat-input-selection"
+              title={selection.text}
+              onClick={() => inputElRef.current?.focus?.()}
+              role="note"
+              aria-label="Selected excerpt"
+            >
+              <div className="chat-input-selection-text">
+                {(() => {
+                  const cleaned = selection.text.replace(/\s+/g, " ").trim();
+                  const parts = cleaned.split(" ").filter(Boolean);
+                  const preview = parts.slice(0, 5).join(" ");
+                  return parts.length > 5 ? `${preview}…` : preview;
+                })()}
+              </div>
+              <button
+                className="chat-input-selection-clear"
+                type="button"
+                aria-label="Clear selection"
+                title="Clear selection"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onClearSelection?.();
+                }}
+              >
+                ×
+              </button>
+            </div>
+          ) : null}
+
+          <div className="chat-input-main">
+            <button
+              className="chat-input-attach"
+              onClick={pickAttachments}
+              disabled={!chatId || isStreaming || !active}
+              aria-label="Attach files"
+              title={attachedPaths.length ? `Attached: ${attachedPaths.length}` : "Attach files"}
+              type="button"
+            >
+              +
+            </button>
+            <textarea
+              className="chat-input"
+              placeholder="Ask Insight anything about your data…"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              rows={1}
+              ref={inputElRef}
+              readOnly={!active}
+            />
+          </div>
         </div>
         <div className="chat-context-wrap">
           {contextStatus ? (
@@ -586,6 +688,7 @@ export function ChatWindow({ chatId }: Props) {
           className="chat-send-btn"
           onClick={isStreaming ? stopStreaming : sendMessage}
           disabled={
+            !active ||
             (isStreaming && !activeRequestIdRef.current) ||
             (!isStreaming && !input.trim())
           }

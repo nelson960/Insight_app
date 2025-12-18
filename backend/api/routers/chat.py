@@ -154,6 +154,7 @@ async def _upload_and_chat_internal(chat_id: str, query: str, files: List[Upload
             query=query,
             documents=doc_ids,
             documents_text=doc_texts,
+            focus_document_id=(doc_ids[0] if doc_ids else None),
         )
         result = service.handle_request(req)
         resp: Dict[str, Any] = {
@@ -271,6 +272,8 @@ async def _ingest_paths_for_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload["documents"] = doc_ids
         payload["documents_text"] = doc_texts
         payload["attachments"] = attachment_names
+        # If no explicit focus was provided, default focus to the first ingested doc.
+        payload.setdefault("focus_document_id", doc_ids[0] if doc_ids else None)
         return payload
 
 
@@ -534,12 +537,23 @@ def _build_request(payload: Dict[str, Any]) -> PlannerRequest:
         docs = payload.get("documents")
         if docs is None:
             docs = payload.get("document_ids") or []
+        focus_document_id = (
+            payload.get("focus_document_id")
+            or payload.get("focus_file_id")
+            or payload.get("active_document_id")
+            or payload.get("focus_document")
+        )
+        selection = payload.get("selection")
+        if selection is not None and not isinstance(selection, dict):
+            selection = None
         return PlannerRequest(
             chat_id=payload["chat_id"],
             query=payload["query"],
             documents=docs,
             documents_text=payload.get("documents_text", []),
             attachments=payload.get("attachments", []) or [],
+            focus_document_id=focus_document_id if isinstance(focus_document_id, str) else None,
+            selection=selection,
             screenshot=payload.get("screenshot"),
             request_id=payload.get("request_id"),
         )

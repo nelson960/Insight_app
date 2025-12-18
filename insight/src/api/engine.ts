@@ -127,8 +127,11 @@ export async function engineStreamChat(opts: {
   query: string;
   requestId: string;
   paths?: string[];
+  documents?: string[];
+  focusDocumentId?: string | null;
+  selection?: { text: string; file_id?: string; page?: number } | null;
 }) {
-  const { chatId, query, requestId, paths } = opts;
+  const { chatId, query, requestId, paths, documents, focusDocumentId, selection } = opts;
   await ensureStreamBridge();
   activeStream = { requestId, chatId };
   return invoke("engine_stream_request", {
@@ -137,6 +140,9 @@ export async function engineStreamChat(opts: {
       chat_id: chatId,
       query,
       stream: true,
+      ...(focusDocumentId ? { focus_document_id: focusDocumentId } : {}),
+      ...(selection && selection.text ? { selection } : {}),
+      ...(documents && documents.length ? { documents } : {}),
       ...(paths && paths.length ? { paths } : {}),
     },
   });

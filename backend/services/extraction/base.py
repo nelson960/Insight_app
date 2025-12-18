@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Protocol
 
@@ -10,11 +10,30 @@ class ExtractionError(RuntimeError):
 
 
 @dataclass
+class ExtractedBlock:
+    """
+    A structured, display-ready block of extracted content.
+
+    `kind` is a small stable enum-ish string so the UI can render it consistently:
+      - "heading"
+      - "paragraph"
+      - "list"
+      - "code"
+      - "page_break"
+    """
+
+    kind: str
+    text: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ExtractedDocument:
     """Structured output returned by each extractor."""
 
     text: str
     metadata: Dict[str, Any]
+    blocks: list[ExtractedBlock] = field(default_factory=list)
 
 
 class BaseExtractor(Protocol):
@@ -52,4 +71,4 @@ class SimpleExtractor:
         raise NotImplementedError("SimpleExtractor subclasses must implement extract()")
 
 
-__all__ = ["BaseExtractor", "ExtractedDocument", "ExtractionError", "SimpleExtractor"]
+__all__ = ["BaseExtractor", "ExtractedBlock", "ExtractedDocument", "ExtractionError", "SimpleExtractor"]

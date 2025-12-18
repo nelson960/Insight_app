@@ -48,6 +48,9 @@ class MetadataStore(ChunkStore, Protocol):
     def record_extraction(self, file_id: str, *, pages: int | None, metadata: dict[str, object]) -> None:
         ...
 
+    def upsert_file_text(self, file_id: str, *, text: str, blocks: Sequence[dict]) -> None:
+        ...
+
     def stage_chunks(
         self,
         file_id: str,
@@ -131,6 +134,11 @@ class IngestionPipeline:
             ctx.extraction = self._run_extraction(ctx.normalized)
             if cancel_check and cancel_check():
                 raise IngestionCancelled("cancelled after extraction")
+            self._metadata_store.upsert_file_text(
+                request.file_id,
+                text=ctx.extraction.plain_text,
+                blocks=ctx.extraction.blocks,
+            )
             self._metadata_store.record_extraction(
                 request.file_id,
                 pages=ctx.extraction.pages,
@@ -218,11 +226,17 @@ class IngestionPipeline:
         except ExtractionError:
             raise
         segments = self._segment_text(extracted)
+        blocks = [
+            {"kind": b.kind, "text": b.text, "metadata": b.metadata}
+            for b in (getattr(extracted, "blocks", None) or [])
+        ]
         return ExtractionResult(
             file_id=document.file_id,
             text_segments=segments,
             pages=extracted.metadata.get("page_count"),
             metadata=extracted.metadata,
+            plain_text=extracted.text,
+            blocks=blocks,
         )
 
     @staticmethod

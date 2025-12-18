@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Optional
 
 from ..base import ExtractedDocument, ExtractionError, SimpleExtractor
-from ..normalizer import normalize_text
 
 try:
     from PIL import Image  # type: ignore
@@ -37,7 +36,7 @@ class ImageExtractor(SimpleExtractor):
             "content_type": mime_type,
         }
         logger.debug("OCR extraction complete for %s (chars=%d)", file_path, len(text))
-        return ExtractedDocument(text=normalize_text(text), metadata=metadata)
+        return ExtractedDocument(text=text, metadata=metadata)
 
 
 __all__ = ["ImageExtractor"]

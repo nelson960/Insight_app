@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Optional
 
 from ..base import ExtractedDocument, ExtractionError, SimpleExtractor
-from ..normalizer import normalize_text
 
 try:
     from docx import Document  # type: ignore
@@ -37,7 +36,7 @@ class DocxExtractor(SimpleExtractor):
             "paragraph_count": len(paragraphs),
         }
         logger.debug("DOCX extraction produced %d paragraphs for %s", metadata["paragraph_count"], file_path)
-        return ExtractedDocument(text=normalize_text(text), metadata=metadata)
+        return ExtractedDocument(text=text, metadata=metadata)
 
 
 __all__ = ["DocxExtractor"]

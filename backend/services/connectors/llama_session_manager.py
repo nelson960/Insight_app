@@ -50,7 +50,21 @@ class LlamaSessionManager:
             n_gpu_layers=gpu_layers,
             chat_format=chat_format,
         )
-        self.ctx_size = ctx_size
+        # Always trust the runtime context size from llama_cpp (it may differ from the
+        # requested value if the backend clamps it). Using a mismatched value can cause
+        # hard failures when the prompt nears the true context limit.
+        actual_ctx = ctx_size
+        try:
+            actual_ctx = int(self.llm.n_ctx())
+        except Exception:
+            pass
+        if actual_ctx != ctx_size:
+            logger.warning("Requested ctx_size=%d but llama_cpp is using n_ctx=%d", ctx_size, actual_ctx)
+        self.ctx_size = actual_ctx
+        try:
+            logger.info("LlamaSessionManager model ready n_ctx=%d n_batch=%d", self.ctx_size, int(self.llm.n_batch))
+        except Exception:
+            pass
 
         # session_id -> {"state": bytes, "messages": List[Dict], ...}
         self.sessions: Dict[str, Dict[str, object]] = {}

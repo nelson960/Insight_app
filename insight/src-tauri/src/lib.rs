@@ -193,6 +193,8 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
         let (role, content_json) = row;
         let content: String;
         let mut attachments: Vec<String> = Vec::new();
+        let mut selection: Option<Value> = None;
+        let mut focus_document_id: Option<String> = None;
         match serde_json::from_str::<serde_json::Value>(&content_json) {
             Ok(v) => {
                 if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
@@ -209,17 +211,31 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
                         }
                     }
                 }
+                if let Some(sel) = v.get("selection") {
+                    if sel.is_object() {
+                        selection = Some(sel.clone());
+                    }
+                }
+                if let Some(fid) = v.get("focus_document_id").and_then(|x| x.as_str()) {
+                    focus_document_id = Some(fid.to_string());
+                }
             }
             Err(_) => {
                 // Fallback: treat as plain text
                 content = content_json.clone();
             }
         }
-        if attachments.is_empty() {
-            out.push(serde_json::json!({ "role": role, "content": content }));
-        } else {
-            out.push(serde_json::json!({ "role": role, "content": content, "attachments": attachments }));
+        let mut msg = serde_json::json!({ "role": role, "content": content });
+        if !attachments.is_empty() {
+            msg["attachments"] = serde_json::json!(attachments);
         }
+        if let Some(sel) = selection {
+            msg["selection"] = sel;
+        }
+        if let Some(fid) = focus_document_id {
+            msg["focus_document_id"] = serde_json::json!(fid);
+        }
+        out.push(msg);
     }
 
     Ok(serde_json::json!({ "messages": out }))
@@ -260,6 +276,7 @@ fn spawn_kv_watcher(app: tauri::AppHandle, kv_dir: PathBuf) -> notify::Result<Re
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python3".into());
             let engine = EngineProcess::spawn(&python_bin)

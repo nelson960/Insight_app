@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 # Minimal inline-doc budgeting defaults (backend-owned; no config system yet).
 INLINE_DOC_FRACTION = 0.30
 INLINE_DOC_MAX_TOKENS = 1500
+RAG_CONTEXT_FRACTION = 0.30
+RAG_CONTEXT_MAX_TOKENS = 1800
 
 
 def build_turn_prompt(
@@ -26,6 +28,7 @@ def build_turn_prompt(
     ltm_hits: List[MemoryHit],
     doc_texts: List[str],
     *,
+    selection: Optional[Dict[str, Any]] = None,
     turn_index: int = 0,
 ) -> str:
     first_turn = turn_index == 0
@@ -35,6 +38,23 @@ def build_turn_prompt(
     # Note: `system_hint` is injected as a system message into the session manager.
     # Do not duplicate it inside the per-turn user prompt.
     parts: List[str] = []
+    if selection and isinstance(selection, dict):
+        sel_text = selection.get("text")
+        if isinstance(sel_text, str) and sel_text.strip():
+            sel_file = selection.get("file_id") if isinstance(selection.get("file_id"), str) else None
+            sel_page = selection.get("page") if isinstance(selection.get("page"), int) else None
+            header = "Selected Excerpt (highest priority):"
+            if sel_file and sel_page:
+                header = f"Selected Excerpt (highest priority) from {sel_file} page {sel_page}:"
+            elif sel_file:
+                header = f"Selected Excerpt (highest priority) from {sel_file}:"
+            elif sel_page:
+                header = f"Selected Excerpt (highest priority) page {sel_page}:"
+            # Prevent extremely large selections from polluting context.
+            sel_trimmed = sel_text.strip()
+            if len(sel_trimmed) > 5000:
+                sel_trimmed = sel_trimmed[:5000] + "…"
+            parts.append(f"{header}\n{sel_trimmed}")
     parts.append(f"User Query:\n{user_message}" if first_turn else f"Follow-up Query:\n{user_message}")
     if mem_block:
         parts.append(f"Long-Term Memory:\n{mem_block}")
@@ -107,6 +127,63 @@ class InsightOrchestrator:
         )
         return []
 
+    def _list_chat_file_ids(self, chat_id: str) -> List[str]:
+        try:
+            rows = self.metadata_store.list_files_for_chat(chat_id)
+        except Exception:
+            return []
+        out: List[str] = []
+        for r in rows:
+            fid = r.get("id")
+            if isinstance(fid, str) and fid:
+                out.append(fid)
+        return out
+
+    def _apply_rag_budget(self, chat_id: str, rag_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not rag_hits:
+            return []
+
+        # Use the same context status mechanism as inline docs budgeting.
+        self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
+        try:
+            status = self.session_mgr.get_context_status(chat_id)
+            used = int(status.get("used_tokens") or 0)
+            capacity = int(status.get("capacity_tokens") or 0)
+        except Exception:
+            used = 0
+            capacity = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
+
+        remaining = max(0, capacity - used)
+        budget_tokens = min(int(remaining * RAG_CONTEXT_FRACTION), RAG_CONTEXT_MAX_TOKENS)
+        if budget_tokens <= 0:
+            return []
+
+        # Approximate chars budget (~4 chars/token).
+        budget_chars = max(0, budget_tokens * 4)
+        remaining_chars = budget_chars
+
+        trimmed: List[Dict[str, Any]] = []
+        for hit in rag_hits:
+            if remaining_chars <= 0:
+                break
+            text = (hit.get("text") or "")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if len(text) > remaining_chars:
+                text = text[:remaining_chars]
+            trimmed.append({**hit, "text": text})
+            remaining_chars -= len(text)
+
+        if len(trimmed) != len(rag_hits):
+            logger.info(
+                "RAG context trimmed chat=%s hits_in=%d hits_out=%d budget_tokens=%d",
+                chat_id,
+                len(rag_hits),
+                len(trimmed),
+                budget_tokens,
+            )
+        return trimmed
+
     def _persist_ui_message(
         self,
         *,
@@ -114,12 +191,24 @@ class InsightOrchestrator:
         role: str,
         text: str,
         attachments: Optional[List[str]] = None,
+        focus_document_id: Optional[str] = None,
+        selection: Optional[Dict[str, Any]] = None,
         mode: str = "chat",
         model: str = "llama_cpp",
     ) -> None:
         payload: Dict[str, Any] = {"text": text}
         if attachments:
             payload["attachments"] = attachments
+        if isinstance(focus_document_id, str) and focus_document_id:
+            payload["focus_document_id"] = focus_document_id
+        if isinstance(selection, dict) and selection.get("text"):
+            # Store a lightweight selection object for UI rehydration/debugging.
+            sel: Dict[str, Any] = {"text": str(selection.get("text"))}
+            if isinstance(selection.get("file_id"), str):
+                sel["file_id"] = selection.get("file_id")
+            if isinstance(selection.get("page"), int):
+                sel["page"] = selection.get("page")
+            payload["selection"] = sel
         message_id = f"msg_{uuid.uuid4().hex}"
         created_at = datetime.now(timezone.utc).isoformat()
         self.metadata_store.insert_message(
@@ -141,6 +230,8 @@ class InsightOrchestrator:
         documents: Optional[List[str]] = None,
         documents_text: Optional[List[str]] = None,
         attachments: Optional[List[str]] = None,
+        focus_document_id: Optional[str] = None,
+        selection: Optional[Dict[str, Any]] = None,
     ) -> str:
         start = time.perf_counter()
         documents = documents or []
@@ -150,16 +241,36 @@ class InsightOrchestrator:
         # Ensure deterministic session per chat_id (required even when no docs are attached).
         self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
 
-        ltm_hits = self.ltm_store.retrieve(chat_id, user_message, top_k=5)
+        ltm_k = 2 if selection else 5
+        ltm_hits = self.ltm_store.retrieve(chat_id, user_message, top_k=ltm_k)
         # If documents are provided, fetch their content; otherwise rely on RAG.
         doc_texts = documents_text or self._fetch_doc_texts(documents)
         doc_texts = self._apply_inline_doc_budget(chat_id, doc_texts)
+        sel_file_id = selection.get("file_id") if isinstance(selection, dict) and isinstance(selection.get("file_id"), str) else None
+        effective_focus = sel_file_id or (focus_document_id if isinstance(focus_document_id, str) and focus_document_id else None)
         if doc_texts:
-            rag_hits_raw = []
-        elif documents:
-            rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=documents, top_k=6)
+            rag_hits_raw: List[Dict[str, Any]] = []
         else:
-            rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=6)
+            primary_k = 4 if selection else 6
+            secondary_k = 1 if selection else 2
+            rag_hits_raw = []
+            if effective_focus:
+                rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=[effective_focus], top_k=primary_k))
+                # Low-priority "other docs" context (kept small to avoid dilution).
+                other_ids = [fid for fid in self._list_chat_file_ids(chat_id) if fid != effective_focus]
+                if other_ids:
+                    rag_hits_raw.extend(
+                        self.rag_store.retrieve(
+                            user_message,
+                            chat_id=chat_id,
+                            doc_ids=other_ids,
+                            top_k=secondary_k,
+                        )
+                    )
+            elif documents:
+                rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=documents, top_k=primary_k)
+            else:
+                rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k)
         selected_rag = self._dedup_rag(rag_hits_raw)
 
         # Turn index (exclude system messages)
@@ -171,6 +282,7 @@ class InsightOrchestrator:
             ltm_hits=ltm_hits,
             user_message=user_message,
             doc_texts=doc_texts,
+            selection=selection,
             turn_index=turn_index,
         )
         if not doc_texts and selected_rag:
@@ -179,7 +291,14 @@ class InsightOrchestrator:
 
         # Persist clean UI user message (not the giant turn_prompt).
         try:
-            self._persist_ui_message(chat_id=chat_id, role="user", text=user_message, attachments=attachments)
+            self._persist_ui_message(
+                chat_id=chat_id,
+                role="user",
+                text=user_message,
+                attachments=attachments,
+                focus_document_id=effective_focus,
+                selection=selection,
+            )
         except Exception:
             logger.exception("Failed to persist UI user message chat=%s", chat_id)
 
@@ -224,6 +343,8 @@ class InsightOrchestrator:
         documents: Optional[List[str]] = None,
         documents_text: Optional[List[str]] = None,
         attachments: Optional[List[str]] = None,
+        focus_document_id: Optional[str] = None,
+        selection: Optional[Dict[str, Any]] = None,
         *,
         request_id: Optional[str] = None,
     ):
@@ -237,16 +358,36 @@ class InsightOrchestrator:
         # Ensure deterministic session per chat_id (required even when no docs are attached).
         self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
 
-        ltm_hits = self.ltm_store.retrieve(chat_id, user_message, top_k=5)
+        ltm_k = 2 if selection else 5
+        ltm_hits = self.ltm_store.retrieve(chat_id, user_message, top_k=ltm_k)
         doc_texts = documents_text or self._fetch_doc_texts(documents)
         doc_texts = self._apply_inline_doc_budget(chat_id, doc_texts)
+        sel_file_id = selection.get("file_id") if isinstance(selection, dict) and isinstance(selection.get("file_id"), str) else None
+        effective_focus = sel_file_id or (focus_document_id if isinstance(focus_document_id, str) and focus_document_id else None)
         if doc_texts:
             rag_hits_raw = []
-        elif documents:
-            rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=documents, top_k=6)
         else:
-            rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=6)
+            primary_k = 4 if selection else 6
+            secondary_k = 1 if selection else 2
+            rag_hits_raw = []
+            if effective_focus:
+                rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=[effective_focus], top_k=primary_k))
+                other_ids = [fid for fid in self._list_chat_file_ids(chat_id) if fid != effective_focus]
+                if other_ids:
+                    rag_hits_raw.extend(
+                        self.rag_store.retrieve(
+                            user_message,
+                            chat_id=chat_id,
+                            doc_ids=other_ids,
+                            top_k=secondary_k,
+                        )
+                    )
+            elif documents:
+                rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=documents, top_k=primary_k)
+            else:
+                rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k)
         selected_rag = self._dedup_rag(rag_hits_raw)
+        selected_rag = self._apply_rag_budget(chat_id, selected_rag)
 
         session_meta = self.session_mgr.sessions.get(chat_id, {})
         turn_index = len([m for m in session_meta.get("messages", []) if m.get("role") != "system"])
@@ -256,6 +397,7 @@ class InsightOrchestrator:
             ltm_hits=ltm_hits,
             user_message=user_message,
             doc_texts=doc_texts,
+            selection=selection,
             turn_index=turn_index,
         )
         if not doc_texts and selected_rag:
@@ -266,7 +408,14 @@ class InsightOrchestrator:
             tokens: List[str] = []
             # Persist clean UI user message immediately so history is instant.
             try:
-                self._persist_ui_message(chat_id=chat_id, role="user", text=user_message, attachments=attachments)
+                self._persist_ui_message(
+                    chat_id=chat_id,
+                    role="user",
+                    text=user_message,
+                    attachments=attachments,
+                    focus_document_id=effective_focus,
+                    selection=selection,
+                )
             except Exception:
                 logger.exception("Failed to persist UI user message chat=%s", chat_id)
 

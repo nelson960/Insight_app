@@ -142,6 +142,8 @@ class ExtractionResult:
     text_segments: List[str]
     pages: Optional[int]
     metadata: Dict[str, Any]
+    plain_text: str = ""
+    blocks: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

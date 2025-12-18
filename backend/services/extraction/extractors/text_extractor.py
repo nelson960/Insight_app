@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Optional
 
 from ..base import ExtractedDocument, SimpleExtractor
-from ..normalizer import normalize_text
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ class PlainTextExtractor(SimpleExtractor):
             "content_type": mime_type,
         }
         logger.debug("Text extraction complete for %s (length=%d)", file_path, len(text))
-        return ExtractedDocument(text=normalize_text(text), metadata=metadata)
+        return ExtractedDocument(text=text, metadata=metadata)
 
     @staticmethod
     def _extract_csv(file_path: Path) -> str:
