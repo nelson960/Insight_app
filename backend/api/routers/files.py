@@ -13,6 +13,7 @@ from backend.services.ingestion import IngestionRequest, FilePolicy
 from backend.services.extraction.detector import detect_mime_type
 from backend.services.security import encrypt_bytes
 from backend.services.extraction.service import blocks_from_text
+from backend.services.ipc_events import emit_event
 
 import logging
 
@@ -54,6 +55,13 @@ async def upload_files(
             stored_path=str(enc_path),
             is_encrypted=True,
             policy={"pii": False},
+        )
+        emit_event(
+            "files_changed",
+            chat_id=chat_id,
+            file_id=file_id,
+            filename=upload.filename,
+            status="registered",
         )
         request = IngestionRequest(
             file_id=file_id,
@@ -133,6 +141,13 @@ async def ingest_paths(payload: Dict[str, Any] = Body(...)):
             user_id=user_id,
             chat_id=chat_id,
             source="desktop_path",
+        )
+        emit_event(
+            "files_changed",
+            chat_id=chat_id,
+            file_id=file_id,
+            filename=filename,
+            status="registered",
         )
 
         request = IngestionRequest(

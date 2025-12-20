@@ -28,7 +28,7 @@ def build_turn_prompt(
     ltm_hits: List[MemoryHit],
     doc_texts: List[str],
     *,
-    selection: Optional[Dict[str, Any]] = None,
+    selection: Optional[Dict[str, Any]] = None,	
     turn_index: int = 0,
 ) -> str:
     first_turn = turn_index == 0
@@ -63,6 +63,72 @@ def build_turn_prompt(
     return "\n\n".join(parts).strip()
 
 
+def build_context_pack(
+    *,
+    ltm_hits: List[MemoryHit],
+    doc_texts: List[str],
+    rag_hits: List[Dict[str, Any]],
+    selection: Optional[Dict[str, Any]] = None,
+    effective_focus: Optional[str] = None,
+) -> str:
+    """
+    Build an ephemeral context pack for a single generation.
+
+    This text is injected for the current model call only and MUST NOT be
+    persisted into session messages/KV. Keeping it separate prevents retrieval
+    and document blobs from "sticking" into the KV cache across turns.
+    """
+    parts: List[str] = []
+
+    if selection and isinstance(selection, dict) and isinstance(selection.get("file_id"), str):
+        parts.append(f"SCOPE:\n- mode: selection\n- file_id: {selection.get('file_id')}")
+    elif effective_focus:
+        parts.append(f"SCOPE:\n- mode: focused_document\n- file_id: {effective_focus}")
+
+    if selection and isinstance(selection, dict):
+        sel_text = selection.get("text")
+        if isinstance(sel_text, str) and sel_text.strip():
+            sel_trimmed = sel_text.strip()
+            if len(sel_trimmed) > 5000:
+                sel_trimmed = sel_trimmed[:5000] + "…"
+            header = "SELECTED EXCERPT (highest priority):"
+            sel_file = selection.get("file_id") if isinstance(selection.get("file_id"), str) else None
+            sel_page = selection.get("page") if isinstance(selection.get("page"), int) else None
+            if sel_file and sel_page is not None:
+                header = f"SELECTED EXCERPT (highest priority) from {sel_file} page {sel_page}:"
+            elif sel_file:
+                header = f"SELECTED EXCERPT (highest priority) from {sel_file}:"
+            parts.append(f"{header}\n{sel_trimmed}")
+
+    if ltm_hits:
+        mem_block = "\n".join(m.text for m in ltm_hits if getattr(m, "text", None)) or ""
+        if mem_block.strip():
+            parts.append(f"LONG-TERM MEMORY (relevant):\n{mem_block.strip()}")
+
+    if doc_texts:
+        docs_block = "\n\n".join(t for t in doc_texts if isinstance(t, str) and t.strip())
+        if docs_block.strip():
+            parts.append(f"INLINE DOCUMENT TEXT (truncated):\n{docs_block.strip()}")
+
+    if rag_hits:
+        lines: List[str] = []
+        for i, hit in enumerate(rag_hits, start=1):
+            text = (hit.get("text") or "").strip()
+            if not text:
+                continue
+            doc_id = hit.get("doc_id") or ""
+            chunk_id = hit.get("chunk_id") or ""
+            score = hit.get("score") or 0.0
+            lines.append(f"[E{i}] doc_id={doc_id} chunk_id={chunk_id} score={score}")
+            lines.append(text)
+            lines.append("")
+        evidence = "\n".join(lines).strip()
+        if evidence:
+            parts.append(f"EVIDENCE (RAG chunks):\n{evidence}")
+
+    return "\n\n".join(p.strip() for p in parts if p and p.strip()).strip()
+
+
 class InsightOrchestrator:
     """
     Combines KV sessions, RAG, and long-term memory into a single turn handler.
@@ -90,6 +156,16 @@ class InsightOrchestrator:
         if not text:
             return 0
         return max(1, len(text) // 4)
+
+    @staticmethod
+    def _is_summary_request(user_message: str) -> bool:
+        q = (user_message or "").strip().lower()
+        if not q:
+            return False
+        # Handle short "mode" prompts used in testing ("brief", "summary", etc.).
+        if q in {"brief", "summary", "summarize", "tldr", "tl;dr"}:
+            return True
+        return any(k in q for k in ("summarize", "summary", "tl;dr", "tldr"))
 
     def _apply_inline_doc_budget(self, chat_id: str, doc_texts: List[str]) -> List[str]:
         if not doc_texts:
@@ -126,6 +202,116 @@ class InsightOrchestrator:
             capacity,
         )
         return []
+
+    def _apply_inline_doc_budget_partial(self, chat_id: str, text: str) -> str:
+        """
+        Like `_apply_inline_doc_budget`, but returns a truncated prefix instead of dropping the doc.
+
+        This is used for summary-style queries where vector search is not meaningful
+        (e.g. user asks just "brief"), so we must provide some sequential doc text.
+        """
+        if not text:
+            return ""
+
+        self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
+        try:
+            status = self.session_mgr.get_context_status(chat_id)
+            used = int(status.get("used_tokens") or 0)
+            capacity = int(status.get("capacity_tokens") or 0)
+        except Exception:
+            used = 0
+            capacity = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
+
+        remaining = max(0, capacity - used)
+        budget = min(int(remaining * INLINE_DOC_FRACTION), INLINE_DOC_MAX_TOKENS)
+        if budget <= 0:
+            return ""
+        budget_chars = max(0, budget * 4)
+        if len(text) <= budget_chars:
+            return text
+        return text[:budget_chars]
+
+    def _resolve_focus_for_turn(
+        self,
+        chat_id: str,
+        *,
+        documents: List[str],
+        focus_document_id: Optional[str],
+        selection: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """
+        Resolve the "effective" focused file for this turn.
+
+        Priority:
+          1) explicit selection.file_id
+          2) explicit focus_document_id from UI
+          3) last document id in the request payload (upload/attach turn)
+          4) last file registered for this chat (SQLite)
+        """
+        sel_file_id = (
+            selection.get("file_id")
+            if isinstance(selection, dict) and isinstance(selection.get("file_id"), str)
+            else None
+        )
+        if isinstance(sel_file_id, str) and sel_file_id:
+            return sel_file_id
+
+        if isinstance(focus_document_id, str) and focus_document_id:
+            return focus_document_id
+
+        # If the request included documents (e.g. upload+chat), default to the most recent
+        # doc in that list so "upload → ask" works without extra UI wiring.
+        for fid in reversed(documents or []):
+            if isinstance(fid, str) and fid:
+                return fid
+
+        # Fallback: when the frontend doesn't send focus_document_id, use the most recently
+        # registered file for this chat so we don't accidentally keep answering from the
+        # first uploaded doc forever.
+        try:
+            if hasattr(self.metadata_store, "latest_file_id_for_chat"):
+                fid = self.metadata_store.latest_file_id_for_chat(chat_id)  # type: ignore[attr-defined]
+                if isinstance(fid, str) and fid:
+                    return fid
+        except Exception:
+            return None
+
+        return None
+
+    def _fetch_focus_doc_text(self, file_id: str) -> str:
+        """
+        Best-effort: get canonical extracted text for a single file.
+        """
+        if not isinstance(file_id, str) or not file_id:
+            return ""
+        try:
+            row = self.metadata_store.get_file_text(file_id)
+            if row and isinstance(row.get("plain_text"), str):
+                return row.get("plain_text") or ""
+        except Exception:
+            pass
+        # Fallback: stitch chunk texts if file_text isn't available.
+        try:
+            if hasattr(self.metadata_store, "fetch_chunk_texts_for_file"):
+                texts = self.metadata_store.fetch_chunk_texts_for_file(file_id, limit=None)
+                return "\n\n".join(t for t in texts if isinstance(t, str) and t.strip())
+        except Exception:
+            pass
+        return ""
+
+    def _doc_fallback_preview(self, chat_id: str, text: str, *, max_chars: int = 4000) -> str:
+        """
+        Small, safe excerpt used when focused RAG returns no hits.
+
+        Keeps the UI/chat responsive for queries like "brief" where embeddings may not
+        retrieve anything meaningful, while still avoiding prompt pollution.
+        """
+        if not text:
+            return ""
+        trimmed = self._apply_inline_doc_budget_partial(chat_id, text)
+        if max_chars > 0 and len(trimmed) > max_chars:
+            return trimmed[:max_chars]
+        return trimmed
 
     def _list_chat_file_ids(self, chat_id: str) -> List[str]:
         try:
@@ -238,56 +424,84 @@ class InsightOrchestrator:
         documents_text = [t for t in (documents_text or []) if isinstance(t, str) and t.strip()]
         attachments = attachments or []
         analysis = self._analyze_query(user_message, has_docs=bool(documents or documents_text))
+        summary_request = self._is_summary_request(user_message)
         # Ensure deterministic session per chat_id (required even when no docs are attached).
         self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
 
         ltm_k = 2 if selection else 5
         ltm_hits = self.ltm_store.retrieve(chat_id, user_message, top_k=ltm_k)
-        # If documents are provided, fetch their content; otherwise rely on RAG.
-        doc_texts = documents_text or self._fetch_doc_texts(documents)
-        doc_texts = self._apply_inline_doc_budget(chat_id, doc_texts)
         sel_file_id = selection.get("file_id") if isinstance(selection, dict) and isinstance(selection.get("file_id"), str) else None
-        effective_focus = sel_file_id or (focus_document_id if isinstance(focus_document_id, str) and focus_document_id else None)
-        if doc_texts:
-            rag_hits_raw: List[Dict[str, Any]] = []
+        effective_focus = self._resolve_focus_for_turn(
+            chat_id,
+            documents=documents,
+            focus_document_id=focus_document_id,
+            selection=selection,
+        )
+        logger.debug(
+            "Planner turn chat=%s summary=%s focus=%s docs_payload=%d docs_text=%d attachments=%d",
+            chat_id,
+            summary_request,
+            effective_focus,
+            len(documents),
+            len(documents_text),
+            len(attachments),
+        )
+
+        # If documents are provided, fetch their content; otherwise rely on RAG.
+        if documents_text:
+            doc_texts = documents_text
+        elif effective_focus:
+            doc_texts = self._fetch_doc_texts([effective_focus])
+        else:
+            doc_texts = self._fetch_doc_texts(documents)
+        doc_texts = self._apply_inline_doc_budget(chat_id, doc_texts)
+
+        # Summary-style queries (e.g. "brief") should not rely on vector search;
+        # they need sequential doc text for the focused document.
+        if summary_request and effective_focus:
+            focus_text = ""
+            if documents and documents_text and len(documents_text) == len(documents):
+                try:
+                    idx = documents.index(effective_focus)
+                    focus_text = documents_text[idx] if idx < len(documents_text) else ""
+                except ValueError:
+                    focus_text = ""
+            if not focus_text:
+                focus_text = self._fetch_focus_doc_text(effective_focus)
+            focus_text = self._apply_inline_doc_budget_partial(chat_id, focus_text)
+            doc_texts = [focus_text] if focus_text.strip() else []
+            rag_hits_raw = []
+        elif doc_texts:
+            rag_hits_raw = []
         else:
             primary_k = 4 if selection else 6
-            secondary_k = 1 if selection else 2
             rag_hits_raw = []
             if effective_focus:
                 rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=[effective_focus], top_k=primary_k))
-                # Low-priority "other docs" context (kept small to avoid dilution).
-                other_ids = [fid for fid in self._list_chat_file_ids(chat_id) if fid != effective_focus]
-                if other_ids:
-                    rag_hits_raw.extend(
-                        self.rag_store.retrieve(
-                            user_message,
-                            chat_id=chat_id,
-                            doc_ids=other_ids,
-                            top_k=secondary_k,
-                        )
-                    )
             elif documents:
                 rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=documents, top_k=primary_k)
             else:
                 rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k)
         selected_rag = self._dedup_rag(rag_hits_raw)
-
-        # Turn index (exclude system messages)
-        session_meta = self.session_mgr.sessions.get(chat_id, {})
-        turn_index = len([m for m in session_meta.get("messages", []) if m.get("role") != "system"])
-
-        turn_prompt = build_turn_prompt(
-            system_hint=self.system_hint,
+        selected_rag = self._apply_rag_budget(chat_id, selected_rag)
+        if effective_focus and not doc_texts and not selected_rag:
+            # Focused retrieval yielded nothing; fall back to a small sequential excerpt.
+            preview = self._doc_fallback_preview(chat_id, self._fetch_focus_doc_text(effective_focus))
+            if preview.strip():
+                doc_texts = [preview]
+        context_pack = build_context_pack(
             ltm_hits=ltm_hits,
-            user_message=user_message,
             doc_texts=doc_texts,
+            rag_hits=selected_rag,
             selection=selection,
-            turn_index=turn_index,
+            effective_focus=effective_focus,
         )
-        if not doc_texts and selected_rag:
-            rag_block = "\n".join((c.get("text", "") or "") for c in selected_rag)
-            turn_prompt += "\n\nContext:\n" + rag_block
+        if summary_request and effective_focus:
+            context_pack = (
+                "TASK:\n- Summarize the focused document briefly.\n"
+                "- Use only the provided document text/evidence.\n\n"
+                + (context_pack or "")
+            ).strip()
 
         # Persist clean UI user message (not the giant turn_prompt).
         try:
@@ -303,7 +517,13 @@ class InsightOrchestrator:
             logger.exception("Failed to persist UI user message chat=%s", chat_id)
 
         # Allow a bit more room for longer answers (cap still applies)
-        reply = self.session_mgr.ask(chat_id, turn_prompt, max_tokens=768, temperature=0.2)
+        reply = self.session_mgr.ask_with_context(
+            chat_id,
+            user_text=user_message,
+            context_pack=context_pack,
+            max_tokens=768,
+            temperature=0.2,
+        )
 
         try:
             if reply:
@@ -313,15 +533,16 @@ class InsightOrchestrator:
 
         total_ms = (time.perf_counter() - start) * 1000
         logger.info(
-            "Planner prompt chat=%s docs=%d rag_hits=%d ltm=%d target_words=%d time_ms=%.1f",
+            "Planner prompt chat=%s focus=%s summary=%s docs=%d rag_hits=%d ltm=%d target_words=%d time_ms=%.1f",
             chat_id,
+            effective_focus,
+            summary_request,
             len(documents) if documents else len(doc_texts),
             len(selected_rag),
             len(ltm_hits),
             analysis["target_words"],
             total_ms,
         )
-        logger.info("Planner prompt payload chat=%s turn=%d:\n%s", chat_id, turn_index, turn_prompt)
 
         # If a new compaction summary was produced, persist it to LTM and clear marker
         session_meta = self.session_mgr.sessions.get(chat_id, {})
@@ -355,54 +576,80 @@ class InsightOrchestrator:
         documents_text = [t for t in (documents_text or []) if isinstance(t, str) and t.strip()]
         attachments = attachments or []
         analysis = self._analyze_query(user_message, has_docs=bool(documents or documents_text))
+        summary_request = self._is_summary_request(user_message)
         # Ensure deterministic session per chat_id (required even when no docs are attached).
         self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
 
         ltm_k = 2 if selection else 5
         ltm_hits = self.ltm_store.retrieve(chat_id, user_message, top_k=ltm_k)
-        doc_texts = documents_text or self._fetch_doc_texts(documents)
+        effective_focus = self._resolve_focus_for_turn(
+            chat_id,
+            documents=documents,
+            focus_document_id=focus_document_id,
+            selection=selection,
+        )
+        logger.debug(
+            "Planner stream turn chat=%s summary=%s focus=%s docs_payload=%d docs_text=%d attachments=%d request_id=%s",
+            chat_id,
+            summary_request,
+            effective_focus,
+            len(documents),
+            len(documents_text),
+            len(attachments),
+            request_id,
+        )
+
+        if documents_text:
+            doc_texts = documents_text
+        elif effective_focus:
+            doc_texts = self._fetch_doc_texts([effective_focus])
+        else:
+            doc_texts = self._fetch_doc_texts(documents)
         doc_texts = self._apply_inline_doc_budget(chat_id, doc_texts)
-        sel_file_id = selection.get("file_id") if isinstance(selection, dict) and isinstance(selection.get("file_id"), str) else None
-        effective_focus = sel_file_id or (focus_document_id if isinstance(focus_document_id, str) and focus_document_id else None)
-        if doc_texts:
+
+        if summary_request and effective_focus:
+            focus_text = ""
+            if documents and documents_text and len(documents_text) == len(documents):
+                try:
+                    idx = documents.index(effective_focus)
+                    focus_text = documents_text[idx] if idx < len(documents_text) else ""
+                except ValueError:
+                    focus_text = ""
+            if not focus_text:
+                focus_text = self._fetch_focus_doc_text(effective_focus)
+            focus_text = self._apply_inline_doc_budget_partial(chat_id, focus_text)
+            doc_texts = [focus_text] if focus_text.strip() else []
+            rag_hits_raw = []
+        elif doc_texts:
             rag_hits_raw = []
         else:
             primary_k = 4 if selection else 6
-            secondary_k = 1 if selection else 2
             rag_hits_raw = []
             if effective_focus:
                 rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=[effective_focus], top_k=primary_k))
-                other_ids = [fid for fid in self._list_chat_file_ids(chat_id) if fid != effective_focus]
-                if other_ids:
-                    rag_hits_raw.extend(
-                        self.rag_store.retrieve(
-                            user_message,
-                            chat_id=chat_id,
-                            doc_ids=other_ids,
-                            top_k=secondary_k,
-                        )
-                    )
             elif documents:
                 rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=documents, top_k=primary_k)
             else:
                 rag_hits_raw = self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k)
         selected_rag = self._dedup_rag(rag_hits_raw)
         selected_rag = self._apply_rag_budget(chat_id, selected_rag)
-
-        session_meta = self.session_mgr.sessions.get(chat_id, {})
-        turn_index = len([m for m in session_meta.get("messages", []) if m.get("role") != "system"])
-
-        turn_prompt = build_turn_prompt(
-            system_hint=self.system_hint,
+        if effective_focus and not doc_texts and not selected_rag:
+            preview = self._doc_fallback_preview(chat_id, self._fetch_focus_doc_text(effective_focus))
+            if preview.strip():
+                doc_texts = [preview]
+        context_pack = build_context_pack(
             ltm_hits=ltm_hits,
-            user_message=user_message,
             doc_texts=doc_texts,
+            rag_hits=selected_rag,
             selection=selection,
-            turn_index=turn_index,
+            effective_focus=effective_focus,
         )
-        if not doc_texts and selected_rag:
-            rag_block = "\n".join((c.get("text", "") or "") for c in selected_rag)
-            turn_prompt += "\n\nContext:\n" + rag_block
+        if summary_request and effective_focus:
+            context_pack = (
+                "TASK:\n- Summarize the focused document briefly.\n"
+                "- Use only the provided document text/evidence.\n\n"
+                + (context_pack or "")
+            ).strip()
 
         def generator():
             tokens: List[str] = []
@@ -419,9 +666,10 @@ class InsightOrchestrator:
             except Exception:
                 logger.exception("Failed to persist UI user message chat=%s", chat_id)
 
-            for token in self.session_mgr.ask_stream(
+            for token in self.session_mgr.ask_stream_with_context(
                 chat_id,
-                turn_prompt,
+                user_text=user_message,
+                context_pack=context_pack,
                 max_tokens=768,
                 temperature=0.2,
                 request_id=request_id,

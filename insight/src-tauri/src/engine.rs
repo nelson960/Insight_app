@@ -4,10 +4,13 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EngineRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
@@ -68,7 +71,32 @@ pub fn resolve_project_root() -> Result<PathBuf> {
 pub struct EngineProcess {
     child: Child,
     stdin: Mutex<ChildStdin>,
-    stdout: Mutex<BufReader<ChildStdout>>,
+    state: Arc<RouterState>,
+}
+
+struct RouterState {
+    pending: Mutex<std::collections::HashMap<String, mpsc::Sender<EngineResponse>>>,
+    streams: Mutex<std::collections::HashMap<String, StreamSink>>,
+    app: Mutex<Option<tauri::AppHandle>>,
+}
+
+#[derive(Clone)]
+struct StreamSink {
+    app: tauri::AppHandle,
+    chat_id: Option<String>,
+}
+
+static REQUEST_SEQ: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+
+fn next_request_id() -> String {
+    let seq = REQUEST_SEQ
+        .get_or_init(|| std::sync::atomic::AtomicU64::new(1))
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_millis(0))
+        .as_millis();
+    format!("req-{now}-{seq}")
 }
 
 impl EngineProcess {
@@ -94,45 +122,76 @@ impl EngineProcess {
             .take()
             .ok_or_else(|| anyhow!("missing stdout for engine"))?;
 
+        let state = Arc::new(RouterState {
+            pending: Mutex::new(std::collections::HashMap::new()),
+            streams: Mutex::new(std::collections::HashMap::new()),
+            app: Mutex::new(None),
+        });
+
+        // Single stdout reader thread that demuxes all responses/tokens by request_id.
+        // This is required to support /chat streaming + concurrent /files/* requests.
+        spawn_stdout_router(BufReader::new(stdout), state.clone());
+
         Ok(Self {
             child,
             stdin: Mutex::new(stdin),
-            stdout: Mutex::new(BufReader::new(stdout)),
+            state,
         })
+    }
+
+    pub fn set_app_handle(&self, app: tauri::AppHandle) {
+        if let Ok(mut slot) = self.state.app.lock() {
+            *slot = Some(app);
+        }
     }
 
     /// Non-streaming request: send one JSON and wait for one JSON line response.
     pub fn send(&self, req: &EngineRequest) -> Result<EngineResponse> {
-        let line = serde_json::to_string(req)?;
+        let mut req = req.clone();
+        if req.request_id.is_none() {
+            req.request_id = Some(next_request_id());
+        }
+        let request_id = req
+            .request_id
+            .clone()
+            .ok_or_else(|| anyhow!("missing request_id"))?;
+
+        let (tx, rx) = mpsc::channel::<EngineResponse>();
+        {
+            let mut pending = self
+                .state
+                .pending
+                .lock()
+                .map_err(|_| anyhow!("pending mutex poisoned"))?;
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let line = serde_json::to_string(&req)?;
         {
             let mut stdin = self.stdin.lock().map_err(|_| anyhow!("stdin mutex poisoned"))?;
             writeln!(stdin, "{line}")?;
             stdin.flush()?;
         }
 
-        let mut response = String::new();
-        {
-            let mut stdout = self
-                .stdout
-                .lock()
-                .map_err(|_| anyhow!("stdout mutex poisoned"))?;
-            stdout
-                .read_line(&mut response)
-                .context("engine did not return a response")?;
+        // Wait for the router thread to deliver the response for this request id.
+        match rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(res) => Ok(res),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Clean up so future responses don't leak.
+                if let Ok(mut pending) = self.state.pending.lock() {
+                    pending.remove(&request_id);
+                }
+                Err(anyhow!("timeout waiting for engine response request_id={request_id}"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Ok(mut pending) = self.state.pending.lock() {
+                    pending.remove(&request_id);
+                }
+                Err(anyhow!("engine response channel disconnected request_id={request_id}"))
+            }
         }
-        if response.trim().is_empty() {
-            return Err(anyhow!(
-                "engine returned empty response; check Python errors in stderr"
-            ));
-        }
-        let val: EngineResponse = serde_json::from_str(&response)
-            .with_context(|| format!("invalid JSON from engine: {response}"))?;
-        Ok(val)
     }
 
-    /// Streaming request: send one JSON, then consume streaming JSON lines:
-    ///   {"stream_token": "<chunk>"}
-    ///   {"stream_end": true}
     pub fn stream(
         &self,
         request_id: &str,
@@ -140,17 +199,23 @@ impl EngineProcess {
         payload: &Value,
         app: &tauri::AppHandle,
     ) -> Result<()> {
-        let debug = std::env::var("INSIGHT_IPC_DEBUG").is_ok();
-
         let chat_id = payload
             .get("chat_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        if debug {
-            eprintln!(
-                "[ipc] stream -> request_id={} endpoint={} chat_id={:?}",
-                request_id, endpoint, chat_id
+        {
+            let mut streams = self
+                .state
+                .streams
+                .lock()
+                .map_err(|_| anyhow!("streams mutex poisoned"))?;
+            streams.insert(
+                request_id.to_string(),
+                StreamSink {
+                    app: app.clone(),
+                    chat_id: chat_id.clone(),
+                },
             );
         }
 
@@ -173,88 +238,6 @@ impl EngineProcess {
             let mut stdin = self.stdin.lock().map_err(|_| anyhow!("stdin mutex poisoned"))?;
             writeln!(stdin, "{line}")?;
             stdin.flush()?;
-        }
-
-        let mut stdout = self
-            .stdout
-            .lock()
-            .map_err(|_| anyhow!("stdout mutex poisoned"))?;
-
-        loop {
-            let mut response = String::new();
-            let read = stdout.read_line(&mut response)?;
-            if read == 0 {
-                // EOF from engine
-                break;
-            }
-            let trimmed = response.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if debug {
-                eprintln!("[ipc] stream <- bytes={} line={}", read, trimmed);
-            }
-
-            let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(_) => {
-                    // Ignore malformed JSON lines (shouldn't happen, but be defensive)
-                    continue;
-                }
-            };
-
-            // Filter out interleaved messages from other requests.
-            if parsed
-                .get("request_id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|rid| rid != request_id)
-            {
-                continue;
-            }
-
-            // End-of-stream marker
-            if parsed.get("stream_end").is_some() {
-                if debug {
-                    eprintln!("[ipc] stream_end");
-                }
-                let _ = app.emit(
-                    "llm-done",
-                    serde_json::json!({ "request_id": request_id, "chat_id": chat_id }),
-                );
-                break;
-            }
-
-            if let Some(err) = parsed.get("stream_error").and_then(|v| v.as_str()) {
-                if debug {
-                    eprintln!("[ipc] stream_error={}", err);
-                }
-                let _ = app.emit(
-                    "llm-error",
-                    serde_json::json!({
-                        "request_id": request_id,
-                        "chat_id": chat_id,
-                        "error": err,
-                    }),
-                );
-            }
-
-            // Normal token line
-            if let Some(token) = parsed.get("stream_token").and_then(|v| v.as_str()) {
-                // Backend emits a human-readable marker; Rust already gets `stream_end`.
-                if token.contains("[DONE]") {
-                    continue;
-                }
-                let payload_json = serde_json::json!({
-                    "token": token,
-                    "chat_id": chat_id,
-                    "request_id": request_id,
-                });
-                if let Err(err) = app.emit("llm-token", payload_json) {
-                    if debug {
-                        eprintln!("[ipc] emit llm-token failed: {err}");
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -279,4 +262,133 @@ impl Drop for EngineProcess {
         }
         let _ = self.child.kill();
     }
+}
+
+fn spawn_stdout_router(mut stdout: BufReader<ChildStdout>, state: Arc<RouterState>) {
+    std::thread::spawn(move || {
+        let debug = std::env::var("INSIGHT_IPC_DEBUG").is_ok();
+        loop {
+            let mut line = String::new();
+            let read = match stdout.read_line(&mut line) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Out-of-band events from the Python engine (not tied to a request_id).
+            if parsed.get("type").and_then(|v| v.as_str()) == Some("event") {
+                let app = {
+                    let slot = state.app.lock().ok();
+                    slot.and_then(|s| s.clone())
+                };
+                if let Some(app) = app {
+                    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let _ = app.emit("engine-event", parsed.clone());
+                    if name == "files_changed" {
+                        let _ = app.emit("files-changed", parsed.clone());
+                    } else if name == "file_text_ready" {
+                        let _ = app.emit("file-text-ready", parsed.clone());
+                    } else if name == "file_status" {
+                        let _ = app.emit("file-status", parsed.clone());
+                    }
+                }
+                continue;
+            }
+            let request_id = parsed
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if debug {
+                if let Some(rid) = &request_id {
+                    eprintln!("[ipc] stdout <- request_id={} bytes={} line={}", rid, read, trimmed);
+                } else {
+                    eprintln!("[ipc] stdout <- bytes={} line={}", read, trimmed);
+                }
+            }
+
+            // Streaming messages
+            if parsed.get("stream_start").is_some()
+                || parsed.get("stream_token").is_some()
+                || parsed.get("stream_error").is_some()
+                || parsed.get("stream_end").is_some()
+            {
+                let rid = match request_id {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let sink = {
+                    let streams = state.streams.lock().ok();
+                    streams.and_then(|m| m.get(&rid).cloned())
+                };
+                let Some(sink) = sink else { continue };
+
+                if let Some(err) = parsed.get("stream_error").and_then(|v| v.as_str()) {
+                    let _ = sink.app.emit(
+                        "llm-error",
+                        serde_json::json!({
+                            "request_id": rid,
+                            "chat_id": sink.chat_id,
+                            "error": err,
+                        }),
+                    );
+                }
+
+                if let Some(token) = parsed.get("stream_token").and_then(|v| v.as_str()) {
+                    if !token.contains("[DONE]") && !token.is_empty() {
+                        let _ = sink.app.emit(
+                            "llm-token",
+                            serde_json::json!({
+                                "token": token,
+                                "chat_id": sink.chat_id,
+                                "request_id": rid,
+                            }),
+                        );
+                    }
+                }
+
+                if parsed.get("stream_end").is_some() {
+                    let _ = sink.app.emit(
+                        "llm-done",
+                        serde_json::json!({ "request_id": rid, "chat_id": sink.chat_id }),
+                    );
+                    if let Ok(mut streams) = state.streams.lock() {
+                        streams.remove(&rid);
+                    }
+                }
+                continue;
+            }
+
+            // Non-stream response
+            let rid = match request_id {
+                Some(r) => r,
+                None => continue,
+            };
+            let resp: EngineResponse = match serde_json::from_value(parsed) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let tx = {
+                let mut pending = match state.pending.lock() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                pending.remove(&rid)
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(resp);
+            }
+        }
+    });
 }

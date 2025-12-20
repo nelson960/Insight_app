@@ -784,6 +784,34 @@ body {
   font-weight: 600;
 }
 
+.docs-tab.pending {
+  opacity: 0.8;
+  cursor: default;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.docs-tab.pending:hover {
+  border-color: rgba(148, 163, 184, 0.18);
+}
+
+.docs-tab-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  border: 2px solid rgba(148, 163, 184, 0.35);
+  border-top-color: rgba(59, 130, 246, 0.9);
+  animation: docs-spin 0.9s linear infinite;
+  flex: 0 0 auto;
+}
+
+@keyframes docs-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .docs-file-row {
   width: 100%;
   text-align: left;

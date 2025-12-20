@@ -14,6 +14,7 @@ from backend.services.ingestion.models import (
     FileIngestionStatus,
     IngestionErrorCode,
 )
+from backend.services.ipc_events import emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,28 @@ class SQLiteConfig:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_file_ingestion_status(status: FileIngestionStatus | str) -> str:
+    """
+    Normalize status values stored in SQLite and emitted over IPC.
+
+    Historically, some code paths used `str(FileIngestionStatus.PROCESSING)` which
+    yields "FileIngestionStatus.PROCESSING" instead of the intended "processing".
+    Keep this tolerant so older rows don't break UI logic.
+    """
+    if isinstance(status, FileIngestionStatus):
+        return status.value
+    if isinstance(status, str):
+        prefix = "FileIngestionStatus."
+        if status.startswith(prefix):
+            name = status[len(prefix) :]
+            try:
+                return FileIngestionStatus[name].value
+            except Exception:
+                return name.lower()
+        return status
+    return str(status)
 
 
 class SQLiteMetadataStore:
@@ -279,6 +302,7 @@ class SQLiteMetadataStore:
             row = cursor.fetchone()
             created_at = row["created_at"] if row else now
             status = row["status"] if row else FileIngestionStatus.PENDING.value
+            status = _normalize_file_ingestion_status(status)
 
             self._connection.execute(
                 """
@@ -316,12 +340,29 @@ class SQLiteMetadataStore:
             self._connection.commit()
 
     def mark_file_status(self, file_id: str, status: FileIngestionStatus | str) -> None:
+        status_value = _normalize_file_ingestion_status(status)
         with self._lock:
             self._connection.execute(
                 "UPDATE files SET status=?, updated_at=? WHERE id=?",
-                (str(status), _now_iso(), file_id),
+                (status_value, _now_iso(), file_id),
             )
             self._connection.commit()
+            try:
+                cursor = self._connection.execute(
+                    "SELECT chat_id, filename FROM files WHERE id=?",
+                    (file_id,),
+                )
+                row = cursor.fetchone()
+                if row and row["chat_id"]:
+                    emit_event(
+                        "file_status",
+                        chat_id=row["chat_id"],
+                        file_id=file_id,
+                        filename=row["filename"] or "",
+                        status=status_value,
+                    )
+            except Exception:
+                pass
 
     def record_extraction(self, file_id: str, *, pages: int | None, metadata: dict[str, object]) -> None:
         with self._lock:
@@ -335,6 +376,19 @@ class SQLiteMetadataStore:
         now = _now_iso()
         blocks_json = json.dumps(list(blocks) if blocks else [])
         with self._lock:
+            chat_id: str | None = None
+            filename = ""
+            try:
+                cursor = self._connection.execute(
+                    "SELECT chat_id, filename FROM files WHERE id=?",
+                    (file_id,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    chat_id = row["chat_id"]
+                    filename = row["filename"] or ""
+            except Exception:
+                chat_id = None
             cursor = self._connection.execute("SELECT created_at FROM file_text WHERE file_id=?", (file_id,))
             row = cursor.fetchone()
             created_at = row["created_at"] if row else now
@@ -346,6 +400,13 @@ class SQLiteMetadataStore:
                 (file_id, blocks_json, text or "", created_at, now),
             )
             self._connection.commit()
+            if chat_id:
+                emit_event(
+                    "file_text_ready",
+                    chat_id=chat_id,
+                    file_id=file_id,
+                    filename=filename,
+                )
 
     def get_file_text(self, file_id: str) -> Optional[dict[str, object]]:
         cursor = self._connection.execute(
@@ -450,12 +511,29 @@ class SQLiteMetadataStore:
             self._connection.commit()
 
     def mark_file_completed(self, file_id: str) -> None:
+        status_value = FileIngestionStatus.COMPLETED.value
         with self._lock:
             self._connection.execute(
                 "UPDATE files SET status=?, updated_at=? WHERE id=?",
-                (FileIngestionStatus.COMPLETED.value, _now_iso(), file_id),
+                (status_value, _now_iso(), file_id),
             )
             self._connection.commit()
+            try:
+                cursor = self._connection.execute(
+                    "SELECT chat_id, filename FROM files WHERE id=?",
+                    (file_id,),
+                )
+                row = cursor.fetchone()
+                if row and row["chat_id"]:
+                    emit_event(
+                        "file_status",
+                        chat_id=row["chat_id"],
+                        file_id=file_id,
+                        filename=row["filename"] or "",
+                        status=status_value,
+                    )
+            except Exception:
+                pass
 
     def record_failure(
         self,
@@ -613,6 +691,17 @@ class SQLiteMetadataStore:
             (chat_id,),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    def latest_file_id_for_chat(self, chat_id: str) -> Optional[str]:
+        cursor = self._connection.execute(
+            "SELECT id FROM files WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+            (chat_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        fid = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+        return fid if isinstance(fid, str) and fid else None
 
     def delete_files_for_chat(self, chat_id: str) -> int:
         # Also delete extracted text payloads for files tied to this chat.

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class LlamaSessionManager:
+    _PROMPT_RENDERER_ID = "llama3_manual_v2"
     """
     Single-model, multi-session manager using llama_cpp KV snapshots.
 
@@ -126,11 +127,17 @@ class LlamaSessionManager:
             messages: List[Dict[str, str]] = []
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
+            # Ensure session KV matches our rendered prompt format (system wrapper included).
+            self._prefill_chat_messages(messages)
             state_obj = self.llm.save_state()
+            prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
+            prompt_tokens = self._tokenize_prompt(prompt)
         session_payload = {
             "state": state_obj,
             "messages": messages,
             "compacted": False,
+            "_prompt_tokens": prompt_tokens,
+            "prompt_renderer": self._PROMPT_RENDERER_ID,
         }
         self.sessions[session_id] = session_payload
         self._persist_session(session_id, session_payload)
@@ -149,8 +156,17 @@ class LlamaSessionManager:
             messages: List[Dict[str, str]] = []
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
+            self._prefill_chat_messages(messages)
             state_obj = self.llm.save_state()
-        session_payload = {"state": state_obj, "messages": messages, "compacted": False}
+            prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
+            prompt_tokens = self._tokenize_prompt(prompt)
+        session_payload = {
+            "state": state_obj,
+            "messages": messages,
+            "compacted": False,
+            "_prompt_tokens": prompt_tokens,
+            "prompt_renderer": self._PROMPT_RENDERER_ID,
+        }
         self.sessions[session_id] = session_payload
         self._persist_session(session_id, session_payload)
         return session_id
@@ -178,6 +194,7 @@ class LlamaSessionManager:
             session = self.sessions.get(session_id)
             if session is None:
                 raise ValueError(f"Unknown session: {session_id}")
+            self._ensure_prompt_renderer(session_id, session)
 
             if self.persist_dir:
                 kv_path = self.persist_dir / f"{session_id}.kv"
@@ -186,8 +203,17 @@ class LlamaSessionManager:
                     system_messages = [m for m in session.get("messages", []) if m.get("role") == "system"]
                     with self._model_lock:
                         self.llm.reset()
+                        self._prefill_chat_messages(system_messages)
                         fresh_state = self.llm.save_state()
-                    session = {"state": fresh_state, "messages": system_messages, "compacted": False}
+                        prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                        prompt_tokens = self._tokenize_prompt(prompt)
+                    session = {
+                        "state": fresh_state,
+                        "messages": system_messages,
+                        "compacted": False,
+                        "_prompt_tokens": prompt_tokens,
+                        "prompt_renderer": self._PROMPT_RENDERER_ID,
+                    }
                     self.sessions[session_id] = session
                     self._persist_session(session_id, session)
 
@@ -205,17 +231,33 @@ class LlamaSessionManager:
                 # llama_cpp is not safe to interleave with other calls while a stream
                 # iterator is active.
                 self._ensure_session_loaded(session_id, session)
-                messages: List[Dict[str, str]] = list(session.get("messages", []))
-                messages.append({"role": "user", "content": message})
+                base_state = session.get("state")
+                clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
+                clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
+                if not clean_tokens:
+                    clean_prompt = self._render_llama3_prompt(clean_messages, add_generation_prompt=False)
+                    clean_tokens = self._tokenize_prompt(clean_prompt)
+                run_messages: List[Dict[str, str]] = list(clean_messages)
+                run_messages.append({"role": "user", "content": message})
 
                 # Avoid llama.cpp hard failures when prompt_tokens + max_tokens > ctx_size.
-                prompt_tokens = self._count_chat_prompt_tokens(messages)
+                run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
+                run_tokens = self._tokenize_prompt(run_prompt)
+                if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
+                    delta = run_tokens[len(clean_tokens) :]
+                    if delta:
+                        self._eval_tokens(delta)
+                else:
+                    self.llm.reset()
+                    self._eval_tokens(run_tokens)
+
+                prompt_tokens = len(run_tokens)
                 max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
 
                 logger.info(
                     "ask_stream llama start chat=%s msgs=%d max_tokens=%d",
                     session_id,
-                    len(messages),
+                    len(run_messages),
                     max_tokens,
                 )
                 with self._abort_lock:
@@ -224,16 +266,16 @@ class LlamaSessionManager:
                     self._abort_event = threading.Event() if request_id else None
 
                 try:
-                    stream = self.llm.create_chat_completion(
-                        messages=messages,
+                    stream = self._create_completion_from_state(
+                        prompt_tokens=run_tokens,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         stream=True,
+                        stop=["<|eot_id|>", "<|end_of_text|>"],
                     )
 
                     for chunk in stream:
-                        delta = chunk["choices"][0].get("delta") or {}
-                        token = delta.get("content") or delta.get("text") or ""
+                        token = (chunk.get("choices") or [{}])[0].get("text") or ""
                         if not token:
                             continue
                         if not reply_parts:
@@ -262,8 +304,6 @@ class LlamaSessionManager:
                         self._abort_event = None
 
                 reply = "".join(reply_parts)
-                if reply:
-                    messages.append({"role": "assistant", "content": reply})
                 logger.info(
                     "ask_stream llama done chat=%s request_id=%s tokens=%d cancelled=%s",
                     session_id,
@@ -271,9 +311,306 @@ class LlamaSessionManager:
                     len(reply_parts),
                     cancelled,
                 )
-                session["state"] = self.llm.save_state()
-                session["messages"] = messages
-                self._active_session_id = session_id
+
+                # Restore clean KV before committing.
+                try:
+                    self.llm.reset()
+                    if base_state is not None:
+                        self.llm.load_state(base_state)
+                    self._active_session_id = session_id
+                except Exception:
+                    self._active_session_id = None
+
+                commit_messages: List[Dict[str, str]] = list(clean_messages)
+                commit_messages.append({"role": "user", "content": message})
+                if reply:
+                    commit_messages.append({"role": "assistant", "content": reply})
+                self._commit_messages_to_session(session_id, session, commit_messages)
+
+            self.sessions[session_id] = session
+            self._persist_session(session_id, session)
+
+    # -------------------------------------------------------------------------
+    # Clean KV + ephemeral context pack API (preferred for RAG/doc chat)
+    # -------------------------------------------------------------------------
+
+    def ask_with_context(
+        self,
+        session_id: str,
+        *,
+        user_text: str,
+        context_pack: str = "",
+        max_tokens: int = 256,
+        temperature: float = 0.2,
+    ) -> str:
+        """
+        Chat that keeps the persistent KV clean.
+
+        - Persistent (saved to session messages + KV): system + clean user + clean assistant
+        - Ephemeral (used only for this turn, not persisted): context_pack
+
+        Implementation: fork -> generate -> restore -> commit (append-only).
+        """
+        lock = self._locks.setdefault(session_id, threading.RLock())
+        with lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise ValueError(f"Unknown session: {session_id}")
+            self._ensure_prompt_renderer(session_id, session)
+
+            # One-time migration: older sessions persisted "turn_prompt" blobs into
+            # user messages, which pollutes KV and mixes context across turns.
+            # For v2, we keep KV clean and inject retrieval/doc context ephemerally.
+            self._ensure_clean_kv_mode(session_id, session)
+
+            if self.persist_dir:
+                kv_path = self.persist_dir / f"{session_id}.kv"
+                if not kv_path.exists():
+                    logger.warning("KV missing for %s, resetting to system-only state", session_id)
+                    system_messages = [m for m in session.get("messages", []) if m.get("role") == "system"]
+                    with self._model_lock:
+                        self.llm.reset()
+                        self._prefill_chat_messages(system_messages)
+                        fresh_state = self.llm.save_state()
+                        prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                        prompt_tokens = self._tokenize_prompt(prompt)
+                    session = {
+                        "state": fresh_state,
+                        "messages": system_messages,
+                        "compacted": False,
+                        "_prompt_tokens": prompt_tokens,
+                        "prompt_renderer": self._PROMPT_RENDERER_ID,
+                    }
+                    self.sessions[session_id] = session
+                    self._persist_session(session_id, session)
+
+            clean_user = (user_text or "").strip()
+            if not clean_user:
+                return ""
+
+            context_pack = (context_pack or "").strip()
+            context_pack = self._budget_context_pack(
+                session_id,
+                session,
+                user_text=clean_user,
+                context_pack=context_pack,
+                reserved_max_tokens=max_tokens,
+            )
+
+            with self._model_lock:
+                self._ensure_session_loaded(session_id, session)
+                base_state = session.get("state")
+                clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
+                clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
+                if not clean_tokens:
+                    clean_prompt = self._render_llama3_prompt(clean_messages, add_generation_prompt=False)
+                    clean_tokens = self._tokenize_prompt(clean_prompt)
+
+                run_messages: List[Dict[str, str]] = list(clean_messages)
+                if context_pack:
+                    run_messages.append({"role": "system", "content": self._format_context_pack(context_pack)})
+                run_messages.append({"role": "user", "content": clean_user})
+
+                run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
+                run_tokens = self._tokenize_prompt(run_prompt)
+                if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
+                    delta = run_tokens[len(clean_tokens) :]
+                    if delta:
+                        self._eval_tokens(delta)
+                else:
+                    self.llm.reset()
+                    self._eval_tokens(run_tokens)
+
+                prompt_tokens = len(run_tokens)
+                max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
+
+                out = self._create_completion_from_state(
+                    prompt_tokens=run_tokens,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stream=False,
+                    stop=["<|eot_id|>", "<|end_of_text|>"],
+                )
+                reply = (out.get("choices") or [{}])[0].get("text") or ""
+
+                # Restore clean KV before committing.
+                try:
+                    self.llm.reset()
+                    if base_state is not None:
+                        self.llm.load_state(base_state)
+                    self._active_session_id = session_id
+                except Exception:
+                    # If restore fails, fallback to a rebuild commit below.
+                    self._active_session_id = None
+
+                commit_messages: List[Dict[str, str]] = list(clean_messages)
+                commit_messages.append({"role": "user", "content": clean_user})
+                if reply:
+                    commit_messages.append({"role": "assistant", "content": reply})
+
+                self._commit_messages_to_session(session_id, session, commit_messages)
+                self.sessions[session_id] = session
+                self._persist_session(session_id, session)
+                return reply
+
+    def ask_stream_with_context(
+        self,
+        session_id: str,
+        *,
+        user_text: str,
+        context_pack: str = "",
+        max_tokens: int = 256,
+        temperature: float = 0.2,
+        request_id: Optional[str] = None,
+    ):
+        """
+        Streaming variant of `ask_with_context()`.
+
+        Yields tokens from the "dirty" run (which includes ephemeral context pack),
+        but commits only clean user + assistant text to persistent KV on completion.
+        """
+        logger.info(
+            "ask_stream_with_context start chat=%s request_id=%s user_chars=%d ctx_chars=%d",
+            session_id,
+            request_id or "-",
+            len(user_text or ""),
+            len(context_pack or ""),
+        )
+        lock = self._locks.setdefault(session_id, threading.RLock())
+        with lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise ValueError(f"Unknown session: {session_id}")
+
+            # One-time migration to "clean KV" mode; see ask_with_context docstring.
+            self._ensure_clean_kv_mode(session_id, session)
+
+            if self.persist_dir:
+                kv_path = self.persist_dir / f"{session_id}.kv"
+                if not kv_path.exists():
+                    logger.warning("KV missing for %s, resetting to system-only state", session_id)
+                    system_messages = [m for m in session.get("messages", []) if m.get("role") == "system"]
+                    with self._model_lock:
+                        self.llm.reset()
+                        self._prefill_chat_messages(system_messages)
+                        fresh_state = self.llm.save_state()
+                        prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                        prompt_tokens = self._tokenize_prompt(prompt)
+                    session = {
+                        "state": fresh_state,
+                        "messages": system_messages,
+                        "compacted": False,
+                        "_prompt_tokens": prompt_tokens,
+                        "prompt_renderer": self._PROMPT_RENDERER_ID,
+                    }
+                    self.sessions[session_id] = session
+                    self._persist_session(session_id, session)
+
+            clean_user = (user_text or "").strip()
+            if not clean_user:
+                return
+
+            context_pack = (context_pack or "").strip()
+            context_pack = self._budget_context_pack(
+                session_id,
+                session,
+                user_text=clean_user,
+                context_pack=context_pack,
+                reserved_max_tokens=max_tokens,
+            )
+
+            reply_parts: List[str] = []
+            cancelled = False
+
+            with self._model_lock:
+                self._ensure_session_loaded(session_id, session)
+                base_state = session.get("state")
+                clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
+                clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
+                if not clean_tokens:
+                    clean_prompt = self._render_llama3_prompt(clean_messages, add_generation_prompt=False)
+                    clean_tokens = self._tokenize_prompt(clean_prompt)
+
+                run_messages: List[Dict[str, str]] = list(clean_messages)
+                if context_pack:
+                    run_messages.append({"role": "system", "content": self._format_context_pack(context_pack)})
+                run_messages.append({"role": "user", "content": clean_user})
+
+                run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
+                run_tokens = self._tokenize_prompt(run_prompt)
+                if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
+                    delta = run_tokens[len(clean_tokens) :]
+                    if delta:
+                        self._eval_tokens(delta)
+                else:
+                    self.llm.reset()
+                    self._eval_tokens(run_tokens)
+
+                prompt_tokens = len(run_tokens)
+                max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
+
+                with self._abort_lock:
+                    self._abort_request_id = request_id
+                    self._abort_event = threading.Event() if request_id else None
+
+                try:
+                    stream = self._create_completion_from_state(
+                        prompt_tokens=run_tokens,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        stream=True,
+                        stop=["<|eot_id|>", "<|end_of_text|>"],
+                    )
+
+                    for chunk in stream:
+                        token = (chunk.get("choices") or [{}])[0].get("text") or ""
+                        if not token:
+                            continue
+                        reply_parts.append(token)
+                        yield token
+                except Exception:
+                    with self._abort_lock:
+                        if self._abort_event is not None and self._abort_event.is_set():
+                            cancelled = True
+                    if cancelled:
+                        logger.info("ask_stream_with_context cancelled chat=%s request_id=%s", session_id, request_id or "-")
+                    else:
+                        logger.exception(
+                            "ask_stream_with_context error chat=%s request_id=%s",
+                            session_id,
+                            request_id or "-",
+                        )
+                        raise
+                finally:
+                    with self._abort_lock:
+                        self._abort_request_id = None
+                        self._abort_event = None
+
+                reply = "".join(reply_parts)
+                logger.info(
+                    "ask_stream_with_context llama done chat=%s request_id=%s tokens=%d cancelled=%s",
+                    session_id,
+                    request_id or "-",
+                    len(reply_parts),
+                    cancelled,
+                )
+
+                # Restore clean KV before committing.
+                try:
+                    self.llm.reset()
+                    if base_state is not None:
+                        self.llm.load_state(base_state)
+                    self._active_session_id = session_id
+                except Exception:
+                    self._active_session_id = None
+
+                commit_messages: List[Dict[str, str]] = list(clean_messages)
+                commit_messages.append({"role": "user", "content": clean_user})
+                if reply:
+                    commit_messages.append({"role": "assistant", "content": reply})
+
+                self._commit_messages_to_session(session_id, session, commit_messages)
+
             self.sessions[session_id] = session
             self._persist_session(session_id, session)
 
@@ -301,6 +638,333 @@ class LlamaSessionManager:
             # Streaming will still work, but Stop won't stop model compute.
             logger.warning("Failed to install llama.cpp abort callback: %s", exc)
 
+    def _format_context_pack(self, context_pack: str) -> str:
+        # This is injected as a system message for a single generation only.
+        # Keep this string stable so tokenization/prefix-matching behaves predictably.
+        return "CONTEXT PACK (ephemeral; do not store in history):\n" + (context_pack or "").strip()
+
+    def _budget_context_pack(
+        self,
+        session_id: str,
+        session: Dict[str, object],
+        *,
+        user_text: str,
+        context_pack: str,
+        reserved_max_tokens: int,
+    ) -> str:
+        """
+        Ensure the ephemeral context pack fits in the remaining context window.
+
+        This is a safety net: orchestrator-level budgeting is approximate; this must
+        prevent llama.cpp hard failures near the context limit.
+        """
+        if not context_pack:
+            return ""
+        if not self.ctx_size:
+            return context_pack
+
+        margin = 128
+        ephemeral_cap = 1800  # hard cap to keep "context pack" bounded even on empty chats
+
+        # Compact if the clean session is already near full.
+        self._maybe_compact(session_id, session, force=False)
+
+        # If even the clean turn (user + reserved output) won't fit, force-compaction once.
+        for attempt in range(2):
+            history: List[Dict[str, str]] = list(session.get("messages", []))
+            # Include an empty system message to account for chat-template overhead of the pack.
+            probe = history + [{"role": "system", "content": ""}, {"role": "user", "content": user_text}]
+            try:
+                with self._model_lock:
+                    base_tokens = self._count_chat_prompt_tokens(probe)
+            except Exception:
+                base_tokens = self._estimate_tokens(probe)
+
+            available = int(self.ctx_size) - int(base_tokens) - int(reserved_max_tokens) - int(margin)
+            available = min(available, ephemeral_cap)
+            if available > 0:
+                break
+            if attempt == 0:
+                self._maybe_compact(session_id, session, force=True)
+                continue
+            return ""
+
+        trimmed = self._truncate_text_head_to_tokens(context_pack, max(1, available))
+        # Validate and shrink further if the template overhead makes it spill.
+        for _ in range(3):
+            history = list(session.get("messages", []))
+            candidate_msgs = history + [
+                {"role": "system", "content": self._format_context_pack(trimmed)},
+                {"role": "user", "content": user_text},
+            ]
+            try:
+                with self._model_lock:
+                    prompt_tokens = self._count_chat_prompt_tokens(candidate_msgs)
+            except Exception:
+                prompt_tokens = self._estimate_tokens(candidate_msgs)
+            if prompt_tokens + margin < self.ctx_size:
+                return trimmed
+            available = max(1, int(available * 0.7))
+            trimmed = self._truncate_text_head_to_tokens(trimmed, available)
+        return trimmed
+
+    def _commit_messages_to_session(
+        self,
+        session_id: str,
+        session: Dict[str, object],
+        commit_messages: List[Dict[str, str]],
+    ) -> None:
+        """
+        Update persistent session messages + KV to match `commit_messages`.
+
+        Must be called while holding `_model_lock`.
+        """
+        prev_messages: List[Dict[str, str]] = list(session.get("messages", []))
+        prev_tokens = session.get("_prompt_tokens")
+        if not isinstance(prev_tokens, list):
+            prev_prompt = self._render_llama3_prompt(prev_messages, add_generation_prompt=False)
+            prev_tokens = self._tokenize_prompt(prev_prompt)
+
+        next_prompt = self._render_llama3_prompt(commit_messages, add_generation_prompt=False)
+        next_tokens = self._tokenize_prompt(next_prompt)
+
+        if prev_tokens and next_tokens[: len(prev_tokens)] == prev_tokens:
+            delta = next_tokens[len(prev_tokens) :]
+            if delta:
+                if self.ctx_size and len(next_tokens) > int(self.ctx_size):
+                    raise ValueError(
+                        f"Requested tokens ({len(next_tokens)}) exceed context window of {self.ctx_size}"
+                    )
+                self._eval_tokens(delta)
+        elif not prev_tokens:
+            # First commit (system-only -> first turn) is still append-only.
+            if self.ctx_size and len(next_tokens) > int(self.ctx_size):
+                raise ValueError(f"Requested tokens ({len(next_tokens)}) exceed context window of {self.ctx_size}")
+            self._eval_tokens(next_tokens)
+        else:
+            # Fallback: rebuild KV from scratch if we can't prove prefix relationship.
+            self.llm.reset()
+            self._prefill_chat_messages(commit_messages)
+
+        session["state"] = self.llm.save_state()
+        session["messages"] = commit_messages
+        session["kv_mode"] = "clean_v2"
+        session["_prompt_tokens"] = next_tokens
+        session["prompt_renderer"] = self._PROMPT_RENDERER_ID
+        self._active_session_id = session_id
+
+    def _tokenize_prompt(self, prompt: str) -> List[int]:
+        """
+        Tokenize a prompt containing llama.cpp special tokens (e.g., <|eot_id|>).
+
+        Must be called while holding `_model_lock`.
+        """
+        data = prompt.encode("utf-8")
+        try:
+            return list(self.llm.tokenize(data, add_bos=False, special=True))
+        except TypeError:
+            # Older llama-cpp-python uses positional args (text, add_bos, special).
+            return list(self.llm.tokenize(data, False, True))
+
+    def _eval_tokens(self, tokens: List[int]) -> None:
+        """
+        Eval token ids into the current model state, chunked to avoid llama.cpp batch issues.
+
+        Must be called while holding `_model_lock`.
+        """
+        if not tokens:
+            return
+        n_batch = int(getattr(self.llm, "n_batch", 512) or 512)
+        # Be conservative: large batches near the end of the context can trigger shape mismatches.
+        step = max(1, min(n_batch, 512))
+        for i in range(0, len(tokens), step):
+            self.llm.eval(tokens[i : i + step])
+
+    def _create_completion_from_state(
+        self,
+        *,
+        prompt_tokens: Optional[List[int]] = None,
+        max_tokens: int,
+        temperature: float,
+        stream: bool,
+        stop: Optional[List[str]] = None,
+    ):
+        """
+        Generate a completion from the *current* model KV/state.
+
+        Important: llama-cpp-python's `create_completion(prompt=...)` calls
+        `self.generate(..., reset=True)` internally. With an empty string prompt it
+        will always reset KV, destroying any prefilled state. To preserve KV, we
+        must provide a prompt token list that prefix-matches the current KV so
+        llama-cpp-python's prefix-match logic flips reset=False.
+        """
+        stop = stop or []
+        # When prompt is a token list, llama-cpp-python will NOT auto-prepend BOS/EOS,
+        # and it will attempt a KV prefix-match against the current state.
+        prompt = prompt_tokens if prompt_tokens else ""
+        kwargs = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": stream,
+            "stop": stop,
+        }
+        if hasattr(self.llm, "create_completion"):
+            return self.llm.create_completion(**kwargs)
+
+        # Fallback (should be rare): use __call__ with reset disabled if supported.
+        return self.llm(
+            "" if isinstance(prompt, list) else prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=stream,
+            stop=stop,
+        )
+
+    def _prefill_chat_messages(self, messages: List[Dict[str, str]]) -> None:
+        """
+        Prefill the model KV for a full chat transcript without generating new tokens.
+
+        This codebase targets llama_cpp versions without a public chat-template renderer,
+        so we pre-render a stable Llama-3 prompt and prefill via `eval()` only.
+        """
+        prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
+        tokens = self._tokenize_prompt(prompt)
+        if self.ctx_size and len(tokens) > int(self.ctx_size):
+            raise ValueError(f"Requested tokens ({len(tokens)}) exceed context window of {self.ctx_size}")
+        self._eval_tokens(tokens)
+
+    def _render_llama3_prompt(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool) -> str:
+        """
+        Minimal Llama-3 prompt renderer compatible with llama.cpp tokenizers.
+
+        Keep this minimal + stable to maximize prefix-matching.
+        """
+        system_message = ""
+        rest = list(messages or [])
+        if rest and rest[0].get("role") == "system":
+            system_message = rest[0].get("content") or ""
+            rest = rest[1:]
+
+        out: List[str] = []
+        out.append("<|begin_of_text|>")
+        out.append("<|start_header_id|>system<|end_header_id|>\n\n")
+        out.append(system_message)
+        out.append("<|eot_id|>")
+
+        for msg in rest:
+            role = (msg.get("role") or "user").strip()
+            content = msg.get("content") or ""
+            out.append(f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>")
+
+        if add_generation_prompt:
+            out.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+
+        return "".join(out)
+
+    def _looks_like_legacy_turn_prompt(self, messages: List[Dict[str, str]]) -> bool:
+        """
+        Detect older persisted user prompts that contained injected blocks like:
+        - "Documents:"
+        - "Long-Term Memory:"
+        - "Context:"
+        """
+        for m in messages or []:
+            if m.get("role") != "user":
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            if any(
+                marker in content
+                for marker in (
+                    "Long-Term Memory:\n",
+                    "Documents:\n",
+                    "Context:\n",
+                    "User Query:\n",
+                    "Follow-up Query:\n",
+                    "Selected Excerpt",
+                )
+            ):
+                return True
+        return False
+
+    def _ensure_prompt_renderer(self, session_id: str, session: Dict[str, object]) -> None:
+        """
+        Ensure the session KV/state matches our prompt renderer and tokenization.
+
+        Delta-commit requires that the loaded KV corresponds exactly to the rendered
+        prompt tokens for `session["messages"]`. If this session was created with a
+        different renderer (or with an empty KV), rebuild once.
+        """
+        if session.get("prompt_renderer") == self._PROMPT_RENDERER_ID:
+            if not isinstance(session.get("_prompt_tokens"), list):
+                with self._model_lock:
+                    prompt = self._render_llama3_prompt(list(session.get("messages", [])), add_generation_prompt=False)
+                    session["_prompt_tokens"] = self._tokenize_prompt(prompt)
+            return
+
+        messages: List[Dict[str, str]] = list(session.get("messages", []))
+        logger.info("Rebuilding KV for prompt renderer migration chat=%s", session_id)
+        with self._model_lock:
+            self.llm.reset()
+            self._prefill_chat_messages(messages)
+            session["state"] = self.llm.save_state()
+            self._active_session_id = session_id
+            prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
+            session["_prompt_tokens"] = self._tokenize_prompt(prompt)
+
+        session["prompt_renderer"] = self._PROMPT_RENDERER_ID
+        self.sessions[session_id] = session
+        self._persist_session(session_id, session)
+
+    def _ensure_clean_kv_mode(self, session_id: str, session: Dict[str, object]) -> None:
+        """
+        Ensure this session is operating in "clean KV" mode.
+
+        If we detect legacy persisted prompts, we rebuild KV once from a clean
+        transcript (SQLite preferred) and keep only a small recent tail.
+        """
+        if session.get("kv_mode") == "clean_v2":
+            self._ensure_prompt_renderer(session_id, session)
+            return
+
+        messages: List[Dict[str, str]] = list(session.get("messages", []))
+        if not self._looks_like_legacy_turn_prompt(messages):
+            session["kv_mode"] = "clean_v2"
+            self._ensure_prompt_renderer(session_id, session)
+            return
+
+        logger.info("Migrating legacy KV session to clean_v2 chat=%s", session_id)
+
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        ui_msgs = self._fetch_ui_transcript(session_id, max_messages=40)
+        convo_msgs = ui_msgs[-4:] if ui_msgs else [m for m in messages if m.get("role") != "system"][-4:]
+        if not ui_msgs:
+            convo_msgs = self._clean_history(convo_msgs)
+
+        new_msgs: List[Dict[str, str]] = []
+        new_msgs.extend(system_msgs)
+        new_msgs.extend(convo_msgs)
+
+        with self._model_lock:
+            self.llm.reset()
+            try:
+                self._prefill_chat_messages(new_msgs)
+            except Exception:
+                pass
+            session["state"] = self.llm.save_state()
+            self._active_session_id = session_id
+            prompt = self._render_llama3_prompt(new_msgs, add_generation_prompt=False)
+            session["_prompt_tokens"] = self._tokenize_prompt(prompt)
+            session["prompt_renderer"] = self._PROMPT_RENDERER_ID
+
+        session["messages"] = new_msgs
+        session["compacted"] = True
+        session["kv_mode"] = "clean_v2"
+        self.sessions[session_id] = session
+        self._persist_session(session_id, session)
+
     def ask(
         self,
         session_id: str,
@@ -326,8 +990,17 @@ class LlamaSessionManager:
                     system_messages = [m for m in session.get("messages", []) if m.get("role") == "system"]
                     with self._model_lock:
                         self.llm.reset()
+                        self._prefill_chat_messages(system_messages)
                         fresh_state = self.llm.save_state()
-                    session = {"state": fresh_state, "messages": system_messages, "compacted": False}
+                        prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                        prompt_tokens = self._tokenize_prompt(prompt)
+                    session = {
+                        "state": fresh_state,
+                        "messages": system_messages,
+                        "compacted": False,
+                        "_prompt_tokens": prompt_tokens,
+                        "prompt_renderer": self._PROMPT_RENDERER_ID,
+                    }
                     self.sessions[session_id] = session
                     self._persist_session(session_id, session)
 
@@ -342,27 +1015,54 @@ class LlamaSessionManager:
                 try:
                     # Load KV only if we are switching sessions
                     self._ensure_session_loaded(session_id, session)
-
-                    messages: List[Dict[str, str]] = list(session.get("messages", []))
-                    messages.append({"role": "user", "content": message})
+                    base_state = session.get("state")
+                    clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
+                    clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
+                    if not clean_tokens:
+                        clean_prompt = self._render_llama3_prompt(clean_messages, add_generation_prompt=False)
+                        clean_tokens = self._tokenize_prompt(clean_prompt)
+                    run_messages: List[Dict[str, str]] = list(clean_messages)
+                    run_messages.append({"role": "user", "content": message})
 
                     # Avoid llama.cpp hard failures when prompt_tokens + max_tokens > ctx_size.
-                    prompt_tokens = self._count_chat_prompt_tokens(messages)
+                    run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
+                    run_tokens = self._tokenize_prompt(run_prompt)
+                    if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
+                        delta = run_tokens[len(clean_tokens) :]
+                        if delta:
+                            self._eval_tokens(delta)
+                    else:
+                        self.llm.reset()
+                        self._eval_tokens(run_tokens)
+
+                    prompt_tokens = len(run_tokens)
                     max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
 
-                    out = self.llm.create_chat_completion(
-                        messages=messages,
+                    out = self._create_completion_from_state(
+                        prompt_tokens=run_tokens,
                         max_tokens=max_tokens,
                         temperature=temperature,
+                        stream=False,
+                        stop=["<|eot_id|>", "<|end_of_text|>"],
                     )
-                    reply = out["choices"][0]["message"]["content"]
-                    messages.append({"role": "assistant", "content": reply})
+                    reply = (out.get("choices") or [{}])[0].get("text") or ""
 
-                    # Save updated KV and messages
-                    session["state"] = self.llm.save_state()
-                    session["messages"] = messages
+                    # Restore clean KV before committing.
+                    try:
+                        self.llm.reset()
+                        if base_state is not None:
+                            self.llm.load_state(base_state)
+                        self._active_session_id = session_id
+                    except Exception:
+                        self._active_session_id = None
+
+                    commit_messages: List[Dict[str, str]] = list(clean_messages)
+                    commit_messages.append({"role": "user", "content": message})
+                    if reply:
+                        commit_messages.append({"role": "assistant", "content": reply})
+                    self._commit_messages_to_session(session_id, session, commit_messages)
+
                     self.sessions[session_id] = session
-                    self._active_session_id = session_id
                     self._persist_session(session_id, session)
                     return reply
                 except Exception as exc:
@@ -400,6 +1100,7 @@ class LlamaSessionManager:
             "state": state_copy,
             "messages": list(session["messages"]),
             "compacted": session.get("compacted", False),
+            "_prompt_tokens": list(session.get("_prompt_tokens") or []),
         }
         self.sessions[new_session_id] = fork_payload
         self._locks.setdefault(new_session_id, threading.RLock())
@@ -412,12 +1113,17 @@ class LlamaSessionManager:
             session = self.sessions.get(session_id)
             if session is None:
                 raise ValueError(f"Unknown session: {session_id}")
+            system_messages = [m for m in session.get("messages", []) if m.get("role") == "system"]
             with self._model_lock:
                 self.llm.reset()
+                self._prefill_chat_messages(system_messages)
                 session["state"] = self.llm.save_state()
                 # If we just reset this session, it's now the active one
                 self._active_session_id = session_id
-            session["messages"] = [m for m in session.get("messages", []) if m.get("role") == "system"]
+                prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                session["_prompt_tokens"] = self._tokenize_prompt(prompt)
+                session["prompt_renderer"] = self._PROMPT_RENDERER_ID
+            session["messages"] = system_messages
             session["compacted"] = False
             self.sessions[session_id] = session
             self._persist_session(session_id, session)
@@ -506,11 +1212,13 @@ class LlamaSessionManager:
         with self._model_lock:
             try:
                 self.llm.reset()
-                out = self.llm.create_chat_completion(
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+                prompt = self._render_llama3_prompt(messages, add_generation_prompt=True)
+                out = self.llm(
+                    prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=0.9,
@@ -518,7 +1226,7 @@ class LlamaSessionManager:
                     frequency_penalty=0.6,
                     stop=["SUMMARY_END"],
                 )
-                return out["choices"][0]["message"]["content"].strip()
+                return ((out.get("choices") or [{}])[0].get("text") or "").strip()
             finally:
                 try:
                     self.llm.reset()
@@ -608,15 +1316,15 @@ class LlamaSessionManager:
                 total_words += len(text.split())
             return int(total_words * 1.3)
 
-    def _count_chat_prompt_tokens(self, messages: List[Dict[str, str]]) -> int:
+    def _count_chat_prompt_tokens(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool = False) -> int:
         """
         Estimate prompt tokens for the chat template (more accurate than joining message content).
 
         Must be called while holding `_model_lock`.
         """
         try:
-            prompt = self.llm.apply_chat_template(messages, tokenize=False)
-            return len(self.llm.tokenize(prompt.encode("utf-8")))
+            prompt = self._render_llama3_prompt(messages, add_generation_prompt=add_generation_prompt)
+            return len(self._tokenize_prompt(prompt))
         except Exception:
             # Fallback MUST NOT call `_estimate_tokens()` here because this method is
             # invoked while holding `_model_lock` and `_estimate_tokens()` also locks,
@@ -902,11 +1610,13 @@ class LlamaSessionManager:
             with self._model_lock:
                 self.llm.reset()
                 try:
-                    prompt = self.llm.apply_chat_template(new_msgs, tokenize=False)
-                    self.llm(prompt, max_tokens=0, cache_prompt=True)
+                    self._prefill_chat_messages(new_msgs)
                 except Exception:
                     pass
                 new_state = self.llm.save_state()
+                prompt = self._render_llama3_prompt(new_msgs, add_generation_prompt=False)
+                session["_prompt_tokens"] = self._tokenize_prompt(prompt)
+                session["prompt_renderer"] = self._PROMPT_RENDERER_ID
             session["state"] = new_state
             session["messages"] = new_msgs
             session["compacted"] = bool(session.get("compacted", False))
@@ -940,13 +1650,14 @@ class LlamaSessionManager:
         with self._model_lock:
             self.llm.reset()
             try:
-                prompt = self.llm.apply_chat_template(new_msgs, tokenize=False)
-                # max_tokens=0 + cache_prompt=True builds KV only, no generation
-                self.llm(prompt, max_tokens=0, cache_prompt=True)
+                self._prefill_chat_messages(new_msgs)
             except Exception:
                 # If feeding fails, fall back to empty state
                 pass
             new_state = self.llm.save_state()
+            prompt = self._render_llama3_prompt(new_msgs, add_generation_prompt=False)
+            session["_prompt_tokens"] = self._tokenize_prompt(prompt)
+            session["prompt_renderer"] = self._PROMPT_RENDERER_ID
 
         session["state"] = new_state
         session["messages"] = new_msgs

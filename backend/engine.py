@@ -44,6 +44,7 @@ import codecs
 import json
 import logging
 import sys
+import threading
 import uuid
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
@@ -82,11 +83,11 @@ class StdoutWriter:
     """Serialize writes to stdout to avoid mixed JSON lines."""
 
     def __init__(self) -> None:
-        self._lock = anyio.Lock()
+        self._lock = threading.Lock()
 
-    async def emit(self, obj: Dict[str, Any]) -> None:
+    def emit(self, obj: Dict[str, Any]) -> None:
         line = json.dumps(obj, ensure_ascii=False) + "\n"
-        async with self._lock:
+        with self._lock:
             # Keep sync write inside lock; ensures whole line is written atomically
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -269,7 +270,7 @@ async def _invoke_asgi(
                     )
                 elif item.get("stream_end"):
                     logger.info("Emit stream_end request_id=%s", rid)
-                await writer.emit(item)
+                writer.emit(item)
 
     if stream:
         assert stream_recv is not None
@@ -393,7 +394,7 @@ class RequestManager:
 
         # Basic validation
         if not endpoint or not isinstance(endpoint, str) or not endpoint.startswith("/"):
-            await self.writer.emit(
+            self.writer.emit(
                 {
                     "request_id": request_id,
                     "ok": False,
@@ -404,7 +405,7 @@ class RequestManager:
             return
 
         if not isinstance(payload, dict):
-            await self.writer.emit(
+            self.writer.emit(
                 {
                     "request_id": request_id,
                     "ok": False,
@@ -444,16 +445,16 @@ class RequestManager:
                             writer=self.writer,
                         )
                         assert result is not None
-                        await self.writer.emit(result)
+                        self.writer.emit(result)
             except anyio.get_cancelled_exc_class():
                 # Cancellation: always produce a clean terminal message
                 if stream:
-                    await self.writer.emit(
+                    self.writer.emit(
                         {"request_id": request_id, "stream_error": "cancelled"}
                     )
-                    await self.writer.emit({"request_id": request_id, "stream_end": True})
+                    self.writer.emit({"request_id": request_id, "stream_end": True})
                 else:
-                    await self.writer.emit(
+                    self.writer.emit(
                         {
                             "request_id": request_id,
                             "ok": False,
@@ -464,12 +465,12 @@ class RequestManager:
             except Exception as exc:
                 logger.exception("Request failed request_id=%s", request_id)
                 if stream:
-                    await self.writer.emit(
+                    self.writer.emit(
                         {"request_id": request_id, "stream_error": str(exc)}
                     )
-                    await self.writer.emit({"request_id": request_id, "stream_end": True})
+                    self.writer.emit({"request_id": request_id, "stream_end": True})
                 else:
-                    await self.writer.emit(
+                    self.writer.emit(
                         {
                             "request_id": request_id,
                             "ok": False,
@@ -510,6 +511,15 @@ async def main_async() -> None:
 
     logger.info("ASGI engine ready; waiting for IPC on stdin")
 
+    # Enable out-of-band events (files_changed, file_text_ready, etc.) in IPC mode.
+    # This is intentionally a no-op in HTTP server mode.
+    try:
+        from backend.services.ipc_events import set_ipc_emitter  # local import
+
+        set_ipc_emitter(manager.writer.emit)
+    except Exception:
+        pass
+
     # Bridge stdin (thread) -> async dispatcher.
     # Use a bounded channel to avoid unbounded buffering if Rust sends fast.
     # Note: don't subscript at runtime; keep typing via variable annotations if needed.
@@ -532,7 +542,7 @@ async def main_async() -> None:
                 except Exception as exc:
                     # request_id may not exist; include a generated id
                     rid = str(uuid.uuid4())
-                    await manager.writer.emit(
+                    manager.writer.emit(
                         {"request_id": rid, "ok": False, "status": 400, "error": f"Invalid JSON: {exc}"}
                     )
                     continue
@@ -547,7 +557,7 @@ async def main_async() -> None:
                     bool(msg.get("stream", False)),
                 )
                 if cmd == "shutdown":
-                    await manager.writer.emit(
+                    manager.writer.emit(
                         {"request_id": msg.get("request_id") or str(uuid.uuid4()), "ok": True, "status": 200, "data": {"detail": "shutdown"}}
                     )
                     tg.cancel_scope.cancel()
@@ -586,6 +596,12 @@ async def main_async() -> None:
                 await manager.submit(msg)
 
     await manager.stop()
+    try:
+        from backend.services.ipc_events import set_ipc_emitter  # local import
+
+        set_ipc_emitter(None)
+    except Exception:
+        pass
 
 
 def main() -> None:

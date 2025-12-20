@@ -66,6 +66,7 @@ export function DocumentsPane({
   onAskSelection,
 }: Props) {
   const [files, setFiles] = useState<ChatFile[]>([]);
+  const [pendingUploads, setPendingUploads] = useState<string[]>([]);
   const [internalActiveFileId, setInternalActiveFileId] = useState<string | null>(null);
   const [view, setView] = useState<ExtractedView | null>(null);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
@@ -79,6 +80,8 @@ export function DocumentsPane({
   const [isDropHover, setIsDropHover] = useState(false);
   const dropCounterRef = useRef(0);
   const ingestInFlightRef = useRef(false);
+  const activeFileIdRef = useRef<string | null>(null);
+  const latestFilesChangedRef = useRef<string | null>(null);
 
   const isControlled = typeof activeFileId !== "undefined";
   const effectiveActiveFileId = isControlled ? (activeFileId ?? null) : internalActiveFileId;
@@ -91,6 +94,7 @@ export function DocumentsPane({
   useEffect(() => {
     setError(null);
     setFiles([]);
+    setPendingUploads([]);
     setView(null);
     setIsLoadingFiles(false);
     setIsLoadingView(false);
@@ -103,7 +107,26 @@ export function DocumentsPane({
     if (!isControlled) setInternalActiveFileId(null);
   }, [chatId]);
 
-  const dropEnabled = !files.length && !ingestInFlightRef.current;
+  useEffect(() => {
+    function onPending(e: Event) {
+      const ce = e as CustomEvent;
+      const targetChatId = ce?.detail?.chatId;
+      if (typeof targetChatId !== "string" || targetChatId !== chatId) return;
+      const names = Array.isArray(ce?.detail?.names)
+        ? (ce.detail.names as any[]).filter((x) => typeof x === "string" && x)
+        : [];
+      if (!names.length) return;
+      setPendingUploads(names.slice(0, 6));
+    }
+    window.addEventListener("insight:docs-pending", onPending as any);
+    return () => window.removeEventListener("insight:docs-pending", onPending as any);
+  }, [chatId]);
+
+  useEffect(() => {
+    activeFileIdRef.current = effectiveActiveFileId;
+  }, [effectiveActiveFileId]);
+
+  const dropEnabled = !files.length && !pendingUploads.length && !ingestInFlightRef.current;
 
   async function reloadFiles() {
     const res = await engine<{ files: ChatFile[] }>(
@@ -117,8 +140,109 @@ export function DocumentsPane({
     }
     const next = Array.isArray(res.data?.files) ? res.data.files : [];
     setFiles(next);
+    if (next.length) {
+      setPendingUploads((prev) => (prev.length ? [] : prev));
+    }
     return next;
   }
+
+  // Backend-driven, out-of-band events (no polling):
+  // - files-changed: file registered/attached to this chat
+  // - file-text-ready: extracted view persisted, safe to render
+  // - file-status: ingestion progress update
+  useEffect(() => {
+    let cancelled = false;
+    const unlistenFns: Array<() => void> = [];
+
+    function shouldHandle(payload: any): boolean {
+      return typeof payload?.chat_id === "string" && payload.chat_id === chatId;
+    }
+
+    function safeReloadFilesAndMaybeSelect(payload: any, reason?: string) {
+      reloadFiles()
+        .then((next) => {
+          const fidFromEvent =
+            typeof payload?.file_id === "string" ? payload.file_id : null;
+
+          // When a new file is attached, we want to immediately switch the active
+          // document to that file (even if another file was already selected).
+          // Do this after the list reload so the tab definitely exists.
+          if (reason === "files-changed" && fidFromEvent) {
+            // Multiple files can be registered in quick succession (multi-attach).
+            // Only apply the selection for the latest files-changed event we've seen,
+            // otherwise slower reloads can "snap" the UI back to an earlier file.
+            if (
+              latestFilesChangedRef.current === fidFromEvent &&
+              next.some((f) => f.file_id === fidFromEvent)
+            ) {
+              setActiveFileId(fidFromEvent);
+              return;
+            }
+          }
+
+          const active = activeFileIdRef.current;
+          const activeStillExists = active ? next.some((f) => f.file_id === active) : false;
+          if (active && !activeStillExists) {
+            setActiveFileId(next.length ? next[0].file_id : null);
+            return;
+          }
+          if (!active && next.length) {
+            const preferred =
+              typeof payload?.file_id === "string"
+                ? next.find((f) => f.file_id === payload.file_id)?.file_id
+                : null;
+            setActiveFileId(preferred || next[0].file_id);
+          }
+        })
+        .catch(() => {
+          // ignore; UI can recover on next event/user action
+        });
+    }
+
+    const eventNames = ["files-changed", "file-text-ready", "file-status"];
+    for (const name of eventNames) {
+      listen<any>(name, (event) => {
+        if (cancelled) return;
+        const payload = event?.payload as any;
+        if (!shouldHandle(payload)) return;
+
+        if (name === "files-changed") {
+          const fid = typeof payload?.file_id === "string" ? payload.file_id : null;
+          if (fid) latestFilesChangedRef.current = fid;
+        }
+
+        // Always refresh the file list promptly.
+        safeReloadFilesAndMaybeSelect(payload, name);
+
+        // If the currently selected file finished extracting, refresh the view.
+        if (name === "file-text-ready") {
+          const fid = typeof payload?.file_id === "string" ? payload.file_id : null;
+          const activeFid = activeFileIdRef.current;
+          if (fid) {
+            // If we didn't have an active file yet, auto-select this one.
+            if (!activeFid) {
+              setActiveFileId(fid);
+            } else if (fid === activeFid) {
+              loadView(fid).catch(() => {
+                // ignore
+              });
+            }
+          }
+        }
+      })
+        .then((fn) => {
+          if (!cancelled) unlistenFns.push(fn);
+        })
+        .catch(() => {
+          // ignore (non-Tauri build / event not supported)
+        });
+    }
+
+    return () => {
+      cancelled = true;
+      for (const fn of unlistenFns) fn();
+    };
+  }, [chatId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -152,6 +276,12 @@ export function DocumentsPane({
     if (!paths.length) return;
     if (ingestInFlightRef.current) return;
     ingestInFlightRef.current = true;
+    setPendingUploads(
+      paths
+        .map((p) => String(p).split(/[\\/]/g).pop() || String(p))
+        .filter(Boolean)
+        .slice(0, 6)
+    );
     setError(null);
     setIsLoadingFiles(true);
     setIsDropHover(false);
@@ -420,7 +550,7 @@ export function DocumentsPane({
     );
   }
 
-    return (
+  return (
     <div className="docs-pane">
       <div className="docs-pane-body">
         <div className="docs-tabs" role="tablist" aria-label="Files">
@@ -440,7 +570,26 @@ export function DocumentsPane({
               </button>
             );
           })}
-          {!files.length ? <div className="docs-tabs-empty">No documents yet</div> : null}
+          {!files.length && pendingUploads.length ? (
+            <>
+              {pendingUploads.map((name, idx) => (
+                <button
+                  key={`${name}-${idx}`}
+                  className="docs-tab pending"
+                  type="button"
+                  disabled
+                  aria-disabled="true"
+                  title="Uploading…"
+                >
+                  <span className="docs-tab-spinner" aria-hidden="true" />
+                  <span className="docs-tab-title">{name}</span>
+                </button>
+              ))}
+            </>
+          ) : null}
+          {!files.length && !pendingUploads.length ? (
+            <div className="docs-tabs-empty">No documents yet</div>
+          ) : null}
         </div>
 
         <div
@@ -489,10 +638,19 @@ export function DocumentsPane({
 
           {!files.length ? (
             <div className="docs-pane-empty">
-              <div className="docs-dropzone">
-                <div className="docs-dropzone-title">Drop a document here</div>
-                <div className="docs-dropzone-sub">It will be attached to this card.</div>
-              </div>
+              {pendingUploads.length ? (
+                <div className="docs-dropzone">
+                  <div className="docs-dropzone-title">Uploading…</div>
+                  <div className="docs-dropzone-sub">
+                    Extracted text will appear here once ready.
+                  </div>
+                </div>
+              ) : (
+                <div className="docs-dropzone">
+                  <div className="docs-dropzone-title">Drop a document here</div>
+                  <div className="docs-dropzone-sub">It will be attached to this card.</div>
+                </div>
+              )}
             </div>
           ) : null}
 

@@ -281,6 +281,9 @@ pub fn run() {
             let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python3".into());
             let engine = EngineProcess::spawn(&python_bin)
                 .map_err(|e| format!("Failed to spawn Python engine: {}", e))?;
+            // Allow the stdout router thread to emit out-of-band backend events
+            // (e.g. files_changed / file_text_ready) to the frontend.
+            engine.set_app_handle(app.app_handle().clone());
             app.manage(Arc::new(engine));
 
             // Watch KV sessions for real-time updates.

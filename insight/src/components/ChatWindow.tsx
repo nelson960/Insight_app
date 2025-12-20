@@ -357,6 +357,18 @@ export function ChatWindow({
       ? { text: selection.text, file_id: selection.file_id }
       : undefined;
 
+    if (attachedNames.length) {
+      try {
+        window.dispatchEvent(
+          new CustomEvent("insight:docs-pending", {
+            detail: { chatId, names: attachedNames },
+          })
+        );
+      } catch {
+        // ignore
+      }
+    }
+
     const userMsg: ChatMessage = {
       id: `${Date.now()}-user`,
       role: "user",
@@ -386,7 +398,16 @@ export function ChatWindow({
           : `${Date.now()}-${Math.random()}`) as string;
       activeRequestIdRef.current = requestId;
       const paths = attached;
-      const documents = activeDocumentId ? [activeDocumentId] : undefined;
+      // Option A (backend contract): `focus_document_id` biases retrieval but does not hard-filter.
+      // Do NOT send `documents` from the UI (it can cause the backend to inline-stitch that doc
+      // and skip broader RAG). The backend already scopes retrieval to the chat's files.
+      //
+      // If the user attached new files in this same send, omit focus_document_id so the backend
+      // can default focus to the first ingested doc for this turn.
+      const focusDocForTurn =
+        paths.length > 0
+          ? undefined
+          : activeDocumentId || undefined;
 
       unlistenTokenRef.current = await listen<{ token: string; chat_id?: string; request_id?: string }>(
         "llm-token",
@@ -427,7 +448,6 @@ export function ChatWindow({
           if (chatId) {
             refreshContextStatus(chatId).catch(() => {});
           }
-          if (onRequestDocsRefresh) onRequestDocsRefresh();
         }
       );
 
@@ -447,7 +467,6 @@ export function ChatWindow({
           if (chatId) {
             refreshContextStatus(chatId).catch(() => {});
           }
-          if (onRequestDocsRefresh) onRequestDocsRefresh();
         }
       );
 
@@ -457,11 +476,9 @@ export function ChatWindow({
         query: trimmed,
         requestId,
         paths,
-        documents,
-        focusDocumentId: activeDocumentId,
+        focusDocumentId: focusDocForTurn,
         selection: selectionPayload,
       });
-      if (paths.length && onRequestDocsRefresh) onRequestDocsRefresh();
     } catch (err: any) {
       console.error("Chat error", err);
       setError(err?.message ?? String(err));

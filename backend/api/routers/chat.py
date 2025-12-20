@@ -15,6 +15,7 @@ from backend.api.deps import AppDependencies
 from backend.services.ingestion import create_extraction_service, IngestionRequest, FilePolicy
 from backend.services.extraction.detector import detect_mime_type
 from backend.services.security import encrypt_bytes
+from backend.services.ipc_events import emit_event
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -130,6 +131,13 @@ async def _upload_and_chat_internal(chat_id: str, query: str, files: List[Upload
                 is_encrypted=True,
                 policy={"pii": False},
             )
+            emit_event(
+                "files_changed",
+                chat_id=chat_id,
+                file_id=file_id,
+                filename=filename,
+                status="registered",
+            )
             ingestion_request = IngestionRequest(
                 file_id=file_id,
                 source_path=str(temp_path),
@@ -154,7 +162,9 @@ async def _upload_and_chat_internal(chat_id: str, query: str, files: List[Upload
             query=query,
             documents=doc_ids,
             documents_text=doc_texts,
-            focus_document_id=(doc_ids[0] if doc_ids else None),
+            # Default focus to the most recently attached doc for this turn.
+            # This matches the UX: “upload → ask about the document I just uploaded”.
+            focus_document_id=(doc_ids[-1] if doc_ids else None),
         )
         result = service.handle_request(req)
         resp: Dict[str, Any] = {
@@ -245,6 +255,13 @@ async def _ingest_paths_for_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
                 chat_id=chat_id,
                 source="desktop_path",
             )
+            emit_event(
+                "files_changed",
+                chat_id=chat_id,
+                file_id=file_id,
+                filename=filename,
+                status="registered",
+            )
 
             ingestion_request = IngestionRequest(
                 file_id=file_id,
@@ -272,8 +289,8 @@ async def _ingest_paths_for_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload["documents"] = doc_ids
         payload["documents_text"] = doc_texts
         payload["attachments"] = attachment_names
-        # If no explicit focus was provided, default focus to the first ingested doc.
-        payload.setdefault("focus_document_id", doc_ids[0] if doc_ids else None)
+        # If no explicit focus was provided, default focus to the most recently ingested doc.
+        payload.setdefault("focus_document_id", doc_ids[-1] if doc_ids else None)
         return payload
 
 
