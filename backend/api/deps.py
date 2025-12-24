@@ -22,6 +22,7 @@ from backend.services.retrieval import RetrievalService
 from backend.services.security import KeyManager
 from backend.services.storage import SQLiteConfig, QdrantConfig, SQLiteMetadataStore, QdrantVectorIndex
 from backend.services.connectors import NomicOnnxConfig, NomicOnnxEmbedTextConnector, LlamaSessionManager
+from backend.services.search import DocSearchService, FileSearchService
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ class AppDependencies:
     _session_manager: Optional[LlamaSessionManager] = None
     _rag_store: Optional[RagStore] = None
     _ltm_store: Optional[Any] = None
+    _search_service: Optional[FileSearchService] = None
+    _doc_search_service: Optional[DocSearchService] = None
 
     @classmethod
     def workspace(cls) -> Workspace:
@@ -142,6 +145,20 @@ class AppDependencies:
         if cls._key_manager is None:
             cls._key_manager = KeyManager(cls.workspace())
         return cls._key_manager
+
+    @classmethod
+    def search_service(cls) -> FileSearchService:
+        if cls._search_service is None:
+            sqlite_store, _ = cls.storage()
+            cls._search_service = FileSearchService(sqlite_store)
+        return cls._search_service
+
+    @classmethod
+    def doc_search_service(cls) -> DocSearchService:
+        if cls._doc_search_service is None:
+            sqlite_store, _ = cls.storage()
+            cls._doc_search_service = DocSearchService(sqlite_store)
+        return cls._doc_search_service
 
     @classmethod
     def query_embedder(cls) -> Optional[Callable[[str], Sequence[float]]]:

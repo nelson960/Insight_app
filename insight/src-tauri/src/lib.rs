@@ -101,6 +101,56 @@ fn list_sessions() -> Result<Value, String> {
                     }
                 }
             }
+
+            // Also include chats that have files/documents attached even if they have no messages yet.
+            // This ensures cards persist when the user only uploads/edits documents without chatting.
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT chat_id, MAX(created_at) AS last_ts FROM files WHERE chat_id IS NOT NULL AND chat_id != '' GROUP BY chat_id ORDER BY last_ts DESC",
+            ) {
+                let rows = stmt.query_map([], |row| {
+                    let chat_id: String = row.get(0)?;
+                    Ok(chat_id)
+                });
+                if let Ok(rows) = rows {
+                    for chat_id in rows.flatten() {
+                        if !seen.insert(chat_id.clone()) {
+                            continue;
+                        }
+                        // Best-effort title: first user message if present, else first filename.
+                        let mut title: Option<String> = None;
+                        if let Ok(mut tstmt) = conn.prepare(
+                            "SELECT content_json FROM messages WHERE chat_id=? AND role='user' ORDER BY created_at ASC LIMIT 1",
+                        ) {
+                            if let Ok(mut trows) = tstmt.query([chat_id.clone()]) {
+                                if let Ok(Some(r)) = trows.next() {
+                                    let content_json: String = r.get(0).unwrap_or_default();
+                                    title = _extract_title_from_content_json(&content_json);
+                                }
+                            }
+                        }
+                        if title.is_none() {
+                            if let Ok(mut fstmt) = conn.prepare(
+                                "SELECT filename FROM files WHERE chat_id=? ORDER BY created_at ASC LIMIT 1",
+                            ) {
+                                if let Ok(mut frows) = fstmt.query([chat_id.clone()]) {
+                                    if let Ok(Some(r)) = frows.next() {
+                                        let filename: String = r.get(0).unwrap_or_default();
+                                        let f = filename.trim();
+                                        if !f.is_empty() {
+                                            title = Some(f.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(t) = title {
+                            sessions.push(serde_json::json!({ "chat_id": chat_id, "title": t }));
+                        } else {
+                            sessions.push(serde_json::json!({ "chat_id": chat_id }));
+                        }
+                    }
+                }
+            }
         }
     }
 

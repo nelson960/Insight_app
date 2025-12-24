@@ -6,14 +6,19 @@ import re
 from pathlib import Path
 from typing import Dict, Optional, List
 
+import atexit
+import json
 import pickle
+import queue
 import threading
+import time
 import ctypes
 
 import llama_cpp
 from llama_cpp import Llama
 
 from backend.services.storage.sqlite_store import SQLiteMetadataStore
+from backend.services.ipc_events import emit_event
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 class LlamaSessionManager:
     _PROMPT_RENDERER_ID = "llama3_manual_v2"
+    _PERSIST_DEBOUNCE_SEC = 0.75
+    _SNAPSHOT_DEBOUNCE_SEC = 0.35
+    _STATE_KIND_COMPACT = "llama_state_compact_v1"
     """
     Single-model, multi-session manager using llama_cpp KV snapshots.
 
@@ -88,8 +96,26 @@ class LlamaSessionManager:
         self.persist_dir = Path(persist_dir) if persist_dir else None
         self._metadata_store = metadata_store
         self.ltm_store = ltm_store
+        self._persist_queue: Optional[queue.Queue[Optional[str]]] = None
+        self._persist_thread: Optional[threading.Thread] = None
+        self._persist_stop = threading.Event()
+        self._persist_mutex = threading.Lock()
+        self._persist_pending: Dict[str, Dict[str, object]] = {}
+        self._persist_scheduled: set[str] = set()
+
+        # KV snapshotting is expensive (copies hundreds of MB). To avoid blocking user-visible
+        # request completion, we can defer state snapshots and persist them during idle time.
+        self._snapshot_queue: Optional[queue.Queue[Optional[str]]] = None
+        self._snapshot_thread: Optional[threading.Thread] = None
+        self._snapshot_stop = threading.Event()
+        self._snapshot_mutex = threading.Lock()
+        self._snapshot_scheduled: set[str] = set()
+        self._start_snapshot_worker()
+        atexit.register(self._shutdown_snapshot_worker)
+
         if self.persist_dir:
             self.persist_dir.mkdir(parents=True, exist_ok=True)
+            self._start_persist_worker()
             self._load_persisted_sessions()
             try:
                 logger.info(
@@ -99,6 +125,7 @@ class LlamaSessionManager:
                 )
             except Exception:
                 pass
+            atexit.register(self._shutdown_persist_worker)
 
     # -------------------------------------------------------------------------
     # Public session API
@@ -129,7 +156,7 @@ class LlamaSessionManager:
                 messages.append({"role": "system", "content": system_prompt})
             # Ensure session KV matches our rendered prompt format (system wrapper included).
             self._prefill_chat_messages(messages)
-            state_obj = self.llm.save_state()
+            state_obj = self._save_state_compact()
             prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
             prompt_tokens = self._tokenize_prompt(prompt)
         session_payload = {
@@ -157,7 +184,7 @@ class LlamaSessionManager:
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             self._prefill_chat_messages(messages)
-            state_obj = self.llm.save_state()
+            state_obj = self._save_state_compact()
             prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
             prompt_tokens = self._tokenize_prompt(prompt)
         session_payload = {
@@ -204,7 +231,7 @@ class LlamaSessionManager:
                     with self._model_lock:
                         self.llm.reset()
                         self._prefill_chat_messages(system_messages)
-                        fresh_state = self.llm.save_state()
+                        fresh_state = self._save_state_compact()
                         prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
                         prompt_tokens = self._tokenize_prompt(prompt)
                     session = {
@@ -231,6 +258,12 @@ class LlamaSessionManager:
                 # llama_cpp is not safe to interleave with other calls while a stream
                 # iterator is active.
                 self._ensure_session_loaded(session_id, session)
+                # If the previous turn deferred the expensive KV snapshot, take it now so
+                # `base_state` always matches the current clean transcript.
+                if bool(session.get("_state_dirty")):
+                    session["state"] = self._save_state_compact()
+                    session["_state_dirty"] = False
+                    session.pop("_state_dirty_at", None)
                 base_state = session.get("state")
                 clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
                 clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
@@ -316,7 +349,7 @@ class LlamaSessionManager:
                 try:
                     self.llm.reset()
                     if base_state is not None:
-                        self.llm.load_state(base_state)
+                        self._load_state_compact(base_state)
                     self._active_session_id = session_id
                 except Exception:
                     self._active_session_id = None
@@ -339,6 +372,7 @@ class LlamaSessionManager:
         session_id: str,
         *,
         user_text: str,
+        run_user_text: Optional[str] = None,
         context_pack: str = "",
         max_tokens: int = 256,
         temperature: float = 0.2,
@@ -371,7 +405,7 @@ class LlamaSessionManager:
                     with self._model_lock:
                         self.llm.reset()
                         self._prefill_chat_messages(system_messages)
-                        fresh_state = self.llm.save_state()
+                        fresh_state = self._save_state_compact()
                         prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
                         prompt_tokens = self._tokenize_prompt(prompt)
                     session = {
@@ -388,17 +422,27 @@ class LlamaSessionManager:
             if not clean_user:
                 return ""
 
+            # Dirty run may include selection excerpts or other per-turn guidance.
+            # This must NOT be persisted into the clean session transcript/KV.
+            run_user = (run_user_text or clean_user).strip()
+            if not run_user:
+                run_user = clean_user
+
             context_pack = (context_pack or "").strip()
             context_pack = self._budget_context_pack(
                 session_id,
                 session,
-                user_text=clean_user,
+                user_text=run_user,
                 context_pack=context_pack,
                 reserved_max_tokens=max_tokens,
             )
 
             with self._model_lock:
                 self._ensure_session_loaded(session_id, session)
+                if bool(session.get("_state_dirty")):
+                    session["state"] = self._save_state_compact()
+                    session["_state_dirty"] = False
+                    session.pop("_state_dirty_at", None)
                 base_state = session.get("state")
                 clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
                 clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
@@ -409,7 +453,7 @@ class LlamaSessionManager:
                 run_messages: List[Dict[str, str]] = list(clean_messages)
                 if context_pack:
                     run_messages.append({"role": "system", "content": self._format_context_pack(context_pack)})
-                run_messages.append({"role": "user", "content": clean_user})
+                run_messages.append({"role": "user", "content": run_user})
 
                 run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
                 run_tokens = self._tokenize_prompt(run_prompt)
@@ -422,11 +466,31 @@ class LlamaSessionManager:
                     self._eval_tokens(run_tokens)
 
                 prompt_tokens = len(run_tokens)
+                requested_max_tokens = int(max_tokens)
                 max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
+
+                # If the model hits max_tokens, the reply can look abruptly cut off.
+                # For "normal" answers, allow a larger hard cap so the model can reach
+                # an end-of-turn stop token naturally.
+                hard_total = int(max_tokens)
+                if int(max_tokens) >= 384 and self.ctx_size:
+                    margin = 128
+                    available_total = int(self.ctx_size) - int(prompt_tokens) - int(margin)
+                    if available_total > 0:
+                        hard_total = min(int(max_tokens) * 2, 1024, int(available_total))
+                logger.info(
+                    "ask_with_context output_budget chat=%s prompt_tokens=%d requested=%d clamped=%d hard_total=%d ctx=%d",
+                    session_id,
+                    prompt_tokens,
+                    requested_max_tokens,
+                    int(max_tokens),
+                    int(hard_total),
+                    int(self.ctx_size or 0),
+                )
 
                 out = self._create_completion_from_state(
                     prompt_tokens=run_tokens,
-                    max_tokens=max_tokens,
+                    max_tokens=int(hard_total),
                     temperature=temperature,
                     stream=False,
                     stop=["<|eot_id|>", "<|end_of_text|>"],
@@ -437,7 +501,7 @@ class LlamaSessionManager:
                 try:
                     self.llm.reset()
                     if base_state is not None:
-                        self.llm.load_state(base_state)
+                        self._load_state_compact(base_state)
                     self._active_session_id = session_id
                 except Exception:
                     # If restore fails, fallback to a rebuild commit below.
@@ -458,6 +522,7 @@ class LlamaSessionManager:
         session_id: str,
         *,
         user_text: str,
+        run_user_text: Optional[str] = None,
         context_pack: str = "",
         max_tokens: int = 256,
         temperature: float = 0.2,
@@ -470,10 +535,11 @@ class LlamaSessionManager:
         but commits only clean user + assistant text to persistent KV on completion.
         """
         logger.info(
-            "ask_stream_with_context start chat=%s request_id=%s user_chars=%d ctx_chars=%d",
+            "ask_stream_with_context start chat=%s request_id=%s user_chars=%d run_user_chars=%d ctx_chars=%d",
             session_id,
             request_id or "-",
             len(user_text or ""),
+            len(run_user_text or ""),
             len(context_pack or ""),
         )
         lock = self._locks.setdefault(session_id, threading.RLock())
@@ -493,7 +559,7 @@ class LlamaSessionManager:
                     with self._model_lock:
                         self.llm.reset()
                         self._prefill_chat_messages(system_messages)
-                        fresh_state = self.llm.save_state()
+                        fresh_state = self._save_state_compact()
                         prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
                         prompt_tokens = self._tokenize_prompt(prompt)
                     session = {
@@ -510,11 +576,15 @@ class LlamaSessionManager:
             if not clean_user:
                 return
 
+            run_user = (run_user_text or clean_user).strip()
+            if not run_user:
+                run_user = clean_user
+
             context_pack = (context_pack or "").strip()
             context_pack = self._budget_context_pack(
                 session_id,
                 session,
-                user_text=clean_user,
+                user_text=run_user,
                 context_pack=context_pack,
                 reserved_max_tokens=max_tokens,
             )
@@ -524,6 +594,10 @@ class LlamaSessionManager:
 
             with self._model_lock:
                 self._ensure_session_loaded(session_id, session)
+                if bool(session.get("_state_dirty")):
+                    session["state"] = self._save_state_compact()
+                    session["_state_dirty"] = False
+                    session.pop("_state_dirty_at", None)
                 base_state = session.get("state")
                 clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
                 clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
@@ -534,7 +608,7 @@ class LlamaSessionManager:
                 run_messages: List[Dict[str, str]] = list(clean_messages)
                 if context_pack:
                     run_messages.append({"role": "system", "content": self._format_context_pack(context_pack)})
-                run_messages.append({"role": "user", "content": clean_user})
+                run_messages.append({"role": "user", "content": run_user})
 
                 run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
                 run_tokens = self._tokenize_prompt(run_prompt)
@@ -547,6 +621,7 @@ class LlamaSessionManager:
                     self._eval_tokens(run_tokens)
 
                 prompt_tokens = len(run_tokens)
+                requested_max_tokens = int(max_tokens)
                 max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
 
                 with self._abort_lock:
@@ -554,9 +629,28 @@ class LlamaSessionManager:
                     self._abort_event = threading.Event() if request_id else None
 
                 try:
+                    # Allow a larger hard cap for "normal" answers so we don't cut off
+                    # mid-thought when the initial dynamic output budget is small.
+                    hard_total = int(max_tokens)
+                    if int(max_tokens) >= 384 and self.ctx_size:
+                        margin = 128
+                        available_total = int(self.ctx_size) - int(prompt_tokens) - int(margin)
+                        if available_total > 0:
+                            hard_total = min(int(max_tokens) * 2, 1024, int(available_total))
+                    logger.info(
+                        "ask_stream_with_context output_budget chat=%s request_id=%s prompt_tokens=%d requested=%d clamped=%d hard_total=%d ctx=%d",
+                        session_id,
+                        request_id or "-",
+                        prompt_tokens,
+                        requested_max_tokens,
+                        int(max_tokens),
+                        int(hard_total),
+                        int(self.ctx_size or 0),
+                    )
+
                     stream = self._create_completion_from_state(
                         prompt_tokens=run_tokens,
-                        max_tokens=max_tokens,
+                        max_tokens=int(hard_total),
                         temperature=temperature,
                         stream=True,
                         stop=["<|eot_id|>", "<|end_of_text|>"],
@@ -594,12 +688,23 @@ class LlamaSessionManager:
                     len(reply_parts),
                     cancelled,
                 )
+                try:
+                    emit_event(
+                        "llm_generation_done",
+                        chat_id=session_id,
+                        request_id=request_id or "",
+                        tokens=len(reply_parts),
+                        cancelled=bool(cancelled),
+                    )
+                except Exception:
+                    # Never let IPC events affect core chat flow.
+                    pass
 
                 # Restore clean KV before committing.
                 try:
                     self.llm.reset()
                     if base_state is not None:
-                        self.llm.load_state(base_state)
+                        self._load_state_compact(base_state)
                     self._active_session_id = session_id
                 except Exception:
                     self._active_session_id = None
@@ -746,12 +851,21 @@ class LlamaSessionManager:
             self.llm.reset()
             self._prefill_chat_messages(commit_messages)
 
-        session["state"] = self.llm.save_state()
         session["messages"] = commit_messages
         session["kv_mode"] = "clean_v2"
         session["_prompt_tokens"] = next_tokens
         session["prompt_renderer"] = self._PROMPT_RENDERER_ID
         self._active_session_id = session_id
+        # IMPORTANT: do not call `_save_state_compact()` here. Copying the full KV state can
+        # take hundreds of milliseconds to seconds on large contexts, and would block the
+        # user-visible request completion (especially at the end of streaming).
+        #
+        # Instead, mark the state as dirty and snapshot/persist from the background worker
+        # during idle time. We will still snapshot synchronously when needed (e.g. before
+        # switching away) to preserve correctness.
+        session["_state_dirty"] = True
+        session["_state_dirty_at"] = time.monotonic()
+        self._schedule_snapshot(session_id)
 
     def _tokenize_prompt(self, prompt: str) -> List[int]:
         """
@@ -792,34 +906,80 @@ class LlamaSessionManager:
         """
         Generate a completion from the *current* model KV/state.
 
-        Important: llama-cpp-python's `create_completion(prompt=...)` calls
-        `self.generate(..., reset=True)` internally. With an empty string prompt it
-        will always reset KV, destroying any prefilled state. To preserve KV, we
-        must provide a prompt token list that prefix-matches the current KV so
-        llama-cpp-python's prefix-match logic flips reset=False.
+        IMPORTANT: We must *not* let llama-cpp-python reset the model state. In
+        llama_cpp 0.3.16, `create_completion()` does not expose a "reset=False"
+        path, and can also re-evaluate prompt tokens internally (undoing our
+        careful chunked eval and causing shape mismatch errors).
+
+        For performance + correctness, generate directly from the current KV via
+        `Llama.generate(..., reset=False)` and stop on the chat EOT markers.
         """
         stop = stop or []
-        # When prompt is a token list, llama-cpp-python will NOT auto-prepend BOS/EOS,
-        # and it will attempt a KV prefix-match against the current state.
-        prompt = prompt_tokens if prompt_tokens else ""
-        kwargs = {
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": stream,
-            "stop": stop,
-        }
-        if hasattr(self.llm, "create_completion"):
-            return self.llm.create_completion(**kwargs)
+        stop_token_ids: set[int] = set()
+        for s in stop:
+            if not isinstance(s, str) or not s:
+                continue
+            try:
+                toks = list(self.llm.tokenize(s.encode("utf-8"), add_bos=False, special=True))
+            except TypeError:
+                toks = list(self.llm.tokenize(s.encode("utf-8"), False, True))
+            if len(toks) == 1:
+                try:
+                    stop_token_ids.add(int(toks[0]))
+                except Exception:
+                    pass
+        try:
+            stop_token_ids.add(int(self.llm.token_eos()))
+        except Exception:
+            pass
 
-        # Fallback (should be rare): use __call__ with reset disabled if supported.
-        return self.llm(
-            "" if isinstance(prompt, list) else prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stream=stream,
-            stop=stop,
-        )
+        def _iter_tokens():
+            produced = 0
+            try:
+                gen = self.llm.generate(
+                    [],
+                    temp=float(temperature),
+                    reset=False,
+                )
+                for tok_id in gen:
+                    try:
+                        tok_i = int(tok_id)
+                    except Exception:
+                        continue
+                    if tok_i in stop_token_ids:
+                        break
+                    piece = self.llm.detokenize([tok_i]).decode("utf-8", errors="ignore")
+                    if not piece:
+                        continue
+                    produced += 1
+                    yield piece
+                    if produced >= int(max_tokens):
+                        break
+            except Exception:
+                # If direct generate fails for any reason, fall back to create_completion.
+                # This is slower and may reset/eval internally, but keeps the system usable.
+                prompt = prompt_tokens if prompt_tokens else ""
+                out = self.llm.create_completion(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stream=True,
+                    stop=stop,
+                )
+                for chunk in out:
+                    text = (chunk.get("choices") or [{}])[0].get("text") or ""
+                    if text:
+                        yield text
+
+        if stream:
+            def _stream():
+                for piece in _iter_tokens():
+                    yield {"choices": [{"text": piece}]}
+
+            return _stream()
+
+        text = "".join(_iter_tokens())
+        return {"choices": [{"text": text}]}
 
     def _prefill_chat_messages(self, messages: List[Dict[str, str]]) -> None:
         """
@@ -909,7 +1069,7 @@ class LlamaSessionManager:
         with self._model_lock:
             self.llm.reset()
             self._prefill_chat_messages(messages)
-            session["state"] = self.llm.save_state()
+            session["state"] = self._save_state_compact()
             self._active_session_id = session_id
             prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
             session["_prompt_tokens"] = self._tokenize_prompt(prompt)
@@ -953,7 +1113,7 @@ class LlamaSessionManager:
                 self._prefill_chat_messages(new_msgs)
             except Exception:
                 pass
-            session["state"] = self.llm.save_state()
+            session["state"] = self._save_state_compact()
             self._active_session_id = session_id
             prompt = self._render_llama3_prompt(new_msgs, add_generation_prompt=False)
             session["_prompt_tokens"] = self._tokenize_prompt(prompt)
@@ -991,7 +1151,7 @@ class LlamaSessionManager:
                     with self._model_lock:
                         self.llm.reset()
                         self._prefill_chat_messages(system_messages)
-                        fresh_state = self.llm.save_state()
+                        fresh_state = self._save_state_compact()
                         prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
                         prompt_tokens = self._tokenize_prompt(prompt)
                     session = {
@@ -1015,6 +1175,10 @@ class LlamaSessionManager:
                 try:
                     # Load KV only if we are switching sessions
                     self._ensure_session_loaded(session_id, session)
+                    if bool(session.get("_state_dirty")):
+                        session["state"] = self._save_state_compact()
+                        session["_state_dirty"] = False
+                        session.pop("_state_dirty_at", None)
                     base_state = session.get("state")
                     clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
                     clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
@@ -1051,7 +1215,7 @@ class LlamaSessionManager:
                     try:
                         self.llm.reset()
                         if base_state is not None:
-                            self.llm.load_state(base_state)
+                            self._load_state_compact(base_state)
                         self._active_session_id = session_id
                     except Exception:
                         self._active_session_id = None
@@ -1117,7 +1281,7 @@ class LlamaSessionManager:
             with self._model_lock:
                 self.llm.reset()
                 self._prefill_chat_messages(system_messages)
-                session["state"] = self.llm.save_state()
+                session["state"] = self._save_state_compact()
                 # If we just reset this session, it's now the active one
                 self._active_session_id = session_id
                 prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
@@ -1132,6 +1296,9 @@ class LlamaSessionManager:
         lock = self._locks.setdefault(session_id, threading.RLock())
         with lock:
             self.sessions.pop(session_id, None)
+            with self._persist_mutex:
+                self._persist_pending.pop(session_id, None)
+                self._persist_scheduled.discard(session_id)
             if self._active_session_id == session_id:
                 # Clear KV for safety since we reuse the same llm instance
                 with self._model_lock:
@@ -1144,7 +1311,8 @@ class LlamaSessionManager:
             if self.persist_dir:
                 kv_path = self.persist_dir / f"{session_id}.kv"
                 msg_path = self.persist_dir / f"{session_id}.json"
-                for p in (kv_path, msg_path):
+                meta_path = self.persist_dir / f"{session_id}.meta.json"
+                for p in (kv_path, msg_path, meta_path):
                     if p.exists():
                         p.unlink()
 
@@ -1168,7 +1336,7 @@ class LlamaSessionManager:
                 self._ensure_session_loaded(session_id, session)
                 out = self.llm(text, max_tokens=max_tokens, temperature=temperature)
                 reply = out["choices"][0]["text"]
-                session["state"] = self.llm.save_state()
+                session["state"] = self._save_state_compact()
                 self._active_session_id = session_id
             self.sessions[session_id] = session
             self._persist_session(session_id, session)
@@ -1193,7 +1361,7 @@ class LlamaSessionManager:
                 out = self.llm(prompt, max_tokens=max_tokens, temperature=temperature)
                 reply = out["choices"][0]["text"]
                 # restore original state
-                self.llm.load_state(original_state)
+                self._load_state_compact(original_state)
                 self._active_session_id = session_id
             return reply
 
@@ -1239,37 +1407,34 @@ class LlamaSessionManager:
     # -------------------------------------------------------------------------
 
     def _persist_session(self, session_id: str, session: Dict[str, object]) -> None:
+        """
+        Schedule persistence of this session (KV + messages + metadata) to disk.
+
+        This must not block the user-visible request path; we debounce and write from a
+        background thread.
+        """
         if not self.persist_dir:
             return
-        try:
-            self.persist_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            logger.warning("Failed to ensure persist_dir %s: %s", self.persist_dir, exc)
+        if not isinstance(session_id, str) or not session_id:
             return
-        kv_path = self.persist_dir / f"{session_id}.kv"
-        msg_path = self.persist_dir / f"{session_id}.json"
-        state_obj = session.get("state")
-        try:
-            if state_obj is not None:
-                with kv_path.open("wb") as f:
-                    pickle.dump(state_obj, f)
-        except Exception as exc:
-            logger.warning("Failed to persist KV for %s: %s", session_id, exc)
-        try:
-            import json
-            msg_path.write_text(json.dumps(session.get("messages", []), ensure_ascii=False))
-        except Exception as exc:
-            logger.warning("Failed to persist messages for %s: %s", session_id, exc)
+        # Never persist a KV snapshot that doesn't correspond to the stored messages.
+        # When `_state_dirty` is True we have updated `session["messages"]` but have not yet
+        # captured a new KV state. Persisting now would create an inconsistent `.kv`+`.json`
+        # pair and force a rebuild on restart. Snapshot first, then persist.
+        if bool(session.get("_state_dirty")):
+            self._schedule_snapshot(session_id)
+            return
+        self._schedule_persist(session_id, session)
 
     def _load_persisted_sessions(self) -> None:
         if not self.persist_dir or not self.persist_dir.exists():
             return
-        import json
+        # Load .kv state + .json messages + optional .meta.json.
         for path in self.persist_dir.glob("*.kv"):
             try:
                 session_id = path.stem
                 with path.open("rb") as f:
-                    state = pickle.load(f)
+                    state = self._coerce_state_compact(pickle.load(f))
                 msg_path = self.persist_dir / f"{session_id}.json"
                 messages: List[Dict[str, str]] = []
                 if msg_path.exists():
@@ -1277,14 +1442,365 @@ class LlamaSessionManager:
                         messages = json.loads(msg_path.read_text()) or []
                     except Exception:
                         messages = []
-                self.sessions[session_id] = {"state": state, "messages": messages, "compacted": False}
+                meta_path = self.persist_dir / f"{session_id}.meta.json"
+                meta: Dict[str, object] = {}
+                if meta_path.exists():
+                    try:
+                        meta = json.loads(meta_path.read_text()) or {}
+                    except Exception:
+                        meta = {}
+                session_payload: Dict[str, object] = {"state": state, "messages": messages}
+                if isinstance(meta, dict):
+                    for k in ("compacted", "kv_mode", "prompt_renderer", "_prompt_tokens", "compaction_tick", "ltm_summary"):
+                        if k in meta:
+                            session_payload[k] = meta.get(k)
+                if "compacted" not in session_payload:
+                    session_payload["compacted"] = False
+                self.sessions[session_id] = session_payload
                 self._locks.setdefault(session_id, threading.RLock())
             except Exception:
                 continue
 
+    def _start_persist_worker(self) -> None:
+        if self._persist_thread is not None:
+            return
+        self._persist_queue = queue.Queue()
+        self._persist_thread = threading.Thread(target=self._persist_worker_loop, daemon=True)
+        self._persist_thread.start()
+
+    def _shutdown_persist_worker(self) -> None:
+        try:
+            self._persist_stop.set()
+            q = self._persist_queue
+            if q is not None:
+                q.put(None)
+            t = self._persist_thread
+            if t is not None and t.is_alive():
+                t.join(timeout=2.0)
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------------------
+    # Snapshot helpers (defer expensive save_state off request hot-path)
+    # -------------------------------------------------------------------------
+
+    def _start_snapshot_worker(self) -> None:
+        if self._snapshot_thread is not None:
+            return
+        self._snapshot_queue = queue.Queue()
+        self._snapshot_thread = threading.Thread(target=self._snapshot_worker_loop, daemon=True)
+        self._snapshot_thread.start()
+
+    def _shutdown_snapshot_worker(self) -> None:
+        try:
+            self._snapshot_stop.set()
+            q = self._snapshot_queue
+            if q is not None:
+                q.put(None)
+            t = self._snapshot_thread
+            if t is not None and t.is_alive():
+                t.join(timeout=2.0)
+        except Exception:
+            pass
+
+    def _schedule_snapshot(self, session_id: str) -> None:
+        q = self._snapshot_queue
+        if q is None or not isinstance(session_id, str) or not session_id:
+            return
+        with self._snapshot_mutex:
+            if session_id in self._snapshot_scheduled:
+                return
+            self._snapshot_scheduled.add(session_id)
+            q.put(session_id)
+
+    def _snapshot_worker_loop(self) -> None:
+        q = self._snapshot_queue
+        if q is None:
+            return
+        while not self._snapshot_stop.is_set():
+            session_id = q.get()
+            if session_id is None:
+                break
+            try:
+                # Debounce: if session keeps changing rapidly, wait a moment for it to settle.
+                while True:
+                    lock = self._locks.setdefault(session_id, threading.RLock())
+                    with lock:
+                        session = self.sessions.get(session_id)
+                        if not isinstance(session, dict):
+                            break
+                        if not bool(session.get("_state_dirty")):
+                            break
+                        dirty_at = float(session.get("_state_dirty_at") or 0.0)
+                    dt = time.monotonic() - dirty_at
+                    if dt < self._SNAPSHOT_DEBOUNCE_SEC:
+                        time.sleep(self._SNAPSHOT_DEBOUNCE_SEC - dt)
+                        continue
+
+                    lock = self._locks.setdefault(session_id, threading.RLock())
+                    with lock:
+                        session = self.sessions.get(session_id)
+                        if not isinstance(session, dict) or not bool(session.get("_state_dirty")):
+                            break
+                        # Snapshotting requires that this session is currently loaded.
+                        if self._active_session_id != session_id:
+                            break
+                        with self._model_lock:
+                            # Active session already loaded; capture a compact snapshot.
+                            session["state"] = self._save_state_compact()
+                            session["_state_dirty"] = False
+                            session.pop("_state_dirty_at", None)
+                            self._active_session_id = session_id
+                        self.sessions[session_id] = session
+                        self._persist_session(session_id, session)
+                    break
+            finally:
+                with self._snapshot_mutex:
+                    self._snapshot_scheduled.discard(str(session_id))
+
+    def _schedule_persist(self, session_id: str, session: Dict[str, object]) -> None:
+        if not self.persist_dir:
+            return
+        q = self._persist_queue
+        if q is None:
+            return
+
+        # Copy only what we must (messages + small metadata). State is immutable bytes.
+        messages = list(session.get("messages", []) or [])
+        state_obj = session.get("state")
+        meta = {
+            "compacted": bool(session.get("compacted", False)),
+            "kv_mode": session.get("kv_mode"),
+            "prompt_renderer": session.get("prompt_renderer"),
+            "_prompt_tokens": list(session.get("_prompt_tokens") or []),
+            "compaction_tick": session.get("compaction_tick"),
+            "ltm_summary": session.get("ltm_summary"),
+        }
+        now = time.monotonic()
+
+        with self._persist_mutex:
+            self._persist_pending[session_id] = {
+                "state": state_obj,
+                "messages": messages,
+                "meta": meta,
+                "updated_at": now,
+            }
+            if session_id not in self._persist_scheduled:
+                self._persist_scheduled.add(session_id)
+                q.put(session_id)
+
+    def _persist_worker_loop(self) -> None:
+        q = self._persist_queue
+        if q is None or not self.persist_dir:
+            return
+
+        while not self._persist_stop.is_set():
+            session_id = q.get()
+            if session_id is None:
+                break
+
+            while True:
+                with self._persist_mutex:
+                    rec = self._persist_pending.get(session_id)
+                    if not isinstance(rec, dict):
+                        self._persist_scheduled.discard(session_id)
+                        break
+                    updated_at = float(rec.get("updated_at") or 0.0)
+                dt = time.monotonic() - updated_at
+                if dt < self._PERSIST_DEBOUNCE_SEC:
+                    time.sleep(self._PERSIST_DEBOUNCE_SEC - dt)
+                    continue
+
+                # Lock again and ensure nothing newer replaced this record.
+                with self._persist_mutex:
+                    rec2 = self._persist_pending.get(session_id)
+                    if not isinstance(rec2, dict):
+                        self._persist_scheduled.discard(session_id)
+                        break
+                    if float(rec2.get("updated_at") or 0.0) != updated_at:
+                        continue
+                    self._persist_pending.pop(session_id, None)
+                    self._persist_scheduled.discard(session_id)
+
+                try:
+                    self._persist_session_sync(
+                        session_id=session_id,
+                        state_obj=rec2.get("state"),
+                        messages=rec2.get("messages") or [],
+                        meta=rec2.get("meta") or {},
+                    )
+                except Exception as exc:
+                    logger.warning("Failed async persist for %s: %s", session_id, exc)
+                break
+
+    def _persist_session_sync(
+        self,
+        *,
+        session_id: str,
+        state_obj: object,
+        messages: List[Dict[str, str]],
+        meta: Dict[str, object],
+    ) -> None:
+        if not self.persist_dir:
+            return
+        try:
+            self.persist_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning("Failed to ensure persist_dir %s: %s", self.persist_dir, exc)
+            return
+
+        kv_path = self.persist_dir / f"{session_id}.kv"
+        msg_path = self.persist_dir / f"{session_id}.json"
+        meta_path = self.persist_dir / f"{session_id}.meta.json"
+
+        # Atomic writes: write temp then replace.
+        try:
+            if state_obj is not None:
+                tmp = kv_path.with_suffix(".kv.tmp")
+                with tmp.open("wb") as f:
+                    pickle.dump(state_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+                tmp.replace(kv_path)
+        except Exception as exc:
+            logger.warning("Failed to persist KV for %s: %s", session_id, exc)
+
+        try:
+            tmp = msg_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(messages or [], ensure_ascii=False))
+            tmp.replace(msg_path)
+        except Exception as exc:
+            logger.warning("Failed to persist messages for %s: %s", session_id, exc)
+
+        try:
+            tmp = meta_path.parent / (meta_path.name + ".tmp")
+            tmp.write_text(json.dumps(meta or {}, ensure_ascii=False))
+            tmp.replace(meta_path)
+        except Exception as exc:
+            logger.warning("Failed to persist metadata for %s: %s", session_id, exc)
+
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------
+
+    def _coerce_state_compact(self, state_obj: object) -> object:
+        """
+        Normalize persisted KV state objects into our compact format.
+
+        Legacy `.kv` files may contain `llama_cpp.LlamaState`, which includes a very
+        large `scores` array. We drop that and keep only what we need to restore
+        llama.cpp + the Python-side token counters.
+        """
+        if isinstance(state_obj, dict) and state_obj.get("_kind") == self._STATE_KIND_COMPACT:
+            return state_obj
+
+        # `llama_cpp.llama.LlamaState` (or compatible) from older versions.
+        if hasattr(state_obj, "llama_state") and hasattr(state_obj, "llama_state_size") and hasattr(state_obj, "n_tokens"):
+            try:
+                return {
+                    "_kind": self._STATE_KIND_COMPACT,
+                    "llama_state": getattr(state_obj, "llama_state"),
+                    "llama_state_size": int(getattr(state_obj, "llama_state_size")),
+                    "n_tokens": int(getattr(state_obj, "n_tokens")),
+                    "input_ids": getattr(state_obj, "input_ids"),
+                    "seed": int(getattr(state_obj, "seed", 0)),
+                }
+            except Exception:
+                return state_obj
+
+        return state_obj
+
+    def _save_state_compact(self) -> Dict[str, object]:
+        """
+        Save llama.cpp KV/state without copying the huge `scores` array.
+
+        Must be called while holding `_model_lock`.
+        """
+        ctx = getattr(getattr(self.llm, "_ctx", None), "ctx", None)
+        if ctx is None:
+            raise RuntimeError("llama context not initialized")
+
+        # Use the newer state API (size + get_data) to avoid extra memmove/copies.
+        state_size = int(llama_cpp.llama_state_get_size(ctx))
+        buf = (ctypes.c_uint8 * state_size)()
+        n_bytes = int(llama_cpp.llama_state_get_data(ctx, buf, state_size))
+        if n_bytes <= 0 or n_bytes > state_size:
+            raise RuntimeError("Failed to copy llama state data")
+        llama_state = ctypes.string_at(buf, n_bytes)
+
+        seed = int(getattr(self.llm, "_seed", 0))
+        try:
+            n_tokens = int(getattr(self.llm, "n_tokens"))
+        except Exception:
+            n_tokens = 0
+
+        try:
+            input_ids = getattr(self.llm, "input_ids").copy()
+        except Exception:
+            input_ids = None
+
+        return {
+            "_kind": self._STATE_KIND_COMPACT,
+            "llama_state": llama_state,
+            "llama_state_size": n_bytes,
+            "n_tokens": n_tokens,
+            "input_ids": input_ids,
+            "seed": seed,
+        }
+
+    def _load_state_compact(self, state_obj: object) -> None:
+        """
+        Restore llama.cpp KV/state from our compact (or legacy) state object.
+
+        Must be called while holding `_model_lock`.
+        """
+        if state_obj is None:
+            return
+
+        state_obj = self._coerce_state_compact(state_obj)
+
+        if isinstance(state_obj, dict) and state_obj.get("_kind") == self._STATE_KIND_COMPACT:
+            llama_state = state_obj.get("llama_state") or b""
+            size = int(state_obj.get("llama_state_size") or len(llama_state) or 0)
+            n_tokens = int(state_obj.get("n_tokens") or 0)
+            input_ids = state_obj.get("input_ids")
+            seed = state_obj.get("seed")
+        elif hasattr(state_obj, "llama_state") and hasattr(state_obj, "llama_state_size") and hasattr(state_obj, "n_tokens"):
+            llama_state = getattr(state_obj, "llama_state") or b""
+            size = int(getattr(state_obj, "llama_state_size") or len(llama_state) or 0)
+            n_tokens = int(getattr(state_obj, "n_tokens") or 0)
+            input_ids = getattr(state_obj, "input_ids", None)
+            seed = getattr(state_obj, "seed", None)
+        else:
+            # Last resort fallback (will copy scores). Keep for safety.
+            self.llm.load_state(state_obj)  # type: ignore[arg-type]
+            return
+
+        ctx = getattr(getattr(self.llm, "_ctx", None), "ctx", None)
+        if ctx is None:
+            raise RuntimeError("llama context not initialized")
+        if not isinstance(llama_state, (bytes, bytearray)) or size <= 0:
+            raise RuntimeError("Invalid llama state payload")
+
+        # Restore Python-side tracking first (matches llama_cpp.Llama.load_state ordering).
+        if input_ids is not None:
+            try:
+                self.llm.input_ids = input_ids.copy()
+            except Exception:
+                pass
+        try:
+            self.llm.n_tokens = int(n_tokens)
+        except Exception:
+            pass
+        if seed is not None:
+            try:
+                self.llm._seed = int(seed)  # noqa: SLF001
+            except Exception:
+                pass
+
+        StateArray = ctypes.c_uint8 * size
+        raw = StateArray.from_buffer_copy(bytes(llama_state)[:size])
+        read = int(llama_cpp.llama_state_set_data(ctx, raw, size))
+        if read != size:
+            raise RuntimeError("Failed to set llama state data")
 
     def _ensure_session_loaded(self, session_id: str, session: Dict[str, object]) -> None:
         """
@@ -1295,10 +1811,54 @@ class LlamaSessionManager:
         """
         if self._active_session_id == session_id:
             return
+        # Before switching away, best-effort snapshot the currently active session if it has
+        # pending (dirty) KV changes. We must not block on another session lock here (deadlock
+        # risk), so we only snapshot if we can acquire the lock immediately.
+        prev_id = self._active_session_id
+        if prev_id and prev_id != session_id:
+            prev = self.sessions.get(prev_id)
+            if isinstance(prev, dict) and bool(prev.get("_state_dirty")):
+                prev_lock = self._locks.get(prev_id) or self._locks.setdefault(prev_id, threading.RLock())
+                acquired = False
+                try:
+                    acquired = prev_lock.acquire(blocking=False)
+                except TypeError:
+                    # Py <3.2 compatibility not needed, but keep safe.
+                    try:
+                        acquired = prev_lock.acquire(False)
+                    except Exception:
+                        acquired = False
+                if acquired:
+                    try:
+                        prev["state"] = self._save_state_compact()
+                        prev["_state_dirty"] = False
+                        prev.pop("_state_dirty_at", None)
+                        self.sessions[prev_id] = prev
+                        self._persist_session(prev_id, prev)
+                    finally:
+                        try:
+                            prev_lock.release()
+                        except Exception:
+                            pass
+                else:
+                    logger.warning(
+                        "Active session has unsnapshotted KV but lock is busy; will rebuild on next load chat=%s",
+                        prev_id,
+                    )
+
         self.llm.reset()
-        state = session.get("state")
-        if state is not None:
-            self.llm.load_state(state)
+
+        # If this session has dirty messages/state (i.e., messages advanced but we couldn't
+        # snapshot KV yet), do NOT load the stale `.state` snapshot. Rebuild KV from the
+        # clean messages so the model state matches the transcript, then let the normal
+        # snapshotting flow capture a fresh state during idle.
+        if bool(session.get("_state_dirty")):
+            messages = list(session.get("messages", []) or [])
+            self._prefill_chat_messages(messages)
+        else:
+            state = session.get("state")
+            if state is not None:
+                self._load_state_compact(state)
         self._active_session_id = session_id
 
     def _estimate_tokens(self, messages: List[Dict[str, str]]) -> int:
@@ -1613,7 +2173,7 @@ class LlamaSessionManager:
                     self._prefill_chat_messages(new_msgs)
                 except Exception:
                     pass
-                new_state = self.llm.save_state()
+                new_state = self._save_state_compact()
                 prompt = self._render_llama3_prompt(new_msgs, add_generation_prompt=False)
                 session["_prompt_tokens"] = self._tokenize_prompt(prompt)
                 session["prompt_renderer"] = self._PROMPT_RENDERER_ID
@@ -1654,7 +2214,7 @@ class LlamaSessionManager:
             except Exception:
                 # If feeding fails, fall back to empty state
                 pass
-            new_state = self.llm.save_state()
+            new_state = self._save_state_compact()
             prompt = self._render_llama3_prompt(new_msgs, add_generation_prompt=False)
             session["_prompt_tokens"] = self._tokenize_prompt(prompt)
             session["prompt_renderer"] = self._PROMPT_RENDERER_ID

@@ -2,22 +2,38 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { ChatWindow } from "./ChatWindow";
 import { DocumentsPane } from "./DocumentsPane";
 import { SplitView } from "./SplitView";
+import type { CardLayout } from "./Canvas";
 
 type Props = {
   title: string;
   chatId: string;
   onClose: () => void;
-  initialShowChat?: boolean;
+  initialLayout?: CardLayout;
+  onLayoutChange?: (next: CardLayout) => void;
 };
 
-export function CardOverlay({ title, chatId, onClose, initialShowChat = true }: Props) {
+const DEFAULT_LAYOUT: CardLayout = {
+  showChat: true,
+  showDocs: true,
+  chatOnRight: true,
+  splitRatio: 0.5,
+};
+
+export function CardOverlay({ title, chatId, onClose, initialLayout, onLayoutChange }: Props) {
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [showChat, setShowChat] = useState(initialShowChat);
-  const [chatOnRight, setChatOnRight] = useState(true);
-  const [splitRatio, setSplitRatio] = useState(0.5);
-  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  const [showChat, setShowChat] = useState(initialLayout?.showChat ?? DEFAULT_LAYOUT.showChat);
+  const [showDocs, setShowDocs] = useState(initialLayout?.showDocs ?? DEFAULT_LAYOUT.showDocs);
+  const [chatOnRight, setChatOnRight] = useState(
+    initialLayout?.chatOnRight ?? DEFAULT_LAYOUT.chatOnRight
+  );
+  const [splitRatio, setSplitRatio] = useState(
+    initialLayout?.splitRatio ?? DEFAULT_LAYOUT.splitRatio
+  );
+  const [activeFileId, setActiveFileId] = useState<string | null>(initialLayout?.activeFileId ?? null);
   const [docsRefreshSeq, setDocsRefreshSeq] = useState(0);
-  const [selection, setSelection] = useState<{ file_id: string; text: string } | null>(null);
+  const [selection, setSelection] = useState<{ text: string; file_id?: string } | null>(null);
+
+  const isSplit = showChat && showDocs;
 
   const askSelection = useCallback(() => {
     setShowChat(true);
@@ -32,83 +48,97 @@ export function CardOverlay({ title, chatId, onClose, initialShowChat = true }: 
   }, [chatId]);
 
   useEffect(() => {
-    setShowChat(initialShowChat);
-  }, [initialShowChat]);
+    // Ensure at least one pane remains visible.
+    if (!showChat && !showDocs) setShowDocs(true);
+    onLayoutChange?.({
+      showChat,
+      showDocs,
+      chatOnRight,
+      splitRatio,
+      activeFileId,
+    });
+  }, [activeFileId, chatOnRight, onLayoutChange, showChat, showDocs, splitRatio]);
 
   useEffect(() => {
     // Switching cards/chats should reset which document is selected.
-    setActiveFileId(null);
+    setActiveFileId(initialLayout?.activeFileId ?? null);
     setSelection(null);
     setDocsRefreshSeq((v) => v + 1);
-  }, [chatId]);
+  }, [chatId, initialLayout?.activeFileId]);
+
+  const docsPane = useMemo(
+    () => (
+      <DocumentsPane
+        chatId={chatId}
+        refreshSeq={docsRefreshSeq}
+        activeFileId={activeFileId}
+        onActiveFileIdChange={setActiveFileId}
+        onSelectionChange={setSelection}
+        onAskSelection={askSelection}
+      />
+    ),
+    [activeFileId, askSelection, chatId, docsRefreshSeq]
+  );
+
+  const chatPane = useMemo(
+    () => (
+      <ChatWindow
+        chatId={chatId}
+        active={true}
+        embedded={true}
+        showTopbar={false}
+        activeDocumentId={activeFileId}
+        selection={selection}
+        onSetSelection={setSelection}
+        onClearSelection={() => {
+          setSelection(null);
+          try {
+            window.getSelection?.()?.removeAllRanges?.();
+          } catch {
+            // ignore
+          }
+        }}
+        onRequestDocsRefresh={() => setDocsRefreshSeq((v) => v + 1)}
+      />
+    ),
+    [activeFileId, chatId, selection]
+  );
 
   const left = useMemo(() => {
-    const docsPane = (
-      <DocumentsPane
-        chatId={chatId}
-        refreshSeq={docsRefreshSeq}
-        activeFileId={activeFileId}
-        onActiveFileIdChange={setActiveFileId}
-        onSelectionChange={setSelection}
-        onAskSelection={askSelection}
-      />
-    );
-    const chatPane = (
-      <ChatWindow
-        chatId={chatId}
-        active={true}
-        embedded={true}
-        showTopbar={false}
-        activeDocumentId={activeFileId}
-        selection={selection}
-        onClearSelection={() => {
-          setSelection(null);
-          try {
-            window.getSelection?.()?.removeAllRanges?.();
-          } catch {
-            // ignore
-          }
-        }}
-        onRequestDocsRefresh={() => setDocsRefreshSeq((v) => v + 1)}
-      />
-    );
-    if (!showChat) return docsPane;
-    return chatOnRight ? docsPane : chatPane;
-  }, [activeFileId, chatId, chatOnRight, docsRefreshSeq, showChat, selection]);
+    if (isSplit) return chatOnRight ? docsPane : chatPane;
+    if (showDocs) return docsPane;
+    if (showChat) return chatPane;
+    return docsPane;
+  }, [chatOnRight, chatPane, docsPane, isSplit, showChat, showDocs]);
 
   const right = useMemo(() => {
-    const docsPane = (
-      <DocumentsPane
-        chatId={chatId}
-        refreshSeq={docsRefreshSeq}
-        activeFileId={activeFileId}
-        onActiveFileIdChange={setActiveFileId}
-        onSelectionChange={setSelection}
-        onAskSelection={askSelection}
-      />
-    );
-    const chatPane = (
-      <ChatWindow
-        chatId={chatId}
-        active={true}
-        embedded={true}
-        showTopbar={false}
-        activeDocumentId={activeFileId}
-        selection={selection}
-        onClearSelection={() => {
-          setSelection(null);
-          try {
-            window.getSelection?.()?.removeAllRanges?.();
-          } catch {
-            // ignore
-          }
-        }}
-        onRequestDocsRefresh={() => setDocsRefreshSeq((v) => v + 1)}
-      />
-    );
-    if (!showChat) return null;
+    if (!isSplit) return null;
     return chatOnRight ? chatPane : docsPane;
-  }, [activeFileId, chatId, chatOnRight, docsRefreshSeq, showChat, selection]);
+  }, [chatOnRight, chatPane, docsPane, isSplit]);
+
+  function toggleChatPane() {
+    if (showChat) {
+      if (!showDocs) {
+        // Switching from chat-only → docs-only.
+        setShowDocs(true);
+      }
+      setShowChat(false);
+      return;
+    }
+    setShowChat(true);
+  }
+
+  function toggleDocsPane() {
+    if (showDocs) {
+      if (!showChat) {
+        // Switching from docs-only → chat-only.
+        setShowChat(true);
+      }
+      setShowDocs(false);
+      return;
+    }
+    setShowDocs(true);
+  }
 
   return (
     <div
@@ -144,14 +174,23 @@ export function CardOverlay({ title, chatId, onClose, initialShowChat = true }: 
             </button>
             <button
               className={`card-overlay-chat-btn ${showChat ? "active" : ""}`}
-              onClick={() => setShowChat((v) => !v)}
+              onClick={toggleChatPane}
               type="button"
               aria-pressed={showChat}
               title={showChat ? "Hide chat" : "Show chat"}
             >
-              {showChat ? "Docs" : "Chat"}
+              Chat
             </button>
-            {showChat ? (
+            <button
+              className={`card-overlay-chat-btn ${showDocs ? "active" : ""}`}
+              onClick={toggleDocsPane}
+              type="button"
+              aria-pressed={showDocs}
+              title={showDocs ? "Hide documents" : "Show documents"}
+            >
+              Docs
+            </button>
+            {isSplit ? (
               <button
                 className="card-overlay-swap-btn"
                 onClick={() => setChatOnRight((v) => !v)}
@@ -168,7 +207,7 @@ export function CardOverlay({ title, chatId, onClose, initialShowChat = true }: 
           </div>
         </div>
         <div className="card-overlay-body">
-          {showChat ? (
+          {isSplit ? (
             <SplitView
               left={left}
               right={right}

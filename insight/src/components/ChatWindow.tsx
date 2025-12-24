@@ -9,6 +9,7 @@ import {
   waitForStreamToFinish,
 } from "../api/engine";
 import { engine } from "../api/engine";
+import { ChatMarkdown, ChatMarkdownStream } from "./ChatMarkdown";
 
 type ChatMessage = {
   id: string;
@@ -25,7 +26,8 @@ type Props = {
   embedded?: boolean;
   showTopbar?: boolean;
   activeDocumentId?: string | null;
-  selection?: { file_id: string; text: string } | null;
+  selection?: { text: string; file_id?: string } | null;
+  onSetSelection?: (sel: { text: string; file_id?: string } | null) => void;
   onClearSelection?: () => void;
   onRequestDocsRefresh?: () => void;
 };
@@ -38,13 +40,95 @@ type ContextStatus = {
   compacted?: boolean;
 };
 
+type MarkdownStreamState = {
+  blocks: string[];
+  tail: string;
+  inFence: boolean;
+  fenceToken?: "```" | "~~~" | null;
+};
+
+const MAX_MD_TAIL_CHARS = 1800;
+
+function _scanMarkdownTail(md: string): {
+  commitIdx: number;
+  inFence: boolean;
+  fenceToken: "```" | "~~~" | null;
+  fenceStartIdx: number;
+} {
+  let inFence = false;
+  let fenceToken: "```" | "~~~" | null = null;
+  let fenceStartIdx = -1;
+  let lastParaIdx = -1;
+  let lastLineIdx = -1;
+
+  // Scan the tail for:
+  // - fenced code blocks (``` / ~~~) to avoid splitting inside them
+  // - safe commit boundaries (blank lines), and a fallback (single newline)
+  for (let i = 0; i < md.length; i++) {
+    const atLineStart = i === 0 || md[i - 1] === "\n";
+    if (atLineStart && (md.startsWith("```", i) || md.startsWith("~~~", i))) {
+      const tok = md.startsWith("```", i) ? "```" : "~~~";
+      // Toggle fence. When opening, remember where it started so we can safely
+      // commit everything *before* the fence, even if there wasn't a blank line.
+      if (!inFence) {
+        inFence = true;
+        fenceToken = tok;
+        fenceStartIdx = i;
+      } else {
+        inFence = false;
+        fenceToken = null;
+        fenceStartIdx = -1;
+      }
+    }
+
+    if (inFence) continue;
+    if (md[i] !== "\n") continue;
+
+    lastLineIdx = i + 1;
+    if (i + 1 < md.length && md[i + 1] === "\n") {
+      lastParaIdx = i + 2;
+    }
+  }
+
+  let commitIdx = lastParaIdx;
+  // If we're currently inside a fence, commit everything *before* the fence so only
+  // the code block tail re-renders during streaming (prevents "markdown flips").
+  if (inFence && fenceStartIdx > 0) {
+    commitIdx = fenceStartIdx;
+  }
+  if (commitIdx < 0 && !inFence && md.length > MAX_MD_TAIL_CHARS && lastLineIdx > 0) {
+    commitIdx = lastLineIdx;
+  }
+  return {
+    commitIdx: commitIdx > 0 ? commitIdx : 0,
+    inFence,
+    fenceToken,
+    fenceStartIdx,
+  };
+}
+
+function _ingestMarkdownChunk(state: MarkdownStreamState, chunk: string) {
+  if (!chunk) return;
+  state.tail += chunk;
+
+  const scan = _scanMarkdownTail(state.tail);
+  state.inFence = scan.inFence;
+  state.fenceToken = scan.fenceToken;
+  if (!scan.commitIdx) return;
+
+  const committed = state.tail.slice(0, scan.commitIdx);
+  state.blocks.push(committed);
+  state.tail = state.tail.slice(scan.commitIdx);
+}
+
 export function ChatWindow({
   chatId,
   active = true,
   embedded = false,
   showTopbar = true,
   activeDocumentId = null,
-  selection = null,
+  selection,
+  onSetSelection,
   onClearSelection,
   onRequestDocsRefresh,
 }: Props) {
@@ -54,11 +138,19 @@ export function ChatWindow({
   const [error, setError] = useState<string | null>(null);
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
+  const [localSelection, setLocalSelection] = useState<{ text: string; file_id?: string } | null>(
+    null
+  );
+  const [chatSelectionText, setChatSelectionText] = useState<string>("");
+  const [chatSelectionPos, setChatSelectionPos] = useState<{ x: number; y: number } | null>(null);
+  const [pendingChatSelection, setPendingChatSelection] = useState<{ text: string } | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
   const pendingTextRef = useRef("");
   const flushRafRef = useRef<number | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
   const assistantIdRef = useRef<string | null>(null);
+  const mdStreamRef = useRef<Map<string, MarkdownStreamState>>(new Map());
   const unlistenTokenRef = useRef<UnlistenFn | null>(null);
   const unlistenDoneRef = useRef<UnlistenFn | null>(null);
   const unlistenErrorRef = useRef<UnlistenFn | null>(null);
@@ -66,6 +158,19 @@ export function ChatWindow({
   const contextReqSeqRef = useRef(0);
   const inputElRef = useRef<HTMLTextAreaElement | null>(null);
   const INPUT_MAX_HEIGHT_PX = 120;
+  const chatPopoverTimerRef = useRef<number | null>(null);
+
+  const effectiveSelection = selection === undefined ? localSelection : selection;
+
+  function setSelectionValue(next: { text: string; file_id?: string } | null) {
+    if (selection === undefined) setLocalSelection(next);
+    onSetSelection?.(next);
+  }
+
+  function clearSelectionValue() {
+    if (selection === undefined) setLocalSelection(null);
+    onClearSelection?.();
+  }
 
   useEffect(() => {
     function onFocusChat(e: Event) {
@@ -92,6 +197,16 @@ export function ChatWindow({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    if (chatPopoverTimerRef.current != null) {
+      window.clearTimeout(chatPopoverTimerRef.current);
+      chatPopoverTimerRef.current = null;
+    }
+    setChatSelectionText("");
+    setChatSelectionPos(null);
+    setPendingChatSelection(null);
+  }, [chatId]);
 
   useEffect(() => {
     activeChatIdRef.current = chatId;
@@ -121,6 +236,102 @@ export function ChatWindow({
     }
   }
 
+  function _closestChatMessage(node: Node | null): HTMLElement | null {
+    if (!node) return null;
+    const el =
+      node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+    if (!el) return null;
+    return el.closest(".chat-message") as HTMLElement | null;
+  }
+
+  function readChatSelectionFromWindow(opts?: { showPopover?: boolean }) {
+    const sel = window.getSelection?.();
+    const txt = (sel && typeof sel.toString === "function" ? sel.toString() : "") || "";
+    const cleaned = txt.replace(/\s+/g, " ").trim();
+    if (!cleaned) {
+      setChatSelectionText("");
+      setChatSelectionPos(null);
+      setPendingChatSelection(null);
+      return;
+    }
+
+    const body = messagesRef.current;
+    if (!body) return;
+
+    try {
+      const anchorNode = sel?.anchorNode ?? null;
+      const focusNode = sel?.focusNode ?? null;
+      const anchorMsg = _closestChatMessage(anchorNode);
+      const focusMsg = _closestChatMessage(focusNode);
+      if (!anchorMsg || !focusMsg || anchorMsg !== focusMsg) {
+        setChatSelectionText("");
+        setChatSelectionPos(null);
+        setPendingChatSelection(null);
+        return;
+      }
+      if (!anchorMsg.classList.contains("chat-message-assistant")) {
+        setChatSelectionText("");
+        setChatSelectionPos(null);
+        setPendingChatSelection(null);
+        return;
+      }
+      const anchorOk = anchorNode ? body.contains(anchorNode) : false;
+      const focusOk = focusNode ? body.contains(focusNode) : false;
+      if (!anchorOk && !focusOk) {
+        setChatSelectionText("");
+        setChatSelectionPos(null);
+        setPendingChatSelection(null);
+        return;
+      }
+    } catch {
+      // ignore
+    }
+
+    const capped = cleaned.length > 2000 ? cleaned.slice(0, 2000) + "…" : cleaned;
+    setChatSelectionText(capped);
+    setPendingChatSelection({ text: capped });
+
+    try {
+      if (!opts?.showPopover) return;
+      if (!sel || sel.rangeCount === 0) return;
+      const range = sel.getRangeAt(0);
+      const rect = range.getBoundingClientRect();
+      const bodyRect = body.getBoundingClientRect();
+      const xRaw = rect.left - bodyRect.left + body.scrollLeft + rect.width / 2;
+      const minX = body.scrollLeft + 28;
+      const maxX = body.scrollLeft + body.clientWidth - 28;
+      const x = Math.max(minX, Math.min(maxX, xRaw));
+
+      const yRaw = rect.top - bodyRect.top + body.scrollTop - 48;
+      const minY = body.scrollTop + 8;
+      const y = Math.max(minY, yRaw);
+      if (chatPopoverTimerRef.current != null) window.clearTimeout(chatPopoverTimerRef.current);
+      chatPopoverTimerRef.current = window.setTimeout(() => {
+        chatPopoverTimerRef.current = null;
+        setChatSelectionPos({ x: Math.max(8, x), y: Math.max(8, y) });
+      }, 0);
+    } catch {
+      // ignore
+    }
+  }
+
+  useEffect(() => {
+    function onSelectionChangeEvent() {
+      readChatSelectionFromWindow({ showPopover: false });
+    }
+    document.addEventListener("selectionchange", onSelectionChangeEvent);
+    return () => document.removeEventListener("selectionchange", onSelectionChangeEvent);
+  }, []);
+
+  function commitChatSelectionToInput() {
+    if (!pendingChatSelection) return;
+    setSelectionValue({ text: pendingChatSelection.text });
+    inputElRef.current?.focus?.();
+    setChatSelectionText("");
+    setPendingChatSelection(null);
+    setChatSelectionPos(null);
+  }
+
   function flushPendingToMessage() {
     if (flushRafRef.current != null) {
       cancelAnimationFrame(flushRafRef.current);
@@ -130,6 +341,11 @@ export function ChatWindow({
     pendingTextRef.current = "";
     const assistantId = assistantIdRef.current;
     if (!pending || !assistantId) return;
+    const st =
+      mdStreamRef.current.get(assistantId) ??
+      ({ blocks: [], tail: "", inFence: false } satisfies MarkdownStreamState);
+    _ingestMarkdownChunk(st, pending);
+    mdStreamRef.current.set(assistantId, st);
     setMessages((prev) =>
       prev.map((m) =>
         m.id === assistantId ? { ...m, content: (m.content || "") + pending } : m
@@ -145,8 +361,12 @@ export function ChatWindow({
     pendingTextRef.current = "";
     assistantIdRef.current = null;
     activeRequestIdRef.current = null;
+    mdStreamRef.current.clear();
     setIsStreaming(false);
     setError(null);
+    setChatSelectionText("");
+    setChatSelectionPos(null);
+    setPendingChatSelection(null);
 
     if (!chatId) {
       setAttachedPaths([]);
@@ -353,8 +573,10 @@ export function ChatWindow({
 
     const attached = attachedPaths.slice();
     const attachedNames = attached.map(filenameFromPath);
-    const selectionPayload = selection?.text
-      ? { text: selection.text, file_id: selection.file_id }
+    const selectionPayload = effectiveSelection?.text
+      ? effectiveSelection.file_id
+        ? { text: effectiveSelection.text, file_id: effectiveSelection.file_id }
+        : { text: effectiveSelection.text }
       : undefined;
 
     if (attachedNames.length) {
@@ -381,7 +603,7 @@ export function ChatWindow({
     setIsStreaming(true);
     setAttachedPaths([]);
     // Selection is a one-shot context for this turn; clear the input-bar snippet after send.
-    if (selectionPayload) onClearSelection?.();
+    if (selectionPayload) clearSelectionValue();
 
     const assistantId = `${Date.now()}-assistant`;
     assistantIdRef.current = assistantId;
@@ -390,6 +612,7 @@ export function ChatWindow({
       { id: assistantId, role: "assistant", content: "" },
     ]);
     pendingTextRef.current = "";
+    mdStreamRef.current.set(assistantId, { blocks: [], tail: "", inFence: false });
 
     try {
       const requestId =
@@ -424,6 +647,11 @@ export function ChatWindow({
             const pending = pendingTextRef.current;
             if (!pending) return;
             pendingTextRef.current = "";
+            const st =
+              mdStreamRef.current.get(assistantId) ??
+              ({ blocks: [], tail: "", inFence: false } satisfies MarkdownStreamState);
+            _ingestMarkdownChunk(st, pending);
+            mdStreamRef.current.set(assistantId, st);
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === assistantId
@@ -445,6 +673,7 @@ export function ChatWindow({
           cleanupListeners();
           activeRequestIdRef.current = null;
           setIsStreaming(false);
+          mdStreamRef.current.delete(assistantId);
           if (chatId) {
             refreshContextStatus(chatId).catch(() => {});
           }
@@ -464,6 +693,7 @@ export function ChatWindow({
             setError(payload.error);
           }
           setIsStreaming(false);
+          mdStreamRef.current.delete(assistantId);
           if (chatId) {
             refreshContextStatus(chatId).catch(() => {});
           }
@@ -504,6 +734,9 @@ export function ChatWindow({
     // Immediate UI stop: ignore further tokens and switch back to "Send".
     flushPendingToMessage();
     cleanupListeners();
+    if (assistantIdRef.current) {
+      mdStreamRef.current.delete(assistantIdRef.current);
+    }
     activeRequestIdRef.current = null;
     setIsStreaming(false);
 
@@ -521,16 +754,45 @@ export function ChatWindow({
   }
 
   return (
-    <div className={`chat-root ${embedded ? "chat-root-embedded" : ""}`}>
+      <div className={`chat-root ${embedded ? "chat-root-embedded" : ""}`}>
       {showTopbar ? <div className="chat-topbar" aria-hidden="true" /> : null}
 
-      <div className="chat-messages">
+      <div
+        className="chat-messages"
+        ref={messagesRef}
+        onMouseUp={() => readChatSelectionFromWindow({ showPopover: true })}
+        onKeyUp={() => readChatSelectionFromWindow({ showPopover: true })}
+        onScroll={() => {
+          if (chatSelectionPos) setChatSelectionPos(null);
+        }}
+      >
         {messages.map((m) => (
           <div key={m.id} className={`chat-message chat-message-${m.role}`}>
             <div className="chat-message-role">
               {m.role === "user" ? "You" : "Insight"}
             </div>
-            <div className="chat-message-content">{m.content}</div>
+            <div className="chat-message-content">
+              {m.role === "assistant" ? (
+                isStreaming && m.id === assistantIdRef.current ? (
+                  (() => {
+                    const st = mdStreamRef.current.get(m.id);
+                    if (!st) return <ChatMarkdown markdown={m.content} />;
+                    return (
+                      <ChatMarkdownStream
+                        blocks={st.blocks}
+                        tail={st.tail}
+                        inFence={st.inFence}
+                        fenceToken={st.fenceToken ?? null}
+                      />
+                    );
+                  })()
+                ) : (
+                  <ChatMarkdown markdown={m.content} />
+                )
+              ) : (
+                m.content
+              )}
+            </div>
             {!!m.selection?.text && (
               <div className="chat-message-selection">
                 <span className="chat-selection-chip" title={m.selection.text}>
@@ -549,6 +811,19 @@ export function ChatWindow({
             )}
           </div>
         ))}
+        {chatSelectionText && chatSelectionPos ? (
+          <button
+            type="button"
+            className="chat-selection-ask chat-selection-popover"
+            style={{ left: chatSelectionPos.x, top: chatSelectionPos.y }}
+            onClick={commitChatSelectionToInput}
+            title="Ask about this selection"
+            onMouseDown={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            Ask
+          </button>
+        ) : null}
         <div ref={bottomRef} />
       </div>
 
@@ -578,17 +853,17 @@ export function ChatWindow({
 
       <div className="chat-input-row">
         <div className="chat-input-shell">
-          {selection?.text ? (
+          {effectiveSelection?.text ? (
             <div
               className="chat-input-selection"
-              title={selection.text}
+              title={effectiveSelection.text}
               onClick={() => inputElRef.current?.focus?.()}
               role="note"
               aria-label="Selected excerpt"
             >
               <div className="chat-input-selection-text">
                 {(() => {
-                  const cleaned = selection.text.replace(/\s+/g, " ").trim();
+                  const cleaned = effectiveSelection.text.replace(/\s+/g, " ").trim();
                   const parts = cleaned.split(" ").filter(Boolean);
                   const preview = parts.slice(0, 5).join(" ");
                   return parts.length > 5 ? `${preview}…` : preview;
@@ -602,7 +877,7 @@ export function ChatWindow({
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
-                  onClearSelection?.();
+                  clearSelectionValue();
                 }}
               >
                 ×

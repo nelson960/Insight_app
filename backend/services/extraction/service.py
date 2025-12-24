@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 PAGE_MARKER_RE = re.compile(r"^---\s*Page\s+(\d+)\s*---$", re.IGNORECASE)
 MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 # Note: put '-' at the end (or escape it) to avoid character range parsing.
-BULLET_RE = re.compile(r"^\s*([*•-]|\d+[.)])\s+")
+# Some PDFs/DOCX exports include zero-width spaces after bullets.
+BULLET_RE = re.compile(r"^\s*([*•●○▪‣–-]|\d+[.)])[\s\u200b]+")
 
 
 @dataclass

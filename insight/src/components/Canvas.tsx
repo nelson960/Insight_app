@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChatSummary } from "../state/useSessions";
 
+export type CardLayout = {
+  showChat: boolean;
+  showDocs: boolean;
+  chatOnRight: boolean;
+  splitRatio: number;
+  activeFileId?: string | null;
+};
+
 export type CanvasNote = {
   chatId: string;
   title?: string;
@@ -9,6 +17,7 @@ export type CanvasNote = {
   w: number;
   h: number;
   z: number;
+  layout?: CardLayout;
 };
 
 type Viewport = { x: number; y: number; scale: number };
@@ -22,7 +31,7 @@ type Props = {
   onUpdateNote: (chatId: string, patch: Partial<CanvasNote>) => void;
   onOpenChat: (chatId: string) => void;
   onCreateChatAt: (pos: { x: number; y: number }) => void;
-  onOpenCard: (chatId: string, opts?: { showChat?: boolean }) => void;
+  onOpenCard: (chatId: string) => void;
   onDeleteChat: (chatId: string) => void;
   confirmDeleteChatId: string | null;
   loadingSessions: boolean;
@@ -453,7 +462,7 @@ export function Canvas({
               onUpdate={(patch) => applyUpdateNote(n.chatId, patch)}
               onOpen={() => onOpenChat(n.chatId)}
               // Default card open shows split view (docs + chat).
-              onOpenCard={() => onOpenCard(n.chatId, { showChat: true })}
+              onOpenCard={() => onOpenCard(n.chatId)}
             />
           );
         })}

@@ -14,6 +14,7 @@ from backend.services.extraction.detector import detect_mime_type
 from backend.services.security import encrypt_bytes
 from backend.services.extraction.service import blocks_from_text
 from backend.services.ipc_events import emit_event
+from backend.services.docs import blocks_to_plain_text, prosemirror_doc_to_blocks
 
 import logging
 
@@ -194,6 +195,9 @@ async def list_files_for_chat(chat_id: str):
                 "size_bytes": record.get("size_bytes") or 0,
                 "status": record.get("status") or "",
                 "pages": record.get("pages"),
+                "created_at": record.get("created_at"),
+                "updated_at": record.get("updated_at"),
+                "source": record.get("source") or "",
             }
         )
     return {"files": files}
@@ -213,6 +217,18 @@ async def get_extracted_view(file_id: str):
     file_text = store.get_file_text(file_id) or {}
     blocks = file_text.get("blocks") or []
     plain_text = file_text.get("plain_text") or ""
+
+    # If the user has edited this file's representation in the current chat, prefer the
+    # saved ProseMirror page (per chat_id + file_id) over the raw extractor output.
+    chat_id = record.get("chat_id")
+    if isinstance(chat_id, str) and chat_id:
+        page = store.get_doc_page(chat_id, file_id)
+        if page and page.get("is_user_edited") and isinstance(page.get("doc"), dict):
+            derived_blocks = prosemirror_doc_to_blocks(page["doc"])
+            derived_text = blocks_to_plain_text(derived_blocks)
+            if derived_blocks:
+                blocks = derived_blocks
+                plain_text = derived_text
 
     # Backfill for older ingestions: reconstruct from stored chunks if we don't have
     # persisted extraction output yet.

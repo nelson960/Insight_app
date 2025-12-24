@@ -156,6 +156,22 @@ class SQLiteMetadataStore:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS doc_pages (
+                chat_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                title TEXT,
+                doc_json TEXT,
+                is_user_edited INTEGER,
+                source_file_updated_at TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (chat_id, file_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_pages_chat ON doc_pages(chat_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_seq ON chunks(file_id, seq)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_chat ON chunks(chat_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_created ON chunks(created_at)")
@@ -407,6 +423,17 @@ class SQLiteMetadataStore:
                     file_id=file_id,
                     filename=filename,
                 )
+
+    def get_file_text_updated_at(self, file_id: str) -> str | None:
+        with self._lock:
+            cursor = self._connection.execute(
+                "SELECT updated_at FROM file_text WHERE file_id=?",
+                (file_id,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return row["updated_at"] or None
 
     def get_file_text(self, file_id: str) -> Optional[dict[str, object]]:
         cursor = self._connection.execute(
@@ -711,11 +738,83 @@ class SQLiteMetadataStore:
             placeholders = ",".join(["?"] * len(ids))
             with self._lock:
                 self._connection.execute(f"DELETE FROM file_text WHERE file_id IN ({placeholders})", ids)
+                self._connection.execute(f"DELETE FROM doc_pages WHERE file_id IN ({placeholders})", ids)
                 self._connection.commit()
         with self._lock:
             cur = self._connection.execute("DELETE FROM files WHERE chat_id=?", (chat_id,))
             self._connection.commit()
             return int(cur.rowcount or 0)
+
+    # ------------------------------------------------------------------ #
+    # Document pages (ProseMirror JSON)
+    # ------------------------------------------------------------------ #
+    def get_doc_page(self, chat_id: str, file_id: str) -> Optional[dict[str, object]]:
+        cursor = self._connection.execute(
+            """
+            SELECT chat_id, file_id, title, doc_json, is_user_edited, source_file_updated_at, created_at, updated_at
+            FROM doc_pages
+            WHERE chat_id=? AND file_id=?
+            """,
+            (chat_id, file_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        doc = None
+        try:
+            doc = json.loads(row["doc_json"]) if row["doc_json"] else None
+        except Exception:
+            doc = None
+        return {
+            "chat_id": row["chat_id"],
+            "file_id": row["file_id"],
+            "title": row["title"] or "",
+            "doc": doc,
+            "doc_json": row["doc_json"] or "",
+            "is_user_edited": bool(row["is_user_edited"]) if row["is_user_edited"] is not None else False,
+            "source_file_updated_at": row["source_file_updated_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_doc_page(
+        self,
+        chat_id: str,
+        file_id: str,
+        *,
+        title: str,
+        doc: object,
+        is_user_edited: bool,
+        source_file_updated_at: str | None,
+    ) -> None:
+        now = _now_iso()
+        doc_json = json.dumps(doc or {})
+        with self._lock:
+            cursor = self._connection.execute(
+                "SELECT created_at FROM doc_pages WHERE chat_id=? AND file_id=?",
+                (chat_id, file_id),
+            )
+            row = cursor.fetchone()
+            created_at = row["created_at"] if row else now
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO doc_pages (
+                    chat_id, file_id, title, doc_json, is_user_edited, source_file_updated_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    file_id,
+                    title or "",
+                    doc_json,
+                    1 if is_user_edited else 0,
+                    source_file_updated_at,
+                    created_at,
+                    now,
+                ),
+            )
+            self._connection.commit()
 
     def delete_jobs_for_chat(self, chat_id: str) -> int:
         # Jobs only store file_id; delete by file_ids tied to this chat.

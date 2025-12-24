@@ -1,12 +1,44 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
 import { Canvas, CanvasNote } from "./components/Canvas";
+import type { CardLayout } from "./components/Canvas";
 import { CardOverlay } from "./components/CardOverlay";
 import { ChatWindow } from "./components/ChatWindow";
 import { useSessions } from "./state/useSessions";
 import { engine } from "./api/engine";
 
 const NOTES_STORAGE_KEY = "insight.canvas.notes.v1";
+const DEFAULT_CARD_LAYOUT: CardLayout = {
+  showChat: true,
+  showDocs: true,
+  chatOnRight: true,
+  splitRatio: 0.5,
+};
+
+function coerceCardLayout(raw: unknown): CardLayout | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as any;
+
+  const showChat = typeof obj.showChat === "boolean" ? obj.showChat : DEFAULT_CARD_LAYOUT.showChat;
+  const showDocs = typeof obj.showDocs === "boolean" ? obj.showDocs : DEFAULT_CARD_LAYOUT.showDocs;
+  const chatOnRight =
+    typeof obj.chatOnRight === "boolean" ? obj.chatOnRight : DEFAULT_CARD_LAYOUT.chatOnRight;
+  const splitRatioRaw = Number(obj.splitRatio);
+  const splitRatio = Number.isFinite(splitRatioRaw)
+    ? Math.max(0.05, Math.min(0.95, splitRatioRaw))
+    : DEFAULT_CARD_LAYOUT.splitRatio;
+  const activeFileId =
+    typeof obj.activeFileId === "string" && obj.activeFileId
+      ? obj.activeFileId
+      : obj.activeFileId === null
+        ? null
+        : undefined;
+
+  // Ensure at least one pane is visible.
+  if (!showChat && !showDocs) return { ...DEFAULT_CARD_LAYOUT };
+
+  return { showChat, showDocs, chatOnRight, splitRatio, activeFileId };
+}
 
 function loadPersistedNotes(): CanvasNote[] | null {
   try {
@@ -25,7 +57,17 @@ function loadPersistedNotes(): CanvasNote[] | null {
       const z = Number((item as any).z);
       if (typeof chatId !== "string" || !chatId) continue;
       if (![x, y, w, h, z].every(Number.isFinite)) continue;
-      out.push({ chatId, x, y, w, h, z, title: (item as any).title });
+      const layout = coerceCardLayout((item as any).layout);
+      out.push({
+        chatId,
+        x,
+        y,
+        w,
+        h,
+        z,
+        title: (item as any).title,
+        layout: layout ?? undefined,
+      });
     }
     return out;
   } catch {
@@ -47,7 +89,6 @@ function App() {
   const [notes, setNotes] = useState<CanvasNote[]>([]);
   const [overlayChatId, setOverlayChatId] = useState<string | null>(null);
   const [overlayCardId, setOverlayCardId] = useState<string | null>(null);
-  const [overlayCardShowChat, setOverlayCardShowChat] = useState(false);
   const [confirmDeleteChatId, setConfirmDeleteChatId] = useState<string | null>(
     null
   );
@@ -103,9 +144,57 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [overlayChatId, overlayCardId]);
 
-  function updateNote(chatId: string, patch: Partial<CanvasNote>) {
-    setNotes((prev) => prev.map((n) => (n.chatId === chatId ? { ...n, ...patch } : n)));
-  }
+  const updateNote = useCallback((chatId: string, patch: Partial<CanvasNote>) => {
+    if (!chatId) return;
+    if (!patch || typeof patch !== "object") return;
+
+    function equalLayout(a?: CardLayout, b?: CardLayout) {
+      if (a === b) return true;
+      if (!a || !b) return false;
+      return (
+        a.showChat === b.showChat &&
+        a.showDocs === b.showDocs &&
+        a.chatOnRight === b.chatOnRight &&
+        a.splitRatio === b.splitRatio &&
+        (a.activeFileId ?? null) === (b.activeFileId ?? null)
+      );
+    }
+
+    setNotes((prev) => {
+      let changed = false;
+      const next = prev.map((n) => {
+        if (n.chatId !== chatId) return n;
+        const merged: CanvasNote = { ...n, ...patch };
+
+        // Avoid infinite update loops: only update when something actually changed.
+        for (const [key, value] of Object.entries(patch)) {
+          if (key === "layout") {
+            if (!equalLayout(n.layout, (value as any) ?? undefined)) {
+              changed = true;
+            }
+            continue;
+          }
+          if (!Object.is((n as any)[key], value)) {
+            changed = true;
+          }
+        }
+
+        return changed ? merged : n;
+      });
+      return changed ? next : prev;
+    });
+  }, []);
+
+  // Keep this callback stable while an overlay is open. If it changes every render,
+  // CardOverlay will re-run its "layout sync" effect continuously and can trigger
+  // React's "Maximum update depth exceeded".
+  const handleOverlayLayoutChange = useCallback(
+    (nextLayout: CardLayout) => {
+      if (!overlayCardId) return;
+      updateNote(overlayCardId, { layout: nextLayout });
+    },
+    [overlayCardId, updateNote]
+  );
 
   // Keep one global canvas note per chat (auto-place missing ones).
   useEffect(() => {
@@ -142,6 +231,7 @@ function App() {
           w: 240,
           h: 140,
           z: z++,
+          layout: { ...DEFAULT_CARD_LAYOUT },
         });
       }
       return next;
@@ -196,6 +286,7 @@ function App() {
           w: 320,
           h: 200,
           z: nextZ,
+          layout: { ...DEFAULT_CARD_LAYOUT },
         },
       ];
     });
@@ -217,23 +308,34 @@ function App() {
               setOverlayCardId(null);
             }}
             onCreateChatAt={createChatCardAt}
-            onOpenCard={(chatId, opts) => {
+            onOpenCard={(chatId) => {
               setActiveChat(chatId);
               setOverlayCardId(chatId);
               setOverlayChatId(null);
-              setOverlayCardShowChat(opts?.showChat ?? true);
             }}
             onDeleteChat={deleteChat}
             confirmDeleteChatId={confirmDeleteChatId}
             loadingSessions={loading}
           />
           {overlayCardId ? (
-            <CardOverlay
-              title={sortedSessions.find((s) => s.chat_id === overlayCardId)?.title || overlayCardId}
-              chatId={overlayCardId}
-              onClose={() => setOverlayCardId(null)}
-              initialShowChat={overlayCardShowChat}
-            />
+            <OverlayBoundary title="Card UI crashed" onClose={() => setOverlayCardId(null)}>
+              {(() => {
+                const note = notes.find((n) => n.chatId === overlayCardId);
+                const layout = note?.layout ?? DEFAULT_CARD_LAYOUT;
+                return (
+                  <CardOverlay
+                    key={overlayCardId}
+                    title={
+                      sortedSessions.find((s) => s.chat_id === overlayCardId)?.title || overlayCardId
+                    }
+                    chatId={overlayCardId}
+                    onClose={() => setOverlayCardId(null)}
+                    initialLayout={layout}
+                    onLayoutChange={handleOverlayLayoutChange}
+                  />
+                );
+              })()}
+            </OverlayBoundary>
           ) : null}
           {overlayChatId ? (
             <div
@@ -269,9 +371,9 @@ function App() {
                   </button>
                 </div>
                 <div className="chat-overlay-body">
-                  <ChatOverlayBoundary onClose={closeOverlay}>
+                  <OverlayBoundary title="Chat UI crashed" onClose={closeOverlay}>
                     <ChatWindow chatId={overlayChatId} active={true} embedded={false} showTopbar={false} />
-                  </ChatOverlayBoundary>
+                  </OverlayBoundary>
                 </div>
               </div>
             </div>
@@ -284,11 +386,11 @@ function App() {
 
 export default App;
 
-class ChatOverlayBoundary extends React.Component<
-  { onClose: () => void; children: React.ReactNode },
+class OverlayBoundary extends React.Component<
+  { title: string; onClose: () => void; children: React.ReactNode },
   { error: Error | null }
 > {
-  constructor(props: { onClose: () => void; children: React.ReactNode }) {
+  constructor(props: { title: string; onClose: () => void; children: React.ReactNode }) {
     super(props);
     this.state = { error: null };
   }
@@ -296,13 +398,13 @@ class ChatOverlayBoundary extends React.Component<
     return { error };
   }
   componentDidCatch(error: Error) {
-    console.error("Chat overlay crashed", error);
+    console.error(this.props.title, error);
   }
   render() {
     if (this.state.error) {
       return (
         <div style={{ padding: 12, color: "#e5e7eb" }}>
-          <div style={{ fontWeight: 700, marginBottom: 8 }}>Chat UI crashed</div>
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>{this.props.title}</div>
           <div style={{ fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
             {String(this.state.error?.message || this.state.error)}
           </div>

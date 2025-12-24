@@ -1,6 +1,9 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { engine } from "../api/engine";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+
+import { engine } from "../api/engine";
+import { DocEditor } from "../editor/DocEditor";
+import { loadDocPage, saveDocPage } from "../editor/docPages";
 
 type ChatFile = {
   file_id: string;
@@ -9,22 +12,23 @@ type ChatFile = {
   size_bytes: number;
   status?: string;
   pages?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  source?: string;
 };
 
-type ExtractedBlock = {
-  kind: string;
-  text: string;
-  metadata?: any;
+type DocSearchMatch = {
+  id: string;
+  from: number;
+  to: number;
+  snippet: string;
 };
 
-type ExtractedView = {
+type DocSearchResponse = {
+  chat_id: string;
   file_id: string;
-  filename: string;
-  mime: string;
-  status: string;
-  pages: number | null;
-  blocks: ExtractedBlock[];
-  plain_text: string;
+  q: string;
+  matches: Array<{ from: number; to: number; snippet: string }>;
 };
 
 type Props = {
@@ -49,12 +53,177 @@ function formatBytes(n: number) {
   return `${v.toFixed(digits)} ${units[i]}`;
 }
 
-function fallbackBlocksFromPlainText(text: string): ExtractedBlock[] {
-  const parts = (text || "")
-    .split("\n\n")
-    .map((p) => p.trim())
-    .filter(Boolean);
-  return parts.map((p) => ({ kind: "paragraph", text: p }));
+function formatTimestamp(ts: string | null | undefined) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (!Number.isFinite(d.getTime())) return String(ts);
+  try {
+    return d.toLocaleString();
+  } catch {
+    return d.toISOString();
+  }
+}
+
+function countWords(text: string) {
+  const cleaned = (text || "").trim();
+  if (!cleaned) return 0;
+  return cleaned.split(/\s+/g).filter(Boolean).length;
+}
+
+function plainTextFromProseMirror(doc: any): string {
+  const parts: string[] = [];
+  function walk(node: any) {
+    if (!node || typeof node !== "object") return;
+    const type = String((node as any).type || "").toLowerCase();
+    if (type === "text") {
+      parts.push(String((node as any).text || ""));
+      return;
+    }
+    if (type === "hardbreak") {
+      parts.push("\n");
+      return;
+    }
+    const content = (node as any).content;
+    if (Array.isArray(content)) {
+      for (const child of content) walk(child);
+      if (type === "paragraph" || type === "heading" || type === "codeblock") {
+        parts.push("\n\n");
+      }
+    }
+  }
+  walk(doc);
+  return parts.join("").trim();
+}
+
+type IndexedBlock = {
+  segments: Array<[number, string]>;
+  text: string;
+  text_ci: string;
+};
+
+function snippet(text: string, start: number, end: number, radius = 42) {
+  const left = Math.max(0, start - radius);
+  const right = Math.min(text.length, end + radius);
+  let out = text.slice(left, right);
+  out = out.split(/\s+/g).filter(Boolean).join(" ");
+  if (left > 0) out = `…${out}`;
+  if (right < text.length) out = `${out}…`;
+  return out;
+}
+
+function offsetToPos(segments: Array<[number, string]>, offset: number) {
+  let cursor = 0;
+  let lastPos = 0;
+  const safeOffset = Math.max(0, Number.isFinite(offset) ? Math.trunc(offset) : 0);
+  for (const [pos, raw] of segments) {
+    const text = raw ?? "";
+    lastPos = pos + text.length;
+    const nextCursor = cursor + text.length;
+    if (safeOffset <= nextCursor) {
+      return pos + (safeOffset - cursor);
+    }
+    cursor = nextCursor;
+  }
+  return lastPos;
+}
+
+function buildIndexedBlocks(doc: any): IndexedBlock[] {
+  const blocks: IndexedBlock[] = [];
+  const blockStack: Array<{ segments: Array<[number, string]> }> = [];
+
+  function pushBlock() {
+    blockStack.push({ segments: [] });
+  }
+
+  function popBlock() {
+    const blk = blockStack.pop();
+    if (!blk) return;
+    const segments = blk.segments
+      .map(([p, t]) => [Number(p), String(t ?? "")] as [number, string])
+      .filter(([, t]) => t);
+    if (!segments.length) return;
+    const text = segments.map(([, t]) => t).join("");
+    if (!text) return;
+    blocks.push({ segments, text, text_ci: text.toLowerCase() });
+  }
+
+  const blockTypes = new Set(["paragraph", "heading", "codeblock"]);
+  const leafOneTypes = new Set(["hardbreak", "horizontalrule"]);
+
+  function walk(node: any, pos: number): number {
+    if (!node || typeof node !== "object") return 0;
+    const nodeType = String((node as any).type || "").toLowerCase();
+
+    if (nodeType === "text") {
+      const text = String((node as any).text || "");
+      if (blockStack.length && text) {
+        blockStack[blockStack.length - 1].segments.push([pos, text]);
+      }
+      return text.length;
+    }
+
+    if (leafOneTypes.has(nodeType)) {
+      if (nodeType === "hardbreak" && blockStack.length) {
+        blockStack[blockStack.length - 1].segments.push([pos, "\n"]);
+      }
+      return 1;
+    }
+
+    const pushed = blockTypes.has(nodeType);
+    if (pushed) pushBlock();
+
+    const content = (node as any).content;
+    let totalChild = 0;
+    if (Array.isArray(content)) {
+      let childPos = nodeType === "doc" ? pos : pos + 1;
+      for (const child of content) {
+        const childSize = walk(child, childPos);
+        childPos += childSize;
+        totalChild += childSize;
+      }
+    }
+
+    if (pushed) popBlock();
+    if (nodeType === "doc") return totalChild;
+    return 2 + totalChild;
+  }
+
+  walk(doc, 0);
+  return blocks;
+}
+
+function searchProseMirrorDoc(doc: any, qRaw: string, opts?: { limit?: number }): DocSearchMatch[] {
+  const q = (qRaw || "").trim();
+  if (!q) return [];
+  if (!doc || typeof doc !== "object") return [];
+
+  const limit = Math.max(1, Math.min(Number(opts?.limit ?? 400) || 400, 1000));
+  const needle = q.toLowerCase();
+  const blocks = buildIndexedBlocks(doc);
+  const matches: DocSearchMatch[] = [];
+  for (const block of blocks) {
+    const hay = block.text_ci;
+    if (!hay) continue;
+    let startAt = 0;
+    while (true) {
+      const found = hay.indexOf(needle, startAt);
+      if (found < 0) break;
+      const end = found + needle.length;
+      const from = offsetToPos(block.segments, found);
+      const to = offsetToPos(block.segments, end);
+      if (Number.isFinite(from) && Number.isFinite(to) && to > from) {
+        matches.push({
+          id: `${from}:${to}:${matches.length}`,
+          from,
+          to,
+          snippet: snippet(block.text, found, end),
+        });
+        if (matches.length >= limit) return matches;
+      }
+      startAt = end > found ? end : found + 1;
+    }
+  }
+  return matches;
 }
 
 export function DocumentsPane({
@@ -68,44 +237,104 @@ export function DocumentsPane({
   const [files, setFiles] = useState<ChatFile[]>([]);
   const [pendingUploads, setPendingUploads] = useState<string[]>([]);
   const [internalActiveFileId, setInternalActiveFileId] = useState<string | null>(null);
-  const [view, setView] = useState<ExtractedView | null>(null);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
-  const [isLoadingView, setIsLoadingView] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const [doc, setDoc] = useState<any | null>(null);
+  const [isLoadingDoc, setIsLoadingDoc] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const editingFileIdRef = useRef<string | null>(null);
+  const docRef = useRef<any | null>(null);
+  const saveTimerRef = useRef<number | null>(null);
+
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const [selectionText, setSelectionText] = useState<string>("");
   const [selectionPos, setSelectionPos] = useState<{ x: number; y: number } | null>(null);
   const [pendingSelection, setPendingSelection] = useState<{ file_id: string; text: string } | null>(null);
   const popoverTimerRef = useRef<number | null>(null);
+
   const [isDropHover, setIsDropHover] = useState(false);
   const dropCounterRef = useRef(0);
   const ingestInFlightRef = useRef(false);
+
   const activeFileIdRef = useRef<string | null>(null);
   const latestFilesChangedRef = useRef<string | null>(null);
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMatches, setSearchMatches] = useState<DocSearchMatch[]>([]);
+  const [activeMatchIndex, setActiveMatchIndex] = useState(0);
+  const [isSearching, setIsSearching] = useState(false);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [replaceQuery, setReplaceQuery] = useState("");
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const editorRef = useRef<any | null>(null);
+  const lastSearchKeyRef = useRef<string>("");
+  const [isReplaceMenuOpen, setIsReplaceMenuOpen] = useState(false);
+  const replaceMenuRef = useRef<HTMLDivElement | null>(null);
+  const handleEditorReady = useCallback((editor: any | null) => {
+    editorRef.current = editor;
+  }, []);
+
+  const infoPopoverRef = useRef<HTMLDivElement | null>(null);
+  const infoAnchorRef = useRef<HTMLElement | null>(null);
+  const [infoPos, setInfoPos] = useState<{ x: number; y: number } | null>(null);
 
   const isControlled = typeof activeFileId !== "undefined";
   const effectiveActiveFileId = isControlled ? (activeFileId ?? null) : internalActiveFileId;
 
   function setActiveFileId(nextId: string | null) {
-    if (onActiveFileIdChange) onActiveFileIdChange(nextId);
+    onActiveFileIdChange?.(nextId);
     if (!isControlled) setInternalActiveFileId(nextId);
   }
+
+  useEffect(() => {
+    docRef.current = doc;
+  }, [doc]);
+
+  useEffect(() => {
+    activeFileIdRef.current = effectiveActiveFileId;
+  }, [effectiveActiveFileId]);
 
   useEffect(() => {
     setError(null);
     setFiles([]);
     setPendingUploads([]);
-    setView(null);
     setIsLoadingFiles(false);
-    setIsLoadingView(false);
-    setSelectionText("");
-    setSelectionPos(null);
-    setPendingSelection(null);
     setIsDropHover(false);
     dropCounterRef.current = 0;
     ingestInFlightRef.current = false;
+
+    setDoc(null);
+    setIsLoadingDoc(false);
+    setIsEditing(false);
+    editingFileIdRef.current = null;
+    docRef.current = null;
+    if (saveTimerRef.current != null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+
+    setSelectionText("");
+    setSelectionPos(null);
+    setPendingSelection(null);
+    if (popoverTimerRef.current != null) {
+      window.clearTimeout(popoverTimerRef.current);
+      popoverTimerRef.current = null;
+    }
+
+    setSearchQuery("");
+    setSearchMatches([]);
+    setActiveMatchIndex(0);
+    setIsSearching(false);
+    setIsSearchOpen(false);
+    setReplaceQuery("");
+    setIsReplaceMenuOpen(false);
+    setInfoPos(null);
+    infoAnchorRef.current = null;
+
+    latestFilesChangedRef.current = null;
     if (!isControlled) setInternalActiveFileId(null);
-  }, [chatId]);
+  }, [chatId, isControlled]);
 
   useEffect(() => {
     function onPending(e: Event) {
@@ -122,13 +351,23 @@ export function DocumentsPane({
     return () => window.removeEventListener("insight:docs-pending", onPending as any);
   }, [chatId]);
 
-  useEffect(() => {
-    activeFileIdRef.current = effectiveActiveFileId;
-  }, [effectiveActiveFileId]);
+  async function flushDocSaveNow() {
+    const fileId = editingFileIdRef.current;
+    if (!fileId) return;
+    const currentDoc = docRef.current;
+    if (!currentDoc) return;
+    if (saveTimerRef.current != null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    try {
+      await saveDocPage(chatId, fileId, { doc: currentDoc });
+    } catch {
+      // ignore
+    }
+  }
 
-  const dropEnabled = !files.length && !pendingUploads.length && !ingestInFlightRef.current;
-
-  async function reloadFiles() {
+  async function reloadFiles(): Promise<ChatFile[]> {
     const res = await engine<{ files: ChatFile[] }>(
       `/files/chat/${encodeURIComponent(chatId)}`,
       undefined,
@@ -146,10 +385,24 @@ export function DocumentsPane({
     return next;
   }
 
-  // Backend-driven, out-of-band events (no polling):
+  async function reloadActiveDoc(fileId: string) {
+    setIsLoadingDoc(true);
+    const res = await loadDocPage(chatId, fileId);
+    setIsLoadingDoc(false);
+    if (!res.ok) {
+      setError(res.error || `Failed to load document (${res.status})`);
+      setDoc(null);
+      return;
+    }
+    setDoc((res.data as any)?.doc ?? null);
+  }
+
+  const dropEnabled = !files.length && !pendingUploads.length && !ingestInFlightRef.current;
+
+  // Backend-driven events:
   // - files-changed: file registered/attached to this chat
-  // - file-text-ready: extracted view persisted, safe to render
-  // - file-status: ingestion progress update
+  // - file-text-ready: extracted representation persisted (doc page can bootstrap/update)
+  // - file-status: ingestion status update
   useEffect(() => {
     let cancelled = false;
     const unlistenFns: Array<() => void> = [];
@@ -161,16 +414,9 @@ export function DocumentsPane({
     function safeReloadFilesAndMaybeSelect(payload: any, reason?: string) {
       reloadFiles()
         .then((next) => {
-          const fidFromEvent =
-            typeof payload?.file_id === "string" ? payload.file_id : null;
+          const fidFromEvent = typeof payload?.file_id === "string" ? payload.file_id : null;
 
-          // When a new file is attached, we want to immediately switch the active
-          // document to that file (even if another file was already selected).
-          // Do this after the list reload so the tab definitely exists.
           if (reason === "files-changed" && fidFromEvent) {
-            // Multiple files can be registered in quick succession (multi-attach).
-            // Only apply the selection for the latest files-changed event we've seen,
-            // otherwise slower reloads can "snap" the UI back to an earlier file.
             if (
               latestFilesChangedRef.current === fidFromEvent &&
               next.some((f) => f.file_id === fidFromEvent)
@@ -211,22 +457,21 @@ export function DocumentsPane({
           if (fid) latestFilesChangedRef.current = fid;
         }
 
-        // Always refresh the file list promptly.
         safeReloadFilesAndMaybeSelect(payload, name);
 
-        // If the currently selected file finished extracting, refresh the view.
         if (name === "file-text-ready") {
           const fid = typeof payload?.file_id === "string" ? payload.file_id : null;
           const activeFid = activeFileIdRef.current;
-          if (fid) {
-            // If we didn't have an active file yet, auto-select this one.
-            if (!activeFid) {
-              setActiveFileId(fid);
-            } else if (fid === activeFid) {
-              loadView(fid).catch(() => {
-                // ignore
-              });
-            }
+          if (!fid) return;
+
+          if (!activeFid) {
+            setActiveFileId(fid);
+            return;
+          }
+          if (fid === activeFid && !editingFileIdRef.current) {
+            reloadActiveDoc(fid).catch(() => {
+              // ignore
+            });
           }
         }
       })
@@ -250,8 +495,8 @@ export function DocumentsPane({
     setIsLoadingFiles(true);
 
     async function load() {
-      if (cancelled) return;
       const next = await reloadFiles();
+      if (cancelled) return;
       setIsLoadingFiles(false);
 
       const current = isControlled ? (activeFileId ?? null) : internalActiveFileId;
@@ -261,10 +506,9 @@ export function DocumentsPane({
     }
 
     load().catch((e) => {
-      if (!cancelled) {
-        setIsLoadingFiles(false);
-        setError(e?.message ?? String(e));
-      }
+      if (cancelled) return;
+      setIsLoadingFiles(false);
+      setError(e?.message ?? String(e));
     });
 
     return () => {
@@ -284,20 +528,16 @@ export function DocumentsPane({
     );
     setError(null);
     setIsLoadingFiles(true);
-    setIsDropHover(false);
-    dropCounterRef.current = 0;
     try {
       const res = await engine<{ files: { file_id: string; filename: string; job_id: string }[] }>(
         "/files/ingest_path",
         { chat_id: chatId, paths },
         "POST"
       );
-      setIsLoadingFiles(false);
       if (!res.ok) {
         setError(res.error || `Failed to ingest files (${res.status})`);
         return;
       }
-      // Refresh list; newly-ingested files may still be processing but should appear immediately.
       const next = await reloadFiles();
       const first = Array.isArray(res.data?.files) && res.data.files.length ? res.data.files[0] : null;
       if (first?.file_id) setActiveFileId(first.file_id);
@@ -357,52 +597,77 @@ export function DocumentsPane({
     };
   }, [chatId, dropEnabled]);
 
-  async function loadView(fileId: string) {
-    setError(null);
-    setIsLoadingView(true);
-    setView(null);
-    const res = await engine<ExtractedView>(`/files/extracted/${encodeURIComponent(fileId)}`, undefined, "GET");
-    setIsLoadingView(false);
-    if (!res.ok) {
-      setError(res.error || `Failed to load extracted view (${res.status})`);
-      return;
+  useEffect(() => {
+    // Reset view state when switching documents.
+    setInfoPos(null);
+    infoAnchorRef.current = null;
+    setSelectionText("");
+    setSelectionPos(null);
+    setPendingSelection(null);
+    if (popoverTimerRef.current != null) {
+      window.clearTimeout(popoverTimerRef.current);
+      popoverTimerRef.current = null;
     }
-    setView(res.data as any);
-  }
+
+    if (isEditing) {
+      void flushDocSaveNow();
+    }
+    setIsEditing(false);
+    editingFileIdRef.current = null;
+
+    if (saveTimerRef.current != null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+  }, [effectiveActiveFileId]);
 
   useEffect(() => {
     let cancelled = false;
     const id = effectiveActiveFileId;
     if (!id) {
-      setView(null);
+      setDoc(null);
+      setIsLoadingDoc(false);
       return;
     }
-    (async () => {
-      try {
-        setError(null);
-        setIsLoadingView(true);
-        setView(null);
-        const res = await engine<ExtractedView>(`/files/extracted/${encodeURIComponent(id)}`, undefined, "GET");
+    setIsLoadingDoc(true);
+    setDoc(null);
+    loadDocPage(chatId, id)
+      .then((res) => {
         if (cancelled) return;
-        setIsLoadingView(false);
+        setIsLoadingDoc(false);
         if (!res.ok) {
-          setError(res.error || `Failed to load extracted view (${res.status})`);
+          setError(res.error || `Failed to load document (${res.status})`);
+          setDoc(null);
           return;
         }
-        setView(res.data as any);
-      } catch (e: any) {
-        if (!cancelled) {
-          setIsLoadingView(false);
-          setError(e?.message ?? String(e));
-        }
-      }
-    })();
+        setDoc((res.data as any)?.doc ?? null);
+      })
+      .catch((e: any) => {
+        if (cancelled) return;
+        setIsLoadingDoc(false);
+        setError(e?.message ?? String(e));
+        setDoc(null);
+      });
     return () => {
       cancelled = true;
     };
-  }, [effectiveActiveFileId]);
+  }, [effectiveActiveFileId, chatId]);
+
+  function scheduleSave(nextDoc: any) {
+    const fileId = editingFileIdRef.current || effectiveActiveFileId;
+    if (!fileId) return;
+    if (!isEditing) return;
+    if (saveTimerRef.current != null) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      saveDocPage(chatId, fileId, { doc: nextDoc }).catch(() => {
+        // ignore; next edit will retry
+      });
+    }, 500);
+  }
 
   function readSelectionFromWindow(opts?: { showPopover?: boolean }) {
+    if (isEditing) return;
     if (!effectiveActiveFileId) return;
     const sel = window.getSelection?.();
     const txt = (sel && typeof sel.toString === "function" ? sel.toString() : "") || "";
@@ -442,7 +707,6 @@ export function DocumentsPane({
       const body = bodyRef.current;
       if (!body) return;
       const bodyRect = body.getBoundingClientRect();
-      // Anchor to selection center, show popover above it.
       const xRaw = rect.left - bodyRect.left + body.scrollLeft + rect.width / 2;
       const minX = body.scrollLeft + 28;
       const maxX = body.scrollLeft + body.clientWidth - 28;
@@ -451,11 +715,7 @@ export function DocumentsPane({
       const yRaw = rect.top - bodyRect.top + body.scrollTop - 48;
       const minY = body.scrollTop + 8;
       const y = Math.max(minY, yRaw);
-      // IMPORTANT: Delay popover render to the next tick so the mouseup/click that
-      // ended the selection can't accidentally click the newly-rendered Ask button.
-      if (popoverTimerRef.current != null) {
-        window.clearTimeout(popoverTimerRef.current);
-      }
+      if (popoverTimerRef.current != null) window.clearTimeout(popoverTimerRef.current);
       popoverTimerRef.current = window.setTimeout(() => {
         popoverTimerRef.current = null;
         setSelectionPos({ x: Math.max(8, x), y: Math.max(8, y) });
@@ -466,18 +726,17 @@ export function DocumentsPane({
   }
 
   useEffect(() => {
-    // More reliable than relying on mouseup within the element:
-    // selection often ends outside the viewer, especially with drag-to-select.
+    if (isEditing) return;
     function onSelectionChangeEvent() {
       readSelectionFromWindow({ showPopover: false });
     }
     document.addEventListener("selectionchange", onSelectionChangeEvent);
     return () => document.removeEventListener("selectionchange", onSelectionChangeEvent);
-  }, [effectiveActiveFileId]);
+  }, [effectiveActiveFileId, isEditing]);
 
   function commitSelectionToChat() {
     if (!pendingSelection) return;
-    if (onSelectionChange) onSelectionChange(pendingSelection);
+    onSelectionChange?.(pendingSelection);
     onAskSelection?.();
     setSelectionText("");
     setPendingSelection(null);
@@ -489,66 +748,236 @@ export function DocumentsPane({
     [files, effectiveActiveFileId]
   );
 
-  const blocks = useMemo(() => {
-    const b = Array.isArray(view?.blocks) ? view!.blocks : [];
-    if (b.length) return b;
-    if (view?.plain_text) return fallbackBlocksFromPlainText(view.plain_text);
-    return [];
-  }, [view]);
+  const wordCount = useMemo(() => {
+    const text = plainTextFromProseMirror(doc);
+    const n = countWords(text);
+    return n > 0 ? n : null;
+  }, [doc]);
 
-  function renderBlock(block: ExtractedBlock, idx: number) {
-    const kind = (block.kind || "paragraph").toLowerCase();
-    if (kind === "page_break") {
-      const label = block.text || `Page ${block?.metadata?.page ?? ""}`.trim();
-      return (
-        <div key={idx} className="docs-block docs-block-page">
-          <div className="docs-block-page-line" />
-          <div className="docs-block-page-label">{label}</div>
-          <div className="docs-block-page-line" />
-        </div>
-      );
+  const effectiveSearchOpen = isSearchOpen || !!searchQuery.trim() || (isEditing && !!replaceQuery.trim());
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (!effectiveActiveFileId) return;
+      if (!e.ctrlKey && !e.metaKey) return;
+      if (e.key.toLowerCase() !== "f") return;
+      e.preventDefault();
+      setIsSearchOpen(true);
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [effectiveActiveFileId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fileId = effectiveActiveFileId;
+    const q = searchQuery.trim();
+    if (!fileId || !q) {
+      setIsSearching(false);
+      setSearchMatches([]);
+      setActiveMatchIndex(0);
+      return;
     }
 
-    if (kind === "heading") {
-      const level = Number(block?.metadata?.level || 2);
-      const cls = `docs-block docs-block-heading h${Math.min(6, Math.max(1, level))}`;
-      return (
-        <div key={idx} className={cls}>
-          {block.text}
-        </div>
-      );
-    }
+    setIsSearching(true);
+    const searchKey = `${fileId}|${q}|${isEditing ? "edit" : "view"}`;
+    const shouldResetIndex = lastSearchKeyRef.current !== searchKey;
+    lastSearchKeyRef.current = searchKey;
+    const timer = window.setTimeout(() => {
+      if (isEditing) {
+        try {
+          const matches = searchProseMirrorDoc(docRef.current, q, { limit: 400 });
+          if (cancelled) return;
+          setIsSearching(false);
+          setSearchMatches(matches);
+          setActiveMatchIndex((prev) => {
+            if (!matches.length) return 0;
+            if (shouldResetIndex) return 0;
+            return Math.min(Math.max(0, prev), matches.length - 1);
+          });
+        } catch {
+          if (cancelled) return;
+          setIsSearching(false);
+          setSearchMatches([]);
+          setActiveMatchIndex(0);
+        }
+        return;
+      }
+      const endpoint = `/search/doc/${encodeURIComponent(chatId)}/${encodeURIComponent(fileId)}?q=${encodeURIComponent(q)}&limit=400`;
+      engine<DocSearchResponse>(endpoint, undefined, "GET")
+        .then((res) => {
+          if (cancelled) return;
+          setIsSearching(false);
+          if (!res.ok) {
+            setSearchMatches([]);
+            setActiveMatchIndex(0);
+            return;
+          }
+          const raw = Array.isArray((res.data as any)?.matches)
+            ? ((res.data as any).matches as any[])
+            : [];
+          const matches = raw
+            .map((m, i) => {
+              const from = Number(m?.from ?? m?.from_pos ?? m?.fromPos ?? -1);
+              const to = Number(m?.to ?? m?.to_pos ?? m?.toPos ?? -1);
+              if (!Number.isFinite(from) || from < 0) return null;
+              if (!Number.isFinite(to) || to <= from) return null;
+              return {
+                id: `${from}:${to}:${i}`,
+                from,
+                to,
+                snippet: String(m?.snippet ?? ""),
+              } satisfies DocSearchMatch;
+            })
+            .filter(Boolean) as DocSearchMatch[];
+          setSearchMatches(matches);
+          setActiveMatchIndex((prev) => {
+            if (!matches.length) return 0;
+            if (shouldResetIndex) return 0;
+            return Math.min(Math.max(0, prev), matches.length - 1);
+          });
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setIsSearching(false);
+          setSearchMatches([]);
+          setActiveMatchIndex(0);
+        });
+    }, 180);
 
-    if (kind === "list") {
-      const items = Array.isArray(block?.metadata?.items)
-        ? block.metadata.items
-        : (block.text || "")
-            .split("\n")
-            .map((x: string) => x.trim())
-            .filter(Boolean);
-      return (
-        <ul key={idx} className="docs-block docs-block-list">
-          {items.map((it: string, i: number) => (
-            <li key={i}>{it}</li>
-          ))}
-        </ul>
-      );
-    }
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [effectiveActiveFileId, searchQuery, chatId, isEditing, doc]);
 
-    if (kind === "code") {
-      return (
-        <pre key={idx} className="docs-block docs-block-code">
-          {block.text}
-        </pre>
-      );
-    }
-
-    return (
-      <p key={idx} className="docs-block docs-block-paragraph">
-        {block.text}
-      </p>
-    );
+  function replaceActiveMatch() {
+    if (!isEditing) return;
+    const editor = editorRef.current;
+    if (!editor) return;
+    const q = searchQuery.trim();
+    if (!q) return;
+    const len = searchMatches.length;
+    if (!len) return;
+    const idx = Math.min(Math.max(0, activeMatchIndex), len - 1);
+    const m = searchMatches[idx];
+    if (!m) return;
+    const from = Number(m.from);
+    const to = Number(m.to);
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return;
+    const replacement = String(replaceQuery ?? "");
+    editor.view.dispatch(editor.state.tr.insertText(replacement, from, to));
+    editor.commands.focus();
   }
+
+  function replaceAllMatches() {
+    if (!isEditing) return;
+    const editor = editorRef.current;
+    if (!editor) return;
+    const q = searchQuery.trim();
+    if (!q) return;
+    const replacement = String(replaceQuery ?? "");
+
+    const matches = [...searchMatches]
+      .map((m) => ({ from: Number(m.from), to: Number(m.to) }))
+      .filter((m) => Number.isFinite(m.from) && Number.isFinite(m.to) && m.to > m.from)
+      .sort((a, b) => b.from - a.from);
+    if (!matches.length) return;
+
+    let tr = editor.state.tr;
+    for (const m of matches) {
+      tr = tr.insertText(replacement, m.from, m.to);
+    }
+    editor.view.dispatch(tr);
+    editor.commands.focus();
+  }
+
+  function toggleInfoPopover(anchor: HTMLElement) {
+    setInfoPos((prev) => {
+      if (prev) return null;
+      const rect = anchor.getBoundingClientRect();
+      infoAnchorRef.current = anchor;
+      return { x: rect.right, y: rect.bottom };
+    });
+  }
+
+  useEffect(() => {
+    if (!isReplaceMenuOpen) return;
+    function onPointerDown(e: Event) {
+      const target = e.target as Node | null;
+      const el = replaceMenuRef.current;
+      if (!el || !target) return;
+      if (el.contains(target)) return;
+      setIsReplaceMenuOpen(false);
+    }
+    window.addEventListener("pointerdown", onPointerDown, true);
+    return () => window.removeEventListener("pointerdown", onPointerDown, true);
+  }, [isReplaceMenuOpen]);
+
+  useEffect(() => {
+    if (!isEditing) setIsReplaceMenuOpen(false);
+  }, [isEditing]);
+
+  useEffect(() => {
+    if (!infoPos) return;
+    function onPointerDown(e: Event) {
+      const target = e.target as Node | null;
+      const popover = infoPopoverRef.current;
+      const anchor = infoAnchorRef.current;
+      if (!target) return;
+      if (popover && popover.contains(target)) return;
+      if (anchor && anchor.contains(target)) return;
+      setInfoPos(null);
+    }
+    window.addEventListener("pointerdown", onPointerDown, true);
+    return () => window.removeEventListener("pointerdown", onPointerDown, true);
+  }, [infoPos]);
+
+  useEffect(() => {
+    if (!infoPos) return;
+    const popover = infoPopoverRef.current;
+    const anchor = infoAnchorRef.current;
+    if (!popover || !anchor) return;
+
+    const raf = window.requestAnimationFrame(() => {
+      const popRect = popover.getBoundingClientRect();
+      const boundaryEl = anchor.closest(".canvas-root") as HTMLElement | null;
+      const boundaryRect = boundaryEl
+        ? boundaryEl.getBoundingClientRect()
+        : new DOMRect(0, 0, window.innerWidth, window.innerHeight);
+
+      const pad = 14;
+      const minX = boundaryRect.left + pad;
+      const maxX = boundaryRect.right - pad;
+      const minY = boundaryRect.top + pad;
+      const maxY = boundaryRect.bottom - pad;
+
+      let nextX = infoPos.x;
+      let nextY = infoPos.y;
+
+      if (popRect.left < minX) nextX += minX - popRect.left;
+      else if (popRect.right > maxX) nextX -= popRect.right - maxX;
+
+      if (popRect.top < minY) nextY += minY - popRect.top;
+      else if (popRect.bottom > maxY) nextY -= popRect.bottom - maxY;
+
+      nextX = Math.round(nextX);
+      nextY = Math.round(nextY);
+
+      if (nextX !== infoPos.x || nextY !== infoPos.y) {
+        setInfoPos({ x: nextX, y: nextY });
+      }
+    });
+
+    return () => window.cancelAnimationFrame(raf);
+  }, [infoPos]);
+
+  useEffect(() => {
+    setInfoPos(null);
+    infoAnchorRef.current = null;
+  }, [effectiveActiveFileId]);
 
   return (
     <div className="docs-pane">
@@ -557,19 +986,36 @@ export function DocumentsPane({
           {files.map((f) => {
             const active = f.file_id === effectiveActiveFileId;
             return (
-              <button
-                key={f.file_id}
-                className={`docs-tab ${active ? "active" : ""}`}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                title={`${f.filename} · ${formatBytes(Number(f.size_bytes || 0))}`}
-                onClick={() => setActiveFileId(f.file_id)}
-              >
-                <span className="docs-tab-title">{f.filename}</span>
-              </button>
+              <div key={f.file_id} className={`docs-tab ${active ? "active" : ""}`}>
+                <button
+                  className="docs-tab-main"
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  title={`${f.filename} · ${formatBytes(Number(f.size_bytes || 0))}`}
+                  onClick={() => setActiveFileId(f.file_id)}
+                >
+                  <span className="docs-tab-title">{f.filename}</span>
+                </button>
+                {active ? (
+                  <button
+                    type="button"
+                    className="docs-tab-info"
+                    aria-label="Document info"
+                    title="Info"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      toggleInfoPopover(e.currentTarget);
+                    }}
+                  >
+                    i
+                  </button>
+                ) : null}
+              </div>
             );
           })}
+
           {!files.length && pendingUploads.length ? (
             <>
               {pendingUploads.map((name, idx) => (
@@ -587,10 +1033,44 @@ export function DocumentsPane({
               ))}
             </>
           ) : null}
+
           {!files.length && !pendingUploads.length ? (
             <div className="docs-tabs-empty">No documents yet</div>
           ) : null}
         </div>
+
+        {infoPos && activeFile ? (
+          <div
+            ref={infoPopoverRef}
+            className="docs-tab-info-popover"
+            role="dialog"
+            aria-label="Document info"
+            style={{ left: infoPos.x, top: infoPos.y }}
+          >
+            <div className="docs-reader-info-panel">
+              <div className="docs-reader-info-row">
+                <div className="docs-reader-info-label">Type</div>
+                <div className="docs-reader-info-value">{activeFile.mime || "—"}</div>
+              </div>
+              <div className="docs-reader-info-row">
+                <div className="docs-reader-info-label">Pages</div>
+                <div className="docs-reader-info-value">{typeof activeFile.pages === "number" ? activeFile.pages : "—"}</div>
+              </div>
+              <div className="docs-reader-info-row">
+                <div className="docs-reader-info-label">Uploaded</div>
+                <div className="docs-reader-info-value">{formatTimestamp(activeFile.created_at) || "—"}</div>
+              </div>
+              <div className="docs-reader-info-row">
+                <div className="docs-reader-info-label">Size</div>
+                <div className="docs-reader-info-value">{formatBytes(Number(activeFile.size_bytes || 0))}</div>
+              </div>
+              <div className="docs-reader-info-row">
+                <div className="docs-reader-info-label">Words</div>
+                <div className="docs-reader-info-value">{typeof wordCount === "number" ? wordCount.toLocaleString() : "—"}</div>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         <div
           className={`docs-pane-viewer ${dropEnabled ? "docs-pane-drop-enabled" : ""} ${isDropHover ? "drag-over" : ""}`}
@@ -612,7 +1092,6 @@ export function DocumentsPane({
           onDragOver={(e) => {
             e.preventDefault();
             e.stopPropagation();
-            // Required to allow drop.
             if (!dropEnabled) return;
             setIsDropHover(true);
           }}
@@ -623,8 +1102,8 @@ export function DocumentsPane({
             dropCounterRef.current = 0;
             if (!dropEnabled) return;
 
-            const files = Array.from(e.dataTransfer?.files || []);
-            const paths = files
+            const droppedFiles = Array.from(e.dataTransfer?.files || []);
+            const paths = droppedFiles
               .map((f) => (f as any)?.path as string)
               .filter((p) => typeof p === "string" && p);
             if (!paths.length) {
@@ -641,9 +1120,7 @@ export function DocumentsPane({
               {pendingUploads.length ? (
                 <div className="docs-dropzone">
                   <div className="docs-dropzone-title">Uploading…</div>
-                  <div className="docs-dropzone-sub">
-                    Extracted text will appear here once ready.
-                  </div>
+                  <div className="docs-dropzone-sub">Extracted text will appear here once ready.</div>
                 </div>
               ) : (
                 <div className="docs-dropzone">
@@ -654,66 +1131,235 @@ export function DocumentsPane({
             </div>
           ) : null}
 
-          {activeFile ? (
-            <div className="docs-reader">
-              <div className="docs-reader-header">
-                <div className="docs-reader-title">{activeFile.filename}</div>
-                <div className="docs-reader-meta">
-                  {activeFile.pages ? <span>{activeFile.pages} pages</span> : null}
-                  {activeFile.mime ? <span>{activeFile.mime}</span> : null}
-                  {activeFile.status ? <span>{activeFile.status}</span> : null}
-                </div>
-                <button
-                  className="docs-reader-refresh"
-                  type="button"
-                  onClick={() => (effectiveActiveFileId ? loadView(effectiveActiveFileId) : undefined)}
-                  disabled={!effectiveActiveFileId || isLoadingView}
-                >
-                  Refresh
-                </button>
-              </div>
+	          {activeFile ? (
+	            <div className="docs-reader">
+		              <div className="docs-reader-header">
+		                <div className="docs-reader-header-row">
+		                  <button
+		                    type="button"
+		                    className="docs-reader-search-toggle"
+		                    aria-label={isEditing ? "Search and replace" : "Search in document"}
+		                    title={isEditing ? "Search & Replace" : "Search"}
+		                    onClick={() => {
+		                      setIsSearchOpen((prev) => {
+		                        const next = !prev;
+		                        if (!next) {
+		                          setReplaceQuery("");
+		                          setIsReplaceMenuOpen(false);
+		                        }
+		                        if (next) {
+		                          window.setTimeout(() => {
+		                            searchInputRef.current?.focus();
+		                            searchInputRef.current?.select();
+		                          }, 0);
+		                        }
+		                        return next;
+		                      });
+		                    }}
+			                  >
+			                    ⌕
+			                  </button>
 
-              {isLoadingFiles || isLoadingView ? (
-                <div className="docs-reader-loading">Loading…</div>
-              ) : null}
+		                  <button
+		                    type="button"
+		                    className="docs-reader-edit-toggle"
+		                    aria-label={isEditing ? "Done editing" : "Edit document"}
+		                    title={isEditing ? "Done" : "Edit"}
+	                    onClick={() => {
+	                      if (isEditing) {
+	                        void flushDocSaveNow().finally(() => {
+	                          editingFileIdRef.current = null;
+	                          setIsEditing(false);
+	                        });
+	                        return;
+	                      }
+	                      editingFileIdRef.current = effectiveActiveFileId;
+	                      setIsEditing(true);
+		                    }}
+		                  >
+		                    <span className="docs-reader-edit-icon">{isEditing ? "✓" : "✎"}</span>
+		                  </button>
+			                </div>
 
-              {!isLoadingView && view && view.status && view.status !== "completed" && !blocks.length ? (
-                <div className="docs-reader-loading">
-                  Processing… extracted text will appear here once ready.
-                </div>
-              ) : null}
+                <div className={`docs-reader-search-wrap ${effectiveSearchOpen ? "open" : ""}`}>
+                  <div className="docs-reader-search">
+                    <span className="docs-reader-search-icon" aria-hidden="true">
+                      ⌕
+                    </span>
+                    <input
+                      ref={searchInputRef}
+                      className="docs-reader-search-input"
+                      placeholder="Search in document…"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      onKeyDown={(e) => {
+                        const len = searchMatches.length;
+                        const navDown = e.key === "Enter" || e.key === "ArrowDown";
+                        const navUp = e.key === "ArrowUp";
+                        if (navDown || navUp) {
+                          if (!len) return;
+                          e.preventDefault();
+                          const delta = navUp || (e.key === "Enter" && e.shiftKey) ? -1 : 1;
+                          setActiveMatchIndex((prev) => (prev + delta + len) % len);
+                          return;
+                        }
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          setSearchQuery("");
+                          setSearchMatches([]);
+                          setActiveMatchIndex(0);
+                          setIsSearchOpen(false);
+                          setReplaceQuery("");
+                          setIsReplaceMenuOpen(false);
+                        }
+                      }}
+                    />
+                    {searchQuery.trim() ? (
+                      <button
+                        type="button"
+                        className="docs-reader-search-clear"
+                        onClick={() => {
+                          setSearchQuery("");
+                          setSearchMatches([]);
+                          setActiveMatchIndex(0);
+                          searchInputRef.current?.focus();
+                        }}
+                        aria-label="Clear search"
+                        title="Clear"
+                      >
+                        ×
+                      </button>
+                    ) : null}
+                    <div className="docs-reader-search-count" aria-label="Search matches">
+                      {isSearching
+                        ? "…"
+                        : searchQuery.trim()
+                          ? `${searchMatches.length ? activeMatchIndex + 1 : 0}/${searchMatches.length}`
+                          : ""}
+                    </div>
+                  </div>
 
-              {!isLoadingView && blocks.length ? (
-                <div
-                  className="docs-reader-body"
-                  ref={bodyRef}
-                  onMouseUp={() => readSelectionFromWindow({ showPopover: true })}
-                  onKeyUp={() => readSelectionFromWindow({ showPopover: true })}
-                  onScroll={() => {
-                    // Hide the popover while scrolling; selection remains available for chat.
-                    if (selectionPos) setSelectionPos(null);
-                  }}
-                >
-                  {selectionText && selectionPos ? (
-                    <button
-                      type="button"
-                      className="docs-selection-ask docs-selection-popover"
-                      style={{ left: selectionPos.x, top: selectionPos.y }}
-                      onClick={commitSelectionToChat}
-                      title="Ask about this selection"
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onPointerDown={(e) => e.stopPropagation()}
-                    >
-                      Ask
-                    </button>
+                  {isEditing ? (
+                    <div className="docs-reader-replace">
+                      <span className="docs-reader-replace-icon" aria-hidden="true">
+                        ↺
+                      </span>
+                      <input
+                        className="docs-reader-replace-input"
+                        placeholder="Replace…"
+                        value={replaceQuery}
+                        onChange={(e) => setReplaceQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            replaceActiveMatch();
+                          }
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            setReplaceQuery("");
+                            setIsReplaceMenuOpen(false);
+                          }
+                        }}
+                      />
+                      <div className="docs-reader-replace-actions" ref={replaceMenuRef}>
+                        <button
+                          type="button"
+                          className="docs-reader-replace-btn"
+                          disabled={!searchQuery.trim() || !searchMatches.length}
+                          onClick={() => setIsReplaceMenuOpen((prev) => !prev)}
+                          title="Replace…"
+                        >
+                          Replace ▾
+                        </button>
+                        {isReplaceMenuOpen ? (
+                          <div className="docs-reader-replace-menu" role="menu" aria-label="Replace options">
+                            <button
+                              type="button"
+                              className="docs-reader-replace-menu-item"
+                              role="menuitem"
+                              onClick={() => {
+                                setIsReplaceMenuOpen(false);
+                                replaceActiveMatch();
+                              }}
+                            >
+                              Replace (selection)
+                            </button>
+                            <button
+                              type="button"
+                              className="docs-reader-replace-menu-item"
+                              role="menuitem"
+                              onClick={() => {
+                                setIsReplaceMenuOpen(false);
+                                replaceAllMatches();
+                              }}
+                            >
+                              Replace all
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
                   ) : null}
-                  {blocks.map(renderBlock)}
                 </div>
+
+	                {/* Info popover is rendered next to the info button for both view and edit modes. */}
+	              </div>
+
+              {isLoadingFiles ? <div className="docs-reader-loading">Loading…</div> : null}
+
+              {!isLoadingDoc && !doc && activeFile.status && activeFile.status !== "completed" ? (
+                <div className="docs-reader-loading">Processing… extracted text will appear here once ready.</div>
               ) : null}
 
-              {!isLoadingView && view && !blocks.length && view.status === "completed" ? (
-                <div className="docs-pane-empty">No extractable text found for this file.</div>
-              ) : null}
+              <div
+                className="docs-reader-body"
+                ref={bodyRef}
+                onMouseUp={isEditing ? undefined : () => readSelectionFromWindow({ showPopover: true })}
+                onKeyUp={isEditing ? undefined : () => readSelectionFromWindow({ showPopover: true })}
+                onScroll={
+                  isEditing
+                    ? undefined
+                    : () => {
+                        if (selectionPos) setSelectionPos(null);
+                      }
+                }
+              >
+                {!isLoadingDoc && !doc && activeFile.status === "completed" ? (
+                  <div className="docs-reader-loading">No extractable text found for this file.</div>
+                ) : null}
+
+                {isLoadingDoc ? <div className="docs-reader-loading">Loading…</div> : null}
+
+                {doc ? (
+                  <>
+                    {selectionText && selectionPos && !isEditing ? (
+                      <button
+                        type="button"
+                        className="docs-selection-ask docs-selection-popover"
+                        style={{ left: selectionPos.x, top: selectionPos.y }}
+                        onClick={commitSelectionToChat}
+                        title="Ask about this selection"
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onPointerDown={(e) => e.stopPropagation()}
+                      >
+                        Ask
+                      </button>
+                    ) : null}
+	                    <DocEditor
+	                      doc={doc}
+	                      editable={isEditing}
+	                      searchMatches={searchMatches}
+	                      activeMatchIndex={activeMatchIndex}
+	                      onEditorReady={handleEditorReady}
+	                      onDocChange={(next) => {
+	                        setDoc(next);
+	                        docRef.current = next;
+	                        scheduleSave(next);
+	                      }}
+	                    />
+                  </>
+                ) : null}
+              </div>
             </div>
           ) : null}
         </div>

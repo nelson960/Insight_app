@@ -28,11 +28,11 @@ class ImageExtractor(SimpleExtractor):
             raise ExtractionError(
                 "Pillow and pytesseract are required for OCR extraction. Install with `pip install pillow pytesseract`."
             )
-        logger.info("Running OCR on %s", file_path)
+        logger.info("Running pytesseract OCR on %s", file_path)
         image = Image.open(file_path)
         text = pytesseract.image_to_string(image)
         metadata = {
-            "extraction_method": "ocr",
+            "extraction_method": "pytesseract_ocr",
             "content_type": mime_type,
         }
         logger.debug("OCR extraction complete for %s (chars=%d)", file_path, len(text))
