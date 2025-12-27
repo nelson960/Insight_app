@@ -146,6 +146,50 @@ class LlamaSessionManager:
             logger.info("cancel_request accepted request_id=%s", request_id)
             return True
 
+    def busy_state(self) -> Dict[str, object]:
+        """
+        Best-effort indicator for background activity.
+
+        Used by Settings to block destructive operations (reset/clean cache) while:
+        - a stream is active
+        - a deferred KV snapshot is pending
+        - async KV persistence is pending
+        """
+        with self._abort_lock:
+            active_stream = self._abort_request_id is not None
+            active_request_id = self._abort_request_id
+
+        with self._snapshot_mutex:
+            snapshot_scheduled = len(self._snapshot_scheduled)
+
+        with self._persist_mutex:
+            persist_scheduled = len(self._persist_scheduled)
+            persist_pending = len(self._persist_pending)
+
+        dirty_sessions = 0
+        try:
+            for s in self.sessions.values():
+                if isinstance(s, dict) and bool(s.get("_state_dirty")):
+                    dirty_sessions += 1
+        except Exception:
+            dirty_sessions = max(dirty_sessions, 1)
+
+        snapshot_pending = snapshot_scheduled > 0 or dirty_sessions > 0
+        persist_pending_any = persist_scheduled > 0 or persist_pending > 0
+        busy = bool(active_stream or snapshot_pending or persist_pending_any)
+        return {
+            "busy": busy,
+            "ctx_size": int(self.ctx_size) if self.ctx_size else None,
+            "active_stream": active_stream,
+            "active_request_id": active_request_id,
+            "snapshot_pending": snapshot_pending,
+            "snapshot_scheduled": snapshot_scheduled,
+            "persist_pending": persist_pending_any,
+            "persist_scheduled": persist_scheduled,
+            "persist_queue": persist_pending,
+            "dirty_sessions": dirty_sessions,
+        }
+
     def create_session(self, system_prompt: Optional[str] = None) -> str:
         session_id = str(uuid.uuid4())
         self._locks.setdefault(session_id, threading.RLock())
@@ -332,6 +376,15 @@ class LlamaSessionManager:
                         logger.exception("ask_stream error chat=%s request_id=%s", session_id, request_id or "-")
                         raise
                 finally:
+                    # 🔔 fast UI signal that token streaming ended
+                    try:
+                        emit_event(
+                            "llm_stream_end",
+                            chat_id=session_id,
+                            request_id=request_id or "",
+                        )
+                    except Exception:
+                        pass
                     with self._abort_lock:
                         self._abort_request_id = None
                         self._abort_event = None
@@ -619,7 +672,7 @@ class LlamaSessionManager:
                 else:
                     self.llm.reset()
                     self._eval_tokens(run_tokens)
-
+	
                 prompt_tokens = len(run_tokens)
                 requested_max_tokens = int(max_tokens)
                 max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
@@ -676,10 +729,20 @@ class LlamaSessionManager:
                         )
                         raise
                 finally:
+                    # 🔔 NEW: notify UI immediately when streaming stops
+                    try:
+                        emit_event(
+                            "llm_stream_end",
+                            chat_id=session_id,
+                            request_id=request_id or "",
+                        )
+                    except Exception:
+                        # Never let IPC events affect core chat flow
+                        pass
+
                     with self._abort_lock:
                         self._abort_request_id = None
                         self._abort_event = None
-
                 reply = "".join(reply_parts)
                 logger.info(
                     "ask_stream_with_context llama done chat=%s request_id=%s tokens=%d cancelled=%s",

@@ -73,6 +73,15 @@ class SQLiteMetadataStore:
         conn = self._connection
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
                 chat_id TEXT NOT NULL,
@@ -177,6 +186,64 @@ class SQLiteMetadataStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_created ON chunks(created_at)")
         conn.execute(f"PRAGMA journal_mode={self._config.journal_mode}")
         conn.execute(f"PRAGMA busy_timeout={self._config.busy_timeout_ms}")
+
+    # ------------------------------------------------------------------ #
+    # App settings (simple key/value JSON)
+    # ------------------------------------------------------------------ #
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        if not key:
+            return default
+        cursor = self._connection.execute("SELECT value_json FROM app_settings WHERE key=?", (key,))
+        row = cursor.fetchone()
+        if not row:
+            return default
+        raw = row["value_json"]
+        if raw is None:
+            return default
+        try:
+            return json.loads(raw)
+        except Exception:
+            return default
+
+    def set_setting(self, key: str, value: Any) -> None:
+        if not key:
+            raise ValueError("settings key is required")
+        payload = json.dumps(value)
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO app_settings (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (key, payload, _now_iso()),
+            )
+            self._connection.commit()
+
+    def delete_setting(self, key: str) -> None:
+        if not key:
+            return
+        with self._lock:
+            self._connection.execute("DELETE FROM app_settings WHERE key=?", (key,))
+            self._connection.commit()
+
+    def list_settings(self) -> dict[str, Any]:
+        cursor = self._connection.execute("SELECT key, value_json FROM app_settings")
+        out: dict[str, Any] = {}
+        for row in cursor.fetchall():
+            k = row["key"]
+            raw = row["value_json"]
+            try:
+                out[k] = json.loads(raw) if raw is not None else None
+            except Exception:
+                out[k] = None
+        return out
+
+    def close(self) -> None:
+        try:
+            with self._lock:
+                self._connection.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Message APIs (minimal passthrough for compatibility)
@@ -865,6 +932,41 @@ class SQLiteMetadataStore:
             (limit,),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    def list_jobs_with_status(self, statuses: Sequence[str], *, limit: int = 200) -> list[dict[str, object]]:
+        statuses = [s for s in (statuses or []) if isinstance(s, str) and s]
+        if not statuses:
+            return []
+        placeholders = ",".join(["?"] * len(statuses))
+        cursor = self._connection.execute(
+            f"""
+            SELECT id, job_type, file_id, status, error, created_at
+            FROM jobs
+            WHERE status IN ({placeholders})
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (*tuple(statuses), int(limit)),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def count_jobs_with_status(self, statuses: Sequence[str]) -> int:
+        statuses = [s for s in (statuses or []) if isinstance(s, str) and s]
+        if not statuses:
+            return 0
+        placeholders = ",".join(["?"] * len(statuses))
+        cursor = self._connection.execute(
+            f"SELECT COUNT(*) AS c FROM jobs WHERE status IN ({placeholders})",
+            tuple(statuses),
+        )
+        row = cursor.fetchone()
+        try:
+            return int(row["c"] if row and "c" in row.keys() else 0)
+        except Exception:
+            try:
+                return int(row[0] if row else 0)
+            except Exception:
+                return 0
 
 
 def create_sqlite_store(db_path: Any, *, config: Optional[SQLiteConfig] = None) -> SQLiteMetadataStore:

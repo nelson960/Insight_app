@@ -301,6 +301,8 @@ fn spawn_stdout_router(mut stdout: BufReader<ChildStdout>, state: Arc<RouterStat
                         let _ = app.emit("file-text-ready", parsed.clone());
                     } else if name == "file_status" {
                         let _ = app.emit("file-status", parsed.clone());
+                    } else if name == "llm_stream_end" {
+           				let _ = app.emit("llm_stream_end", parsed.clone());
                     }
                 }
                 continue;

@@ -52,7 +52,7 @@ def build_turn_prompt(
     if selection and isinstance(selection, dict):
         sel_text = selection.get("text")
         if isinstance(sel_text, str) and sel_text.strip():
-            sel_file = selection.get("file_id") if isinstance(selection.get("file_id"), str) else None
+            sel_file = selection.get("filename") if isinstance(selection.get("filename"), str) else None
             sel_page = selection.get("page") if isinstance(selection.get("page"), int) else None
             header = "Selected Excerpt (highest priority):"
             if sel_file and sel_page:
@@ -81,6 +81,7 @@ def build_context_pack(
     rag_hits: List[Dict[str, Any]],
     selection: Optional[Dict[str, Any]] = None,
     effective_focus: Optional[str] = None,
+    effective_focus_name: Optional[str] = None,
     include_selection_excerpt: bool = True,
 ) -> str:
     """
@@ -92,10 +93,18 @@ def build_context_pack(
     """
     parts: List[str] = []
 
-    if selection and isinstance(selection, dict) and isinstance(selection.get("file_id"), str):
-        parts.append(f"SCOPE:\n- mode: selection\n- file_id: {selection.get('file_id')}")
+    if selection and isinstance(selection, dict) and isinstance(selection.get("text"), str) and selection.get("text"):
+        # Never include internal IDs in model-visible text.
+        sel_name = selection.get("filename") if isinstance(selection.get("filename"), str) else None
+        if sel_name:
+            parts.append(f"SCOPE:\n- mode: selection\n- file: {sel_name}")
+        else:
+            parts.append("SCOPE:\n- mode: selection")
+    elif effective_focus_name:
+        parts.append(f"SCOPE:\n- mode: focused_document\n- file: {effective_focus_name}")
     elif effective_focus:
-        parts.append(f"SCOPE:\n- mode: focused_document\n- file_id: {effective_focus}")
+        # Focus exists but we don't have a safe filename; keep the scope without IDs.
+        parts.append("SCOPE:\n- mode: focused_document")
 
     # NOTE: Selected excerpts can be injected as part of the *dirty user turn* so they
     # can't be diluted by large context packs. In that mode, keep the excerpt out of
@@ -107,7 +116,7 @@ def build_context_pack(
             if len(sel_trimmed) > 5000:
                 sel_trimmed = sel_trimmed[:5000] + "…"
             header = "SELECTED EXCERPT (highest priority):"
-            sel_file = selection.get("file_id") if isinstance(selection.get("file_id"), str) else None
+            sel_file = selection.get("filename") if isinstance(selection.get("filename"), str) else None
             sel_page = selection.get("page") if isinstance(selection.get("page"), int) else None
             if sel_file and sel_page is not None:
                 header = f"SELECTED EXCERPT (highest priority) from {sel_file} page {sel_page}:"
@@ -131,10 +140,24 @@ def build_context_pack(
             text = (hit.get("text") or "").strip()
             if not text:
                 continue
-            doc_id = hit.get("doc_id") or ""
-            chunk_id = hit.get("chunk_id") or ""
-            score = hit.get("score") or 0.0
-            lines.append(f"[E{i}] doc_id={doc_id} chunk_id={chunk_id} score={score}")
+            filename = hit.get("filename") if isinstance(hit.get("filename"), str) else None
+            page = hit.get("page")
+            if not isinstance(page, int):
+                page = None
+            if page is None:
+                m = re.search(r"---\s*Page\s+(\d+)\s*---", text, flags=re.IGNORECASE)
+                if m:
+                    try:
+                        page = int(m.group(1))
+                    except Exception:
+                        page = None
+
+            if filename and page is not None:
+                lines.append(f"[E{i}] Source: {filename} (page {page})")
+            elif filename:
+                lines.append(f"[E{i}] Source: {filename}")
+            else:
+                lines.append(f"[E{i}] Source")
             lines.append(text)
             lines.append("")
         evidence = "\n".join(lines).strip()
@@ -161,7 +184,7 @@ def build_dirty_user_turn(user_message: str, *, selection: Optional[Dict[str, An
     if len(sel_trimmed) > 5000:
         sel_trimmed = sel_trimmed[:5000] + "…"
 
-    sel_file = selection.get("file_id") if isinstance(selection.get("file_id"), str) else None
+    sel_file = selection.get("filename") if isinstance(selection.get("filename"), str) else None
     sel_page = selection.get("page") if isinstance(selection.get("page"), int) else None
     if sel_file and sel_page is not None:
         header = f"SELECTED EXCERPT (highest priority) from {sel_file} page {sel_page}:"
@@ -412,6 +435,15 @@ class InsightOrchestrator:
         if not isinstance(doc, dict):
             return []
 
+        filename: Optional[str] = None
+        try:
+            rec = self.metadata_store.get_file(file_id)
+            name = rec.get("filename") if isinstance(rec, dict) else None
+            if isinstance(name, str) and name.strip():
+                filename = name
+        except Exception:
+            filename = None
+
         blocks_raw = prosemirror_doc_to_blocks(doc)
         blocks: List[Dict[str, Any]] = []
         for b in blocks_raw:
@@ -480,10 +512,14 @@ class InsightOrchestrator:
         evidence: List[Dict[str, Any]] = []
         for start, end in merged:
             lines: List[str] = []
+            pages: List[int] = []
             for b in blocks[start : end + 1]:
                 kind = str(b.get("kind") or "paragraph")
                 text = str(b.get("text") or "").strip()
                 meta = b.get("metadata") if isinstance(b.get("metadata"), dict) else {}
+                page = meta.get("page")
+                if isinstance(page, int):
+                    pages.append(page)
                 if kind == "heading":
                     level = meta.get("level", 2)
                     try:
@@ -508,12 +544,15 @@ class InsightOrchestrator:
             excerpt = "\n".join(lines).strip()
             if not excerpt:
                 continue
+            page = min(pages) if pages else None
             evidence.append(
                 {
                     "doc_id": file_id,
                     "chunk_id": f"doc_page:{start}-{end}",
                     "score": 1.0,
                     "text": excerpt,
+                    "filename": filename,
+                    "page": page,
                 }
             )
 
@@ -1007,16 +1046,16 @@ class InsightOrchestrator:
         # Default target length for a "normal" chat answer.
         target_words = 180
         m = re.search(r"(\\d+)\\s*words", q)
-        if m:
+        if m:	
             try:
                 target_words = int(m.group(1))
             except Exception:
-                target_words = 180
+                target_words = 280
         # Prefer "detailed/long" over "brief/summary" if both appear (e.g. "detailed summary").
         elif any(k in q for k in ["detailed", "long", "full"]):
-            target_words = 260
+            target_words = 350
         elif any(k in q for k in ["short", "brief", "summary"]):
-            target_words = 90
+            target_words = 100
         hint_doc = has_docs or any(k in q for k in ["document", "file", "pdf", "upload"])
         return {
             "target_words": target_words,

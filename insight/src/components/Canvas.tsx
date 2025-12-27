@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { listen } from "@tauri-apps/api/event";
 import type { ChatSummary } from "../state/useSessions";
+import { engine } from "../api/engine";
 
 export type CardLayout = {
   showChat: boolean;
@@ -30,18 +33,22 @@ type Props = {
   onFocusChat: (chatId: string) => void;
   onUpdateNote: (chatId: string, patch: Partial<CanvasNote>) => void;
   onOpenChat: (chatId: string) => void;
-  onCreateChatAt: (pos: { x: number; y: number }) => void;
+  onCreateChatAt: (pos: { x: number; y: number }) => string;
   onOpenCard: (chatId: string) => void;
+  onOpenSettings: () => void;
   onDeleteChat: (chatId: string) => void;
   confirmDeleteChatId: string | null;
   loadingSessions: boolean;
+  dockVisible?: boolean;
 };
 
 const MIN_SCALE = 0.35;
 const MAX_SCALE = 1.75;
 const PAN_ENABLE_SCALE = 1.01;
 const ZOOM_SPEED = 0.0015;
-const BOARD_MULT = 2.6;
+// Keep the board large enough that even at MIN_SCALE it still covers the viewport
+// (avoids seeing a hard "edge" or misalignment when zoomed out).
+const BOARD_MULT = 3.2;
 const BOARD_MIN_W = 2200;
 const BOARD_MIN_H = 1400;
 
@@ -80,9 +87,11 @@ export function Canvas({
   onOpenChat,
   onCreateChatAt,
   onOpenCard,
+  onOpenSettings,
   onDeleteChat,
   confirmDeleteChatId,
   loadingSessions,
+  dockVisible = true,
 }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [vp, setVp] = useState<Viewport>({ x: 0, y: 0, scale: 1 });
@@ -98,6 +107,9 @@ export function Canvas({
   });
   const [isPanning, setIsPanning] = useState(false);
   const [chatListOpen, setChatListOpen] = useState(false);
+  const [filesByChatId, setFilesByChatId] = useState<Record<string, string[]>>({});
+  const chatIdSetRef = useRef<Set<string>>(new Set());
+  const fileReloadTimersRef = useRef<Record<string, number>>({});
   const panRef = useRef<{ startX: number; startY: number; startVpX: number; startVpY: number } | null>(
     null
   );
@@ -107,6 +119,81 @@ export function Canvas({
     for (const s of sessions) map.set(s.chat_id, s);
     return map;
   }, [sessions]);
+
+  const noteById = useMemo(() => {
+    const map = new Map<string, CanvasNote>();
+    for (const n of notes) map.set(n.chatId, n);
+    return map;
+  }, [notes]);
+
+  const chatIdsKey = useMemo(() => {
+    const ids = [...new Set(notes.map((n) => n.chatId))].sort();
+    return ids.join("|");
+  }, [notes]);
+
+  useEffect(() => {
+    chatIdSetRef.current = new Set(notes.map((n) => n.chatId));
+  }, [chatIdsKey, notes]);
+
+  async function loadFileNames(chatId: string) {
+    const res = await engine<{ files?: Array<{ filename?: string }> }>(
+      `/files/chat/${encodeURIComponent(chatId)}`,
+      undefined,
+      "GET"
+    );
+    if (!res.ok) return;
+    const rows = Array.isArray((res.data as any)?.files) ? (res.data as any).files : [];
+    const names = rows
+      .map((f: any) => (typeof f?.filename === "string" ? f.filename : ""))
+      .filter((s: string) => s);
+    setFilesByChatId((prev) => ({ ...prev, [chatId]: names }));
+  }
+
+  function scheduleLoadFileNames(chatId: string) {
+    if (!chatId) return;
+    const timers = fileReloadTimersRef.current;
+    if (timers[chatId]) window.clearTimeout(timers[chatId]);
+    timers[chatId] = window.setTimeout(() => {
+      delete timers[chatId];
+      loadFileNames(chatId).catch(() => {
+        // ignore
+      });
+    }, 120);
+  }
+
+  // Load file lists for visible cards (and keep them fresh on backend events).
+  useEffect(() => {
+    const ids = [...new Set(notes.map((n) => n.chatId))];
+    for (const id of ids) {
+      if (typeof filesByChatId[id] !== "undefined") continue;
+      scheduleLoadFileNames(id);
+    }
+    // Only depends on chat membership, not positions/sizes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatIdsKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: null | (() => void) = null;
+    listen<any>("files-changed", (event) => {
+      if (cancelled) return;
+      const payload = event?.payload as any;
+      const chatId = typeof payload?.chat_id === "string" ? payload.chat_id : "";
+      if (!chatId) return;
+      if (!chatIdSetRef.current.has(chatId)) return;
+      scheduleLoadFileNames(chatId);
+    })
+      .then((fn) => {
+        if (!cancelled) unlisten = fn;
+      })
+      .catch(() => {
+        // ignore (non-Tauri build / event not supported)
+      });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   function clampScale(s: number) {
     return Math.max(MIN_SCALE, Math.min(MAX_SCALE, s));
@@ -212,7 +299,38 @@ export function Canvas({
     return next;
   }
 
-  function applyUpdateNote(chatId: string, patch: Partial<CanvasNote>) {
+  function clampNoteToViewport(note: CanvasNote): CanvasNote {
+    const viewW = viewRef.current.w;
+    const viewH = viewRef.current.h;
+    const { x: vpX, y: vpY, scale } = vpRef.current;
+    if (!viewW || !viewH || !scale) return note;
+
+    const worldLeft = -vpX / scale;
+    const worldTop = -vpY / scale;
+    const worldRight = worldLeft + viewW / scale;
+    const worldBottom = worldTop + viewH / scale;
+
+    const maxX = worldRight - note.w;
+    const maxY = worldBottom - note.h;
+
+    let nextX = note.x;
+    let nextY = note.y;
+
+    if (Number.isFinite(worldLeft) && Number.isFinite(maxX)) {
+      nextX = Math.max(worldLeft, Math.min(maxX, note.x));
+    }
+    if (Number.isFinite(worldTop) && Number.isFinite(maxY)) {
+      nextY = Math.max(worldTop, Math.min(maxY, note.y));
+    }
+
+    return nextX === note.x && nextY === note.y ? note : { ...note, x: nextX, y: nextY };
+  }
+
+  function applyUpdateNote(
+    chatId: string,
+    patch: Partial<CanvasNote>,
+    opts?: { clampToViewport?: boolean }
+  ) {
     if (!boardRef.current.w || !boardRef.current.h) {
       onUpdateNote(chatId, patch);
       return;
@@ -223,7 +341,11 @@ export function Canvas({
       return;
     }
     const merged = { ...current, ...patch };
-    const clamped = clampNoteToBoard(merged);
+    let clamped = clampNoteToBoard(merged);
+    if (opts?.clampToViewport) {
+      clamped = clampNoteToViewport(clamped);
+      clamped = clampNoteToBoard(clamped);
+    }
     const nextPatch: Partial<CanvasNote> = { ...patch };
     if (clamped.x !== merged.x) nextPatch.x = clamped.x;
     if (clamped.y !== merged.y) nextPatch.y = clamped.y;
@@ -351,8 +473,17 @@ export function Canvas({
     // Only pan when clicking background (not on notes).
     if (e.currentTarget !== e.target) return;
     if (e.button !== 0) return;
-    // Only allow click-drag panning when zoomed in.
-    if (vpRef.current.scale <= PAN_ENABLE_SCALE) return;
+    // Allow click-drag panning when either:
+    // - zoomed in, or
+    // - the board is larger than the viewport (so panning is meaningful even at 1.0x).
+    const viewW = viewRef.current.w;
+    const viewH = viewRef.current.h;
+    const bw = boardRef.current.w;
+    const bh = boardRef.current.h;
+    const boardPxW = bw * vpRef.current.scale;
+    const boardPxH = bh * vpRef.current.scale;
+    const canPan = vpRef.current.scale > PAN_ENABLE_SCALE || boardPxW > viewW + 1 || boardPxH > viewH + 1;
+    if (!canPan) return;
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     setIsPanning(true);
@@ -368,7 +499,6 @@ export function Canvas({
   function movePan(e: React.PointerEvent) {
     updateCursorFromClient(e.clientX, e.clientY);
     if (!isPanning || !panRef.current) return;
-    if (vpRef.current.scale <= PAN_ENABLE_SCALE) return;
     const dx = e.clientX - panRef.current.startX;
     const dy = e.clientY - panRef.current.startY;
     setVpSync((prev) => ({
@@ -398,7 +528,10 @@ export function Canvas({
     const my = clientY - rect.top;
     const worldX = (mx - x) / scale;
     const worldY = (my - y) / scale;
-    onCreateChatAt({ x: worldX, y: worldY });
+    const created = onCreateChatAt({ x: worldX, y: worldY });
+    // Creating a card from the canvas should not immediately open it.
+    // The user can click the card (or open from the Cards menu) when ready.
+    void created;
   }
 
   function createAtCenter() {
@@ -412,16 +545,105 @@ export function Canvas({
   const renderX = Math.round(vp.x * dpr) / dpr;
   const renderY = Math.round(vp.y * dpr) / dpr;
 
+  const dock = (
+    <div className="canvas-dock" onPointerDown={(e) => e.stopPropagation()}>
+      <div className="canvas-dock-row">
+        <button
+          className="canvas-dock-btn"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            createAtCenter();
+          }}
+          type="button"
+        >
+          + Card
+        </button>
+        <button
+          className={`canvas-dock-icon ${chatListOpen ? "active" : ""}`}
+          type="button"
+          aria-label={chatListOpen ? "Hide chats" : "Show chats"}
+          title={chatListOpen ? "Hide chats" : "Show chats"}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setChatListOpen((v) => !v);
+          }}
+        >
+          ☰
+        </button>
+        <button
+          className="canvas-dock-icon"
+          type="button"
+          aria-label="Settings"
+          title="Settings"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onOpenSettings();
+          }}
+        >
+          ⚙
+        </button>
+      </div>
+
+      {chatListOpen ? (
+        <div className="canvas-chatlist" role="menu" aria-label="Chats">
+          {loadingSessions ? <div className="canvas-chatlist-muted">Syncing…</div> : null}
+          {!loadingSessions && sessions.length === 0 ? (
+            <div className="canvas-chatlist-muted">No chats yet</div>
+          ) : null}
+          {sessions.map((s) => (
+            <div key={s.chat_id} className="canvas-chatlist-row">
+              <button
+                type="button"
+                className={`canvas-chatlist-item ${s.chat_id === activeChatId ? "active" : ""}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onFocusChat(s.chat_id);
+                  onOpenCard(s.chat_id);
+                  setChatListOpen(false);
+                }}
+                title={s.chat_id}
+              >
+                {noteById.get(s.chat_id)?.title || s.title || s.chat_id}
+              </button>
+              <button
+                type="button"
+                className={`canvas-chatlist-del ${confirmDeleteChatId === s.chat_id ? "confirm" : ""}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onDeleteChat(s.chat_id);
+                }}
+                title={
+                  confirmDeleteChatId === s.chat_id
+                    ? "Click again to confirm delete"
+                    : "Delete chat"
+                }
+                aria-label={`Delete chat ${s.chat_id}`}
+              >
+                {confirmDeleteChatId === s.chat_id ? "Del" : "×"}
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+
   return (
-    <div
-      ref={rootRef}
-      className="canvas-root"
-      onPointerDown={beginPan}
-      onPointerMove={movePan}
-      onPointerUp={endPan}
-      onPointerCancel={endPan}
-      onMouseMove={(e) => updateCursorFromClient(e.clientX, e.clientY)}
-    >
+    <>
+      <div
+        ref={rootRef}
+        className="canvas-root"
+        onPointerDown={beginPan}
+        onPointerMove={movePan}
+        onPointerUp={endPan}
+        onPointerCancel={endPan}
+        onMouseMove={(e) => updateCursorFromClient(e.clientX, e.clientY)}
+      >
       <div
         className="canvas-viewport"
         style={{
@@ -435,21 +657,22 @@ export function Canvas({
           <div
             className="canvas-board"
             style={{
-              width: board.w * vp.scale,
-              height: board.h * vp.scale,
-              borderRadius: `${18 * vp.scale}px`,
+              width: Math.round(board.w * vp.scale * dpr) / dpr,
+              height: Math.round(board.h * vp.scale * dpr) / dpr,
               backgroundSize: `${28 * vp.scale}px ${28 * vp.scale}px`,
             }}
           />
         ) : null}
-      {notes.map((n) => {
-          const title = sessionById.get(n.chatId)?.title || n.title || n.chatId;
+        {notes.map((n) => {
+          const noteTitle = typeof n.title === "string" ? n.title.trim() : "";
+          const title = noteTitle || sessionById.get(n.chatId)?.title || n.chatId;
           const isActive = n.chatId === activeChatId;
           return (
             <ChatNote
               key={n.chatId}
               chatId={n.chatId}
               title={title}
+              files={filesByChatId[n.chatId] || []}
               x={n.x}
               y={n.y}
               w={n.w}
@@ -459,7 +682,7 @@ export function Canvas({
               dpr={dpr}
               active={isActive}
               onFocus={() => onFocusChat(n.chatId)}
-              onUpdate={(patch) => applyUpdateNote(n.chatId, patch)}
+              onUpdate={(patch, opts) => applyUpdateNote(n.chatId, patch, opts)}
               onOpen={() => onOpenChat(n.chatId)}
               // Default card open shows split view (docs + chat).
               onOpenCard={() => onOpenCard(n.chatId)}
@@ -467,88 +690,18 @@ export function Canvas({
           );
         })}
       </div>
-
-      <div
-        className="canvas-dock"
-        onPointerDown={(e) => e.stopPropagation()}
-        onPointerMove={(e) => e.stopPropagation()}
-        onPointerUp={(e) => e.stopPropagation()}
-        onWheel={(e) => e.stopPropagation()}
-      >
-        <div className="canvas-dock-row">
-          <button className="canvas-dock-btn" onClick={createAtCenter} type="button">
-            + Card
-          </button>
-          <button
-            className={`canvas-dock-icon ${chatListOpen ? "active" : ""}`}
-            type="button"
-            aria-label={chatListOpen ? "Hide chats" : "Show chats"}
-            title={chatListOpen ? "Hide chats" : "Show chats"}
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              setChatListOpen((v) => !v);
-            }}
-          >
-            ☰
-          </button>
-        </div>
-
-        {chatListOpen ? (
-          <div
-            className="canvas-chatlist"
-            role="menu"
-            aria-label="Chats"
-            onPointerDown={(e) => e.stopPropagation()}
-          >
-            {loadingSessions ? <div className="canvas-chatlist-muted">Syncing…</div> : null}
-            {!loadingSessions && sessions.length === 0 ? (
-              <div className="canvas-chatlist-muted">No chats yet</div>
-            ) : null}
-            {sessions.map((s) => (
-              <div key={s.chat_id} className="canvas-chatlist-row">
-                <button
-                  type="button"
-                  className={`canvas-chatlist-item ${s.chat_id === activeChatId ? "active" : ""}`}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    onFocusChat(s.chat_id);
-                    setChatListOpen(false);
-                  }}
-                  title={s.chat_id}
-                >
-                  {s.title || s.chat_id}
-                </button>
-                <button
-                  type="button"
-                  className={`canvas-chatlist-del ${confirmDeleteChatId === s.chat_id ? "confirm" : ""}`}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    onDeleteChat(s.chat_id);
-                  }}
-                  title={
-                    confirmDeleteChatId === s.chat_id
-                      ? "Click again to confirm delete"
-                      : "Delete chat"
-                  }
-                  aria-label={`Delete chat ${s.chat_id}`}
-                >
-                  {confirmDeleteChatId === s.chat_id ? "Del" : "×"}
-                </button>
-              </div>
-            ))}
-          </div>
-        ) : null}
       </div>
-    </div>
+      {dockVisible && typeof document !== "undefined" && document.body
+        ? createPortal(dock, document.body)
+        : null}
+    </>
   );
 }
 
 function ChatNote({
   chatId,
   title,
+  files,
   x,
   y,
   w,
@@ -564,6 +717,7 @@ function ChatNote({
 }: {
   chatId: string;
   title: string;
+  files: string[];
   x: number;
   y: number;
   w: number;
@@ -575,7 +729,7 @@ function ChatNote({
   onFocus: () => void;
   onOpen: () => void;
   onOpenCard: () => void;
-  onUpdate: (patch: Partial<CanvasNote>) => void;
+  onUpdate: (patch: Partial<CanvasNote>, opts?: { clampToViewport?: boolean }) => void;
 }) {
   const dragRef = useRef<{ startX: number; startY: number; startPx: number; startPy: number } | null>(
     null
@@ -594,6 +748,34 @@ function ChatNote({
   type ResizeDir = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw";
   const minW = 200;
   const minH = 120;
+  const [isRenaming, setIsRenaming] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(title);
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (isRenaming) return;
+    setTitleDraft(title);
+  }, [title, isRenaming]);
+
+  useEffect(() => {
+    if (!isRenaming) return;
+    const t = window.setTimeout(() => {
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    }, 0);
+    return () => window.clearTimeout(t);
+  }, [isRenaming]);
+
+  function commitRename(nextTitle: string) {
+    const trimmed = (nextTitle || "").trim();
+    onUpdate({ title: trimmed ? trimmed : undefined });
+    setIsRenaming(false);
+  }
+
+  function cancelRename() {
+    setTitleDraft(title);
+    setIsRenaming(false);
+  }
 
   function bringToFront() {
     onFocus();
@@ -601,9 +783,9 @@ function ChatNote({
 
   function beginDrag(e: React.PointerEvent) {
     if (e.button !== 0) return;
-    e.preventDefault();
+    const t = e.target as HTMLElement | null;
+    if (t && (t.closest("button") || t.closest("input"))) return;
     bringToFront();
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     dragRef.current = { startX: e.clientX, startY: e.clientY, startPx: x, startPy: y };
     dragMovedRef.current = false;
   }
@@ -612,8 +794,21 @@ function ChatNote({
     if (!dragRef.current) return;
     const dx = (e.clientX - dragRef.current.startX) / scale;
     const dy = (e.clientY - dragRef.current.startY) / scale;
-    if (Math.abs(dx) + Math.abs(dy) > 2) dragMovedRef.current = true;
-    onUpdate({ x: dragRef.current.startPx + dx, y: dragRef.current.startPy + dy });
+    if (Math.abs(dx) + Math.abs(dy) > 2) {
+      if (!dragMovedRef.current) {
+        dragMovedRef.current = true;
+        try {
+          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        } catch {
+          // ignore
+        }
+      }
+      e.preventDefault();
+    }
+    onUpdate(
+      { x: dragRef.current.startPx + dx, y: dragRef.current.startPy + dy },
+      { clampToViewport: true }
+    );
   }
 
   function endDrag(e: React.PointerEvent) {
@@ -679,7 +874,7 @@ function ChatNote({
           nextY = r.startY + (r.startH - nextH);
         }
 
-        onUpdate({ x: nextX, y: nextY, w: nextW, h: nextH });
+        onUpdate({ x: nextX, y: nextY, w: nextW, h: nextH }, { clampToViewport: true });
       };
       const onUp = (ev: PointerEvent) => {
         if (ev.pointerId !== pointerId) return;
@@ -724,9 +919,43 @@ function ChatNote({
           onPointerUp={endDrag}
           onPointerCancel={endDrag}
         >
-          <div className="canvas-note-title" title={title} aria-label={chatId}>
-            {title}
-          </div>
+          {isRenaming ? (
+            <input
+              ref={renameInputRef}
+              className="canvas-note-title-input"
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  commitRename(titleDraft);
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  cancelRename();
+                }
+              }}
+              onBlur={() => commitRename(titleDraft)}
+              aria-label="Rename card"
+            />
+          ) : (
+            <div
+              className="canvas-note-title"
+              title={title}
+              aria-label={chatId}
+              onDoubleClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setTitleDraft(title);
+                setIsRenaming(true);
+              }}
+            >
+              {title}
+            </div>
+          )}
         </div>
         <div
           className="canvas-note-body"
@@ -748,8 +977,22 @@ function ChatNote({
           tabIndex={-1}
         >
           <div className="canvas-note-preview">
-            <div className="canvas-note-preview-line">Documents</div>
-            <div className="canvas-note-preview-sub">Drop files here</div>
+            {files.length ? (
+              <>
+                {files.slice(0, 3).map((name, idx) => (
+                  <div key={`${idx}-${name}`} className="canvas-note-preview-file" title={name}>
+                    {name}
+                  </div>
+                ))}
+                {files.length > 3 ? (
+                  <div className="canvas-note-preview-sub">+{files.length - 3} more</div>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <div className="canvas-note-preview-sub">No files</div>
+              </>
+            )}
           </div>
         </div>
       </div>

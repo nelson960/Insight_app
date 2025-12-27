@@ -159,6 +159,8 @@ export function ChatWindow({
   const inputElRef = useRef<HTMLTextAreaElement | null>(null);
   const INPUT_MAX_HEIGHT_PX = 120;
   const chatPopoverTimerRef = useRef<number | null>(null);
+  const unlistenStreamEndRef = useRef<UnlistenFn | null>(null);
+
 
   const effectiveSelection = selection === undefined ? localSelection : selection;
 
@@ -225,7 +227,7 @@ export function ChatWindow({
   }
 
   function cleanupListeners() {
-    for (const ref of [unlistenTokenRef, unlistenDoneRef, unlistenErrorRef]) {
+    for (const ref of [unlistenTokenRef, unlistenDoneRef, unlistenErrorRef, unlistenStreamEndRef]) {
       if (!ref.current) continue;
       try {
         ref.current();
@@ -589,6 +591,8 @@ export function ChatWindow({
       } catch {
         // ignore
       }
+      // Nudge the Documents pane to refresh its file list immediately.
+      onRequestDocsRefresh?.();
     }
 
     const userMsg: ChatMessage = {
@@ -679,7 +683,24 @@ export function ChatWindow({
           }
         }
       );
+	unlistenStreamEndRef.current = await listen<{
+	request_id?: string;
+	chat_id?: string;
+	}>(
+	"llm_stream_end",
+	(event) => {
+		const payload = event.payload || {};
+		if (payload.chat_id && payload.chat_id !== chatId) return;
+		if (payload.request_id && payload.request_id !== requestId) return;
 
+		// Fast UI response when tokens stop
+		setIsStreaming(false);
+		try {
+      unlistenStreamEndRef.current?.();
+    } catch {}
+    unlistenStreamEndRef.current = null;
+  }
+	);
       unlistenErrorRef.current = await listen<{ request_id?: string; chat_id?: string; error?: string }>(
         "llm-error",
         (event) => {

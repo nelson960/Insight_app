@@ -4,8 +4,11 @@ import { Canvas, CanvasNote } from "./components/Canvas";
 import type { CardLayout } from "./components/Canvas";
 import { CardOverlay } from "./components/CardOverlay";
 import { ChatWindow } from "./components/ChatWindow";
+import { SettingsModal, ThemeMode } from "./components/SettingsModal";
 import { useSessions } from "./state/useSessions";
 import { engine } from "./api/engine";
+import { setTheme as setAppTheme } from "@tauri-apps/api/app";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const NOTES_STORAGE_KEY = "insight.canvas.notes.v1";
 const DEFAULT_CARD_LAYOUT: CardLayout = {
@@ -89,9 +92,75 @@ function App() {
   const [notes, setNotes] = useState<CanvasNote[]>([]);
   const [overlayChatId, setOverlayChatId] = useState<string | null>(null);
   const [overlayCardId, setOverlayCardId] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [themeMode, setThemeMode] = useState<ThemeMode>("system");
   const [confirmDeleteChatId, setConfirmDeleteChatId] = useState<string | null>(
     null
   );
+
+  // Load persisted app settings (theme) from backend.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const res = await engine<{ settings?: { theme_mode?: ThemeMode } }>(
+        "/settings",
+        undefined,
+        "GET"
+      );
+      if (!res.ok || cancelled) return;
+      const mode = (res.data as any)?.settings?.theme_mode;
+      if (mode === "system" || mode === "dark" || mode === "light") {
+        setThemeMode(mode);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Apply theme to the document root (CSS can key off data-theme).
+  useEffect(() => {
+    const root = document.documentElement;
+    const apply = (mode: ThemeMode) => {
+      const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+      const effectiveTheme: "dark" | "light" =
+        mode === "system" ? (prefersDark ? "dark" : "light") : mode;
+
+      root.dataset.theme = effectiveTheme;
+
+      // Keep the native title bar in sync with the in-app theme toggle.
+      // In system mode we explicitly apply the current system theme and update on OS changes.
+      const isTauriRuntime = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
+      if (isTauriRuntime) {
+        const titleBarBg = effectiveTheme === "dark" ? "#0f172a" : "#ffffff";
+        const win = getCurrentWindow();
+        // Ensure the title bar uses our window background color (macOS).
+        void win.setTitleBarStyle("transparent").catch(() => {});
+        // On macOS, theme is app-wide; use `null` to follow system.
+        const tauriTheme = mode === "system" ? null : effectiveTheme;
+        void win.setTheme(tauriTheme).catch((e) => {
+          console.warn("[theme] window.setTheme failed", e);
+        });
+        void win.setBackgroundColor(titleBarBg).catch(() => {});
+        void setAppTheme(tauriTheme).catch((e) => {
+          console.warn("[theme] app.setTheme failed", e);
+        });
+      }
+    };
+    apply(themeMode);
+
+    if (themeMode !== "system" || !window.matchMedia) return;
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = () => apply("system");
+    try {
+      mql.addEventListener("change", handler);
+      return () => mql.removeEventListener("change", handler);
+    } catch {
+      // Safari fallback
+      mql.addListener(handler);
+      return () => mql.removeListener(handler);
+    }
+  }, [themeMode]);
 
   // Rehydrate canvas notes on startup (persistent card positions).
   useEffect(() => {
@@ -138,6 +207,7 @@ function App() {
       if (e.key === "Escape") {
         setOverlayChatId(null);
         setOverlayCardId(null);
+        setSettingsOpen(false);
       }
     }
     window.addEventListener("keydown", onKeyDown);
@@ -290,6 +360,7 @@ function App() {
         },
       ];
     });
+    return id;
   }
 
   return (
@@ -313,9 +384,17 @@ function App() {
               setOverlayCardId(chatId);
               setOverlayChatId(null);
             }}
+            onOpenSettings={() => setSettingsOpen(true)}
             onDeleteChat={deleteChat}
             confirmDeleteChatId={confirmDeleteChatId}
             loadingSessions={loading}
+            dockVisible={!overlayCardId && !overlayChatId}
+          />
+          <SettingsModal
+            open={settingsOpen}
+            onClose={() => setSettingsOpen(false)}
+            themeMode={themeMode}
+            onThemeModeChange={(mode) => setThemeMode(mode)}
           />
           {overlayCardId ? (
             <OverlayBoundary title="Card UI crashed" onClose={() => setOverlayCardId(null)}>
@@ -326,12 +405,33 @@ function App() {
                   <CardOverlay
                     key={overlayCardId}
                     title={
-                      sortedSessions.find((s) => s.chat_id === overlayCardId)?.title || overlayCardId
+                      note?.title ||
+                      sortedSessions.find((s) => s.chat_id === overlayCardId)?.title ||
+                      overlayCardId
                     }
                     chatId={overlayCardId}
                     onClose={() => setOverlayCardId(null)}
                     initialLayout={layout}
                     onLayoutChange={handleOverlayLayoutChange}
+                    sessions={sortedSessions}
+                    loadingSessions={loading}
+                    onOpenCard={(chatId) => {
+                      setActiveChat(chatId);
+                      setOverlayCardId(chatId);
+                      setOverlayChatId(null);
+                    }}
+                    onCreateCard={() => {
+                      const idx = notes.length;
+                      const col = idx % 4;
+                      const row = Math.floor(idx / 4);
+                      return createChatCardAt({
+                        x: 60 + col * 260,
+                        y: 60 + row * 170,
+                      });
+                    }}
+                    onOpenSettings={() => setSettingsOpen(true)}
+                    onDeleteChat={deleteChat}
+                    confirmDeleteChatId={confirmDeleteChatId}
                   />
                 );
               })()}
@@ -340,7 +440,6 @@ function App() {
           {overlayChatId ? (
             <div
               className="chat-overlay"
-              style={{ background: "rgba(0, 0, 0, 0.6)" }}
               role="dialog"
               aria-modal="true"
               aria-label="Chat"
@@ -350,7 +449,6 @@ function App() {
             >
               <div
                 className="chat-overlay-window"
-                style={{ background: "#0f172a" }}
                 onPointerDown={(e) => {
                   // Prevent backdrop-close from firing when clicking inside the window.
                   e.stopPropagation();
@@ -358,7 +456,9 @@ function App() {
               >
                 <div className="chat-overlay-header">
                   <div className="chat-overlay-title">
-                    {sortedSessions.find((s) => s.chat_id === overlayChatId)?.title || overlayChatId}
+                    {notes.find((n) => n.chatId === overlayChatId)?.title ||
+                      sortedSessions.find((s) => s.chat_id === overlayChatId)?.title ||
+                      overlayChatId}
                   </div>
                   <button
                     className="chat-overlay-close"
@@ -403,22 +503,13 @@ class OverlayBoundary extends React.Component<
   render() {
     if (this.state.error) {
       return (
-        <div style={{ padding: 12, color: "#e5e7eb" }}>
-          <div style={{ fontWeight: 700, marginBottom: 8 }}>{this.props.title}</div>
-          <div style={{ fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
+        <div className="overlay-error">
+          <div className="overlay-error-title">{this.props.title}</div>
+          <div className="overlay-error-msg">
             {String(this.state.error?.message || this.state.error)}
           </div>
           <button
-            style={{
-              marginTop: 12,
-              height: 30,
-              padding: "0 10px",
-              borderRadius: 10,
-              border: "1px solid rgba(75, 85, 99, 0.65)",
-              background: "rgba(17, 24, 39, 0.6)",
-              color: "#e5e7eb",
-              cursor: "pointer",
-            }}
+            className="overlay-error-btn"
             onClick={this.props.onClose}
             type="button"
           >

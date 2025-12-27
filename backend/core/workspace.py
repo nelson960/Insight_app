@@ -87,6 +87,9 @@ class Workspace:
             self.cache,
             self.db,
             self.logs,
+            self.keys,
+            self.config_dir,
+            self.base / "kv_sessions",
         ]
         for target in targets:
             if not target.exists():

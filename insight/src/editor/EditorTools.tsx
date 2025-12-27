@@ -29,6 +29,8 @@ type PanelState =
   | {
       kind: "link";
       href: string;
+      level: number;
+      index: number;
     }
   | null;
 
@@ -36,14 +38,22 @@ type MenuState = {
   x: number;
   y: number;
   stack: MenuKind[];
+  activeKeys: string[];
+  activeIndices: number[];
   panel: PanelState;
 };
 
-type RadialItem = {
+type MenuItemSelectContext = {
+  level: number;
+  index: number;
+};
+
+type MenuItem = {
   key: string;
   label: string;
   icon: string;
-  onSelect?: () => void;
+  submenu?: MenuKind;
+  onSelect?: (ctx?: MenuItemSelectContext) => void;
   disabled?: boolean;
   keepOpen?: boolean;
 };
@@ -228,134 +238,45 @@ function ensureFreshEmptyLine(editor: EditorLike): boolean {
   }
 }
 
-function degToRad(deg: number): number {
-  return (deg * Math.PI) / 180;
+const MENU_WIDTH = 210;
+const MENU_ROW_H = 32;
+const MENU_PAD = 6;
+const MENU_GAP = 6;
+const MENU_MARGIN = 10;
+
+function clamp(n: number, lo: number, hi: number): number {
+  if (!Number.isFinite(n)) return lo;
+  return Math.max(lo, Math.min(hi, n));
 }
 
-function polar(opts: { cx: number; cy: number; r: number; deg: number }) {
-  const rad = degToRad(opts.deg);
-  return {
-    x: opts.cx + Math.cos(rad) * opts.r,
-    y: opts.cy + Math.sin(rad) * opts.r,
-  };
+function clampInt(n: number, lo: number, hi: number): number {
+  return Math.trunc(clamp(n, lo, hi));
 }
 
-function annularSectorPath(opts: {
-  cx: number;
-  cy: number;
-  rInner: number;
-  rOuter: number;
-  startDeg: number;
-  endDeg: number;
-}): string {
-  const sweepDeg = Math.abs(opts.endDeg - opts.startDeg);
-  const largeArc = sweepDeg > 180 ? 1 : 0;
-  const p0 = polar({ cx: opts.cx, cy: opts.cy, r: opts.rOuter, deg: opts.startDeg });
-  const p1 = polar({ cx: opts.cx, cy: opts.cy, r: opts.rOuter, deg: opts.endDeg });
-  const p2 = polar({ cx: opts.cx, cy: opts.cy, r: opts.rInner, deg: opts.endDeg });
-  const p3 = polar({ cx: opts.cx, cy: opts.cy, r: opts.rInner, deg: opts.startDeg });
-  return [
-    `M ${p0.x.toFixed(3)} ${p0.y.toFixed(3)}`,
-    `A ${opts.rOuter} ${opts.rOuter} 0 ${largeArc} 1 ${p1.x.toFixed(3)} ${p1.y.toFixed(3)}`,
-    `L ${p2.x.toFixed(3)} ${p2.y.toFixed(3)}`,
-    `A ${opts.rInner} ${opts.rInner} 0 ${largeArc} 0 ${p3.x.toFixed(3)} ${p3.y.toFixed(3)}`,
-    "Z",
-  ].join(" ");
+function menuHeight(items: MenuItem[]): number {
+  const count = Math.max(0, items.length);
+  return MENU_PAD * 2 + count * MENU_ROW_H;
 }
 
-function RadialMenu(props: { items: RadialItem[]; onClose: () => void; onCenter: () => void }) {
-  const visible = useMemo(() => props.items.slice(0, 6), [props.items]);
-  const geom = useMemo(() => {
-    const n = Math.max(0, Math.min(6, visible.length));
-    const size = 280;
-    const cx = size / 2;
-    const cy = size / 2;
-    const rOuter = 132;
-    const rInner = 64;
-    const stepDeg = n > 0 ? 360 / n : 360;
-    const startDeg = -90 - stepDeg / 2;
-    return { n, size, cx, cy, rOuter, rInner, stepDeg, startDeg };
-  }, [visible.length]);
+function getMenuBounds(editor: EditorLike): DOMRect {
+  const viewDom = editor?.view?.dom as HTMLElement | undefined;
+  const scroller =
+    (viewDom?.closest?.(".docs-reader-body") as HTMLElement | null) ??
+    (viewDom?.closest?.(".docs-pane") as HTMLElement | null) ??
+    null;
+  if (scroller) return scroller.getBoundingClientRect();
+  if (viewDom?.getBoundingClientRect) return viewDom.getBoundingClientRect();
+  return new DOMRect(0, 0, window.innerWidth, window.innerHeight);
+}
 
-  return (
-    <div className="insight-radial">
-      <svg
-        className="insight-pie-svg"
-        viewBox={`0 0 ${geom.size} ${geom.size}`}
-        width={geom.size}
-        height={geom.size}
-        role="presentation"
-      >
-        {visible.map((item, idx) => {
-          const n = Math.max(1, geom.n);
-          const step = geom.stepDeg || 360 / n;
-          const start = geom.startDeg;
-          const startDeg = start + idx * step;
-          const endDeg = start + (idx + 1) * step;
-          const safeEnd = geom.n === 1 ? startDeg + 359.999 : endDeg;
-          const d = annularSectorPath({
-            cx: geom.cx,
-            cy: geom.cy,
-            rInner: geom.rInner,
-            rOuter: geom.rOuter,
-            startDeg,
-            endDeg: safeEnd,
-          });
-
-          const mid = (startDeg + safeEnd) / 2;
-          const centerR = (geom.rInner + geom.rOuter) / 2;
-          const p = polar({ cx: geom.cx, cy: geom.cy, r: centerR, deg: mid });
-
-        const disabled = !!item.disabled || !item.onSelect;
-        const style = {
-          ["--delay" as any]: `${idx * 14}ms`,
-        } as CSSProperties;
-        return (
-          <g
-            key={item.key}
-            className={`insight-pie-slice-group ${disabled ? "disabled" : ""}`}
-            style={style}
-            onClick={() => {
-              if (disabled) return;
-              item.onSelect?.();
-              if (!item.keepOpen) props.onClose();
-            }}
-          >
-            <path className="insight-pie-slice" d={d} />
-            <text
-              className="insight-radial-icon"
-              x={p.x}
-              y={p.y - 6}
-              textAnchor="middle"
-              dominantBaseline="middle"
-            >
-              {item.icon}
-            </text>
-            <text
-              className="insight-radial-label"
-              x={p.x}
-              y={p.y + 12}
-              textAnchor="middle"
-              dominantBaseline="middle"
-            >
-              {item.label}
-            </text>
-          </g>
-        );
-      })}
-      </svg>
-
-      <button
-        type="button"
-        className="insight-radial-center-btn"
-        onClick={props.onCenter}
-        aria-label="Back"
-        title="Back"
-      >
-        ↩
-      </button>
-    </div>
-  );
+function selectedText(editor: EditorLike): string {
+  try {
+    const sel = editor?.state?.selection;
+    if (!sel || sel.empty) return "";
+    return editor.state.doc.textBetween(sel.from, sel.to, "\n\n", "\n\n");
+  } catch {
+    return "";
+  }
 }
 
 function LinkPanel(props: {
@@ -436,259 +357,300 @@ export function useEditorRadialTools(opts: { editor: EditorLike | null; enabled:
         x: Number(e.clientX) || 0,
         y: Number(e.clientY) || 0,
         stack: [kind],
+        activeKeys: [],
+        activeIndices: [],
         panel: null,
       });
     },
     [editor, enabled]
   );
 
-  const currentKind = menu?.stack[menu.stack.length - 1] ?? null;
+  const getItems = useCallback(
+    (kind: MenuKind): MenuItem[] => {
+      if (!editor) return [];
+      const ch = editor.chain().focus();
 
-  const items = useMemo<RadialItem[]>(() => {
-    if (!editor || !currentKind) return [];
-    const ch = editor.chain().focus();
-    if (currentKind === "format") {
-      const currentHref = String(editor.getAttributes("link")?.href || "");
-      return [
-        { key: "bold", label: "Bold", icon: "B", onSelect: () => ch.toggleBold().run() },
-        { key: "italic", label: "Italic", icon: "I", onSelect: () => ch.toggleItalic().run() },
-        { key: "underline", label: "Underline", icon: "U", onSelect: () => ch.toggleUnderline?.().run?.() },
-        { key: "highlight", label: "Highlight", icon: "▧", onSelect: () => ch.toggleHighlight?.().run?.() },
-        {
-          key: "link",
-          label: "Link",
-          icon: "🔗",
-          keepOpen: true,
-          onSelect: () => {
-            setMenu((prev) => {
-              if (!prev) return prev;
-              return { ...prev, panel: { kind: "link", href: currentHref } };
-            });
+      if (kind === "format") {
+        const currentHref = String(editor.getAttributes("link")?.href || "");
+        return [
+          { key: "bold", label: "Bold", icon: "B", onSelect: () => ch.toggleBold().run() },
+          { key: "italic", label: "Italic", icon: "I", onSelect: () => ch.toggleItalic().run() },
+          { key: "underline", label: "Underline", icon: "U", onSelect: () => ch.toggleUnderline?.().run?.() },
+          { key: "highlight", label: "Highlight", icon: "▧", onSelect: () => ch.toggleHighlight?.().run?.() },
+          {
+            key: "link",
+            label: "Link…",
+            icon: "🔗",
+            keepOpen: true,
+            onSelect: (ctx) => {
+              setMenu((prev) => {
+                if (!prev) return prev;
+                return {
+                  ...prev,
+                  panel: {
+                    kind: "link",
+                    href: currentHref,
+                    level: ctx?.level ?? 0,
+                    index: ctx?.index ?? 0,
+                  },
+                };
+              });
+            },
           },
-        },
-        {
-          key: "more",
-          label: "More",
-          icon: "⋯",
-          keepOpen: true,
-          onSelect: () =>
-            setMenu((prev) => (prev ? { ...prev, stack: [...prev.stack, "format_more"] } : prev)),
-        },
-      ];
-    }
+          { key: "more", label: "More", icon: "⋯", submenu: "format_more", keepOpen: true },
+        ];
+      }
 
-    if (currentKind === "format_more") {
-      return [
-        { key: "strike", label: "Strike", icon: "S", onSelect: () => ch.toggleStrike().run() },
-        { key: "code", label: "Inline code", icon: "<>", onSelect: () => ch.toggleCode().run() },
-        {
-          key: "block",
-          label: "Block",
-          icon: "¶",
-          keepOpen: true,
-          onSelect: () => setMenu((prev) => (prev ? { ...prev, stack: [...prev.stack, "convert"] } : prev)),
-        },
-        { key: "clear", label: "Clear", icon: "×", onSelect: () => ch.unsetAllMarks().run() },
-      ];
-    }
+      if (kind === "format_more") {
+        const canCopy = selectedText(editor).trim().length > 0;
+        return [
+          { key: "strike", label: "Strikethrough", icon: "S", onSelect: () => ch.toggleStrike().run() },
+          { key: "code", label: "Inline code", icon: "<>", onSelect: () => ch.toggleCode().run() },
+          { key: "clear", label: "Clear formatting", icon: "×", onSelect: () => ch.unsetAllMarks().run() },
+          { key: "convert", label: "Convert block", icon: "¶", submenu: "convert", keepOpen: true },
+          {
+            key: "copy",
+            label: "Copy",
+            icon: "⧉",
+            disabled: !canCopy,
+            onSelect: () => void copyToClipboard(selectedText(editor)),
+          },
+        ];
+      }
 
-    if (currentKind === "convert") {
-      return [
-        { key: "p", label: "Paragraph", icon: "¶", onSelect: () => ch.setParagraph().run() },
-        {
-          key: "heading",
-          label: "Heading",
-          icon: "H",
-          keepOpen: true,
-          onSelect: () =>
-            setMenu((prev) => (prev ? { ...prev, stack: [...prev.stack, "convert_heading"] } : prev)),
-        },
-        {
-          key: "list",
-          label: "List",
-          icon: "≡",
-          keepOpen: true,
-          onSelect: () =>
-            setMenu((prev) => (prev ? { ...prev, stack: [...prev.stack, "convert_list"] } : prev)),
-        },
-        { key: "code", label: "Code block", icon: "</>", onSelect: () => ch.toggleCodeBlock().run() },
-        { key: "quote", label: "Quote", icon: "❝", onSelect: () => ch.toggleBlockquote().run() },
-      ];
-    }
+      if (kind === "convert") {
+        return [
+          { key: "p", label: "Paragraph", icon: "¶", onSelect: () => ch.setParagraph().run() },
+          { key: "heading", label: "Heading", icon: "H", submenu: "convert_heading", keepOpen: true },
+          { key: "list", label: "List", icon: "≡", submenu: "convert_list", keepOpen: true },
+          { key: "quote", label: "Quote", icon: "❝", onSelect: () => ch.toggleBlockquote().run() },
+          { key: "code", label: "Code block", icon: "</>", onSelect: () => ch.toggleCodeBlock().run() },
+        ];
+      }
 
-    if (currentKind === "convert_heading") {
-      return [
-        { key: "h1", label: "H1", icon: "H1", onSelect: () => ch.toggleHeading({ level: 1 }).run() },
-        { key: "h2", label: "H2", icon: "H2", onSelect: () => ch.toggleHeading({ level: 2 }).run() },
-        { key: "h3", label: "H3", icon: "H3", onSelect: () => ch.toggleHeading({ level: 3 }).run() },
-        { key: "h4", label: "H4", icon: "H4", onSelect: () => ch.toggleHeading({ level: 4 }).run() },
-      ];
-    }
+      if (kind === "convert_heading") {
+        return [
+          { key: "h1", label: "H1", icon: "H1", onSelect: () => ch.toggleHeading({ level: 1 }).run() },
+          { key: "h2", label: "H2", icon: "H2", onSelect: () => ch.toggleHeading({ level: 2 }).run() },
+          { key: "h3", label: "H3", icon: "H3", onSelect: () => ch.toggleHeading({ level: 3 }).run() },
+          { key: "h4", label: "H4", icon: "H4", onSelect: () => ch.toggleHeading({ level: 4 }).run() },
+        ];
+      }
 
-    if (currentKind === "convert_list") {
-      return [
-        { key: "bullets", label: "Bullets", icon: "•", onSelect: () => ch.toggleBulletList().run() },
-        { key: "numbered", label: "Numbered", icon: "1.", onSelect: () => ch.toggleOrderedList().run() },
-        { key: "task", label: "Task", icon: "☐", onSelect: () => ch.toggleTaskList?.().run?.() },
-      ];
-    }
+      if (kind === "convert_list") {
+        return [
+          { key: "bullets", label: "Bullets", icon: "•", onSelect: () => ch.toggleBulletList().run() },
+          { key: "numbered", label: "Numbered", icon: "1.", onSelect: () => ch.toggleOrderedList().run() },
+          { key: "task", label: "Task", icon: "☐", onSelect: () => ch.toggleTaskList?.().run?.() },
+        ];
+      }
 
-    if (currentKind === "insert") {
-      return [
-        {
-          key: "text",
-          label: "Text",
-          icon: "T",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().setParagraph().run();
+      if (kind === "insert") {
+        return [
+          {
+            key: "text",
+            label: "Text",
+            icon: "T",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().setParagraph().run();
+            },
           },
-        },
-        {
-          key: "heading",
-          label: "Heading",
-          icon: "H",
-          keepOpen: true,
-          onSelect: () => setMenu((prev) => (prev ? { ...prev, stack: [...prev.stack, "heading"] } : prev)),
-        },
-        {
-          key: "list",
-          label: "List",
-          icon: "≡",
-          keepOpen: true,
-          onSelect: () => setMenu((prev) => (prev ? { ...prev, stack: [...prev.stack, "list"] } : prev)),
-        },
-        {
-          key: "table",
-          label: "Table",
-          icon: "▦",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().insertTable?.({ rows: 3, cols: 3, withHeaderRow: true })?.run?.();
+          { key: "heading", label: "Heading", icon: "H", submenu: "heading", keepOpen: true },
+          { key: "list", label: "List", icon: "≡", submenu: "list", keepOpen: true },
+          {
+            key: "table",
+            label: "Table",
+            icon: "▦",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().insertTable?.({ rows: 3, cols: 3, withHeaderRow: true })?.run?.();
+            },
           },
-        },
-        {
-          key: "code",
-          label: "Code",
-          icon: "</>",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().toggleCodeBlock().run();
+          {
+            key: "code",
+            label: "Code block",
+            icon: "</>",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().toggleCodeBlock().run();
+            },
           },
-        },
-        {
-          key: "quote",
-          label: "Quote",
-          icon: "❝",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().toggleBlockquote().run();
+          {
+            key: "quote",
+            label: "Quote",
+            icon: "❝",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().toggleBlockquote().run();
+            },
           },
-        },
-      ];
-    }
+        ];
+      }
 
-    if (currentKind === "heading") {
-      return [
-        {
-          key: "h1",
-          label: "H1",
-          icon: "H1",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().toggleHeading({ level: 1 }).run();
+      if (kind === "heading") {
+        return [
+          {
+            key: "h1",
+            label: "H1",
+            icon: "H1",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().toggleHeading({ level: 1 }).run();
+            },
           },
-        },
-        {
-          key: "h2",
-          label: "H2",
-          icon: "H2",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().toggleHeading({ level: 2 }).run();
+          {
+            key: "h2",
+            label: "H2",
+            icon: "H2",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().toggleHeading({ level: 2 }).run();
+            },
           },
-        },
-        {
-          key: "h3",
-          label: "H3",
-          icon: "H3",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().toggleHeading({ level: 3 }).run();
+          {
+            key: "h3",
+            label: "H3",
+            icon: "H3",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().toggleHeading({ level: 3 }).run();
+            },
           },
-        },
-        {
-          key: "h4",
-          label: "H4",
-          icon: "H4",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().toggleHeading({ level: 4 }).run();
+          {
+            key: "h4",
+            label: "H4",
+            icon: "H4",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().toggleHeading({ level: 4 }).run();
+            },
           },
-        },
-      ];
-    }
+        ];
+      }
 
-    if (currentKind === "list") {
-      return [
-        {
-          key: "bullets",
-          label: "Bullets",
-          icon: "•",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().toggleBulletList().run();
+      if (kind === "list") {
+        return [
+          {
+            key: "bullets",
+            label: "Bullets",
+            icon: "•",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().toggleBulletList().run();
+            },
           },
-        },
-        {
-          key: "numbered",
-          label: "Numbered",
-          icon: "1.",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().toggleOrderedList().run();
+          {
+            key: "numbered",
+            label: "Numbered",
+            icon: "1.",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().toggleOrderedList().run();
+            },
           },
-        },
-        {
-          key: "task",
-          label: "Task",
-          icon: "☐",
-          onSelect: () => {
-            ensureFreshEmptyLine(editor);
-            editor.chain().focus().toggleTaskList?.().run?.();
+          {
+            key: "task",
+            label: "Task",
+            icon: "☐",
+            onSelect: () => {
+              ensureFreshEmptyLine(editor);
+              editor.chain().focus().toggleTaskList?.().run?.();
+            },
           },
-        },
-      ];
-    }
+        ];
+      }
 
-    if (currentKind === "table_ops") {
-      return [
-        { key: "row_add", label: "Add row", icon: "+R", onSelect: () => ch.addRowAfter?.().run?.() },
-        { key: "row_del", label: "Remove row", icon: "−R", onSelect: () => ch.deleteRow?.().run?.() },
-        { key: "col_add", label: "Add column", icon: "+C", onSelect: () => ch.addColumnAfter?.().run?.() },
-        { key: "col_del", label: "Remove column", icon: "−C", onSelect: () => ch.deleteColumn?.().run?.() },
-        { key: "hdr", label: "Header row", icon: "H", onSelect: () => ch.toggleHeaderRow?.().run?.() },
-        { key: "tbl_del", label: "Delete table", icon: "🗑", onSelect: () => ch.deleteTable?.().run?.() },
-      ];
-    }
+      if (kind === "table_ops") {
+        return [
+          { key: "row_add", label: "Add row", icon: "+R", onSelect: () => ch.addRowAfter?.().run?.() },
+          { key: "row_del", label: "Remove row", icon: "−R", onSelect: () => ch.deleteRow?.().run?.() },
+          { key: "col_add", label: "Add column", icon: "+C", onSelect: () => ch.addColumnAfter?.().run?.() },
+          { key: "col_del", label: "Remove column", icon: "−C", onSelect: () => ch.deleteColumn?.().run?.() },
+          { key: "hdr", label: "Header row", icon: "H", onSelect: () => ch.toggleHeaderRow?.().run?.() },
+          { key: "tbl_del", label: "Delete table", icon: "🗑", onSelect: () => ch.deleteTable?.().run?.() },
+        ];
+      }
 
-    if (currentKind === "code_ops") {
-      const text = getCodeBlockText(editor);
-      return [
-        { key: "copy", label: "Copy", icon: "⧉", onSelect: () => void copyToClipboard(text) },
-        { key: "to_p", label: "To text", icon: "T", onSelect: () => ch.toggleCodeBlock().run() },
-        { key: "del", label: "Delete", icon: "🗑", onSelect: () => deleteCurrentCodeBlock(editor) },
-      ];
-    }
+      if (kind === "code_ops") {
+        const text = getCodeBlockText(editor);
+        return [
+          { key: "copy", label: "Copy code", icon: "⧉", onSelect: () => void copyToClipboard(text) },
+          { key: "to_p", label: "Convert to text", icon: "T", onSelect: () => ch.toggleCodeBlock().run() },
+          { key: "del", label: "Delete block", icon: "🗑", onSelect: () => deleteCurrentCodeBlock(editor) },
+        ];
+      }
 
-    return [];
-  }, [editor, currentKind]);
+      return [];
+    },
+    [editor]
+  );
 
   const overlay = useMemo(() => {
     if (!menu || !editor || !enabled) return null;
+    const bounds = getMenuBounds(editor);
+
+    const columns = (() => {
+      const stack = Array.isArray(menu.stack) ? menu.stack : [];
+      const out: Array<{ kind: MenuKind; x: number; y: number; items: MenuItem[] }> = [];
+      if (!stack.length) return out;
+
+      const rootItems = getItems(stack[0]);
+      const rootH = menuHeight(rootItems);
+      const maxRootX = bounds.right - MENU_MARGIN - MENU_WIDTH;
+      const maxRootY = bounds.bottom - MENU_MARGIN - rootH;
+      let x = clamp(menu.x, bounds.left + MENU_MARGIN, maxRootX);
+      let y = clamp(menu.y, bounds.top + MENU_MARGIN, maxRootY);
+      out.push({ kind: stack[0], x, y, items: rootItems });
+
+      for (let level = 1; level < stack.length; level += 1) {
+        const prev = out[level - 1];
+        const prevItems = prev.items;
+        const idxRaw = menu.activeIndices[level - 1] ?? 0;
+        const idx = clampInt(idxRaw, 0, Math.max(0, prevItems.length - 1));
+        const items = getItems(stack[level]);
+        const h = menuHeight(items);
+
+        const rightX = prev.x + MENU_WIDTH + MENU_GAP;
+        const leftX = prev.x - MENU_WIDTH - MENU_GAP;
+        const canRight = rightX + MENU_WIDTH <= bounds.right - MENU_MARGIN;
+        const canLeft = leftX >= bounds.left + MENU_MARGIN;
+        let colX = canRight ? rightX : canLeft ? leftX : rightX;
+        colX = clamp(colX, bounds.left + MENU_MARGIN, bounds.right - MENU_MARGIN - MENU_WIDTH);
+
+        let colY = prev.y + idx * MENU_ROW_H;
+        colY = clamp(colY, bounds.top + MENU_MARGIN, bounds.bottom - MENU_MARGIN - h);
+
+        out.push({ kind: stack[level], x: colX, y: colY, items });
+      }
+
+      return out;
+    })();
+
+    const linkPanelPos = (() => {
+      if (menu.panel?.kind !== "link") return null;
+      const level = clampInt(menu.panel.level, 0, Math.max(0, columns.length - 1));
+      const col = columns[level];
+      if (!col) return null;
+
+      const panelW = 260;
+      const panelH = 140;
+      const rightX = col.x + MENU_WIDTH + MENU_GAP;
+      const leftX = col.x - panelW - MENU_GAP;
+      const canRight = rightX + panelW <= bounds.right - MENU_MARGIN;
+      const canLeft = leftX >= bounds.left + MENU_MARGIN;
+      let x = canRight ? rightX : canLeft ? leftX : rightX;
+      x = clamp(x, bounds.left + MENU_MARGIN, bounds.right - MENU_MARGIN - panelW);
+
+      const idx = clampInt(menu.panel.index, 0, Math.max(0, col.items.length - 1));
+      let y = col.y + idx * MENU_ROW_H;
+      y = clamp(y, bounds.top + MENU_MARGIN, bounds.bottom - MENU_MARGIN - panelH);
+      return { x, y, w: panelW };
+    })();
+
     return (
       <div
-        className="insight-radial-overlay"
+        className="insight-menu-overlay"
         role="presentation"
         onPointerDown={() => setMenu(null)}
         onContextMenu={(e) => {
@@ -711,34 +673,105 @@ export function useEditorRadialTools(opts: { editor: EditorLike | null; enabled:
               // ignore
             }
           }
-          setMenu({ x: e.clientX, y: e.clientY, stack: [kind], panel: null });
+          setMenu({
+            x: e.clientX,
+            y: e.clientY,
+            stack: [kind],
+            activeKeys: [],
+            activeIndices: [],
+            panel: null,
+          });
         }}
       >
-        <div
-          className="insight-radial-anchor"
-          style={{ left: menu.x, top: menu.y }}
-          onPointerDown={(e) => e.stopPropagation()}
-        >
-          <RadialMenu
-            items={items}
-            onClose={() => setMenu(null)}
-            onCenter={() => {
-              setMenu((prev) => {
-                if (!prev) return prev;
-                if (prev.panel) return { ...prev, panel: null };
-                if (prev.stack.length > 1) return { ...prev, stack: prev.stack.slice(0, -1) };
-                return null;
-              });
-            }}
-          />
-          {menu.panel?.kind === "link" ? (
-            <div className="insight-tools-panel-anchor" onPointerDown={(e) => e.stopPropagation()}>
+        {columns.map((col, level) => (
+          <div
+            key={`${col.kind}-${level}`}
+            className="insight-menu-col"
+            style={{ left: col.x, top: col.y } as CSSProperties}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            {col.items.map((item, index) => {
+              const isDisabled = !!item.disabled || (!item.onSelect && !item.submenu);
+              const isActive = (menu.activeKeys[level] ?? "") === item.key;
+              const keepOpen = item.keepOpen ?? !!item.submenu;
+
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  className={`insight-menu-row${isActive ? " active" : ""}${isDisabled ? " disabled" : ""}`}
+                  onMouseEnter={() => {
+                    setMenu((prev) => {
+                      if (!prev) return prev;
+                      const next: MenuState = { ...prev };
+                      next.activeKeys = [...(prev.activeKeys ?? [])];
+                      next.activeIndices = [...(prev.activeIndices ?? [])];
+                      next.activeKeys[level] = item.key;
+                      next.activeIndices[level] = index;
+
+                      // Hover never opens submenus (click-only). It can, however, close deeper stacks so
+                      // the visible submenu doesn't mismatch the highlighted parent row.
+                      if (prev.stack.length > level + 1) {
+                        next.stack = prev.stack.slice(0, level + 1);
+                        next.activeKeys = next.activeKeys.slice(0, level + 1);
+                        next.activeIndices = next.activeIndices.slice(0, level + 1);
+                        if (next.panel && next.panel.level >= next.stack.length) next.panel = null;
+                      }
+                      return next;
+                    });
+                  }}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (isDisabled) return;
+
+                    if (item.submenu) {
+                      setMenu((prev) => {
+                        if (!prev) return prev;
+                        return {
+                          ...prev,
+                          stack: [...prev.stack.slice(0, level + 1), item.submenu!],
+                          activeKeys: [...prev.activeKeys.slice(0, level), item.key],
+                          activeIndices: [...prev.activeIndices.slice(0, level), index],
+                          panel: null,
+                        };
+                      });
+                      return;
+                    }
+
+                    item.onSelect?.({ level, index });
+                    if (!keepOpen) setMenu(null);
+                  }}
+                  disabled={isDisabled}
+                >
+                  <span className="insight-menu-icon" aria-hidden="true">
+                    {item.icon}
+                  </span>
+                  <span className="insight-menu-label">{item.label}</span>
+                  {item.submenu ? (
+                    <span className="insight-menu-arrow" aria-hidden="true">
+                      ›
+                    </span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        ))}
+
+        {menu.panel?.kind === "link" && linkPanelPos ? (
+          <div
+            className="insight-tools-panel-anchor"
+            style={{ left: linkPanelPos.x, top: linkPanelPos.y, transform: "none" } as CSSProperties}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <div style={{ width: linkPanelPos.w } as CSSProperties}>
               <LinkPanel
                 href={menu.panel.href}
                 onChangeHref={(v) => {
                   setMenu((prev) => {
                     if (!prev || prev.panel?.kind !== "link") return prev;
-                    return { ...prev, panel: { kind: "link", href: v } };
+                    return { ...prev, panel: { ...prev.panel, href: v } };
                   });
                 }}
                 onApply={() => {
@@ -754,11 +787,11 @@ export function useEditorRadialTools(opts: { editor: EditorLike | null; enabled:
                 }}
               />
             </div>
-          ) : null}
-        </div>
+          </div>
+        ) : null}
       </div>
     );
-  }, [menu, editor, enabled, items]);
+  }, [menu, editor, enabled, getItems]);
 
   return { onContextMenu, overlay };
 }

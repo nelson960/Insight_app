@@ -1,8 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatWindow } from "./ChatWindow";
 import { DocumentsPane } from "./DocumentsPane";
 import { SplitView } from "./SplitView";
 import type { CardLayout } from "./Canvas";
+import type { ChatSummary } from "../state/useSessions";
 
 type Props = {
   title: string;
@@ -10,6 +11,13 @@ type Props = {
   onClose: () => void;
   initialLayout?: CardLayout;
   onLayoutChange?: (next: CardLayout) => void;
+  sessions: ChatSummary[];
+  loadingSessions: boolean;
+  onOpenCard: (chatId: string) => void;
+  onCreateCard: () => string;
+  onOpenSettings: () => void;
+  onDeleteChat: (chatId: string) => void;
+  confirmDeleteChatId: string | null;
 };
 
 const DEFAULT_LAYOUT: CardLayout = {
@@ -19,8 +27,20 @@ const DEFAULT_LAYOUT: CardLayout = {
   splitRatio: 0.5,
 };
 
-export function CardOverlay({ title, chatId, onClose, initialLayout, onLayoutChange }: Props) {
-  const [isFullscreen, setIsFullscreen] = useState(false);
+export function CardOverlay({
+  title,
+  chatId,
+  onClose,
+  initialLayout,
+  onLayoutChange,
+  sessions,
+  loadingSessions,
+  onOpenCard,
+  onCreateCard,
+  onOpenSettings,
+  onDeleteChat,
+  confirmDeleteChatId,
+}: Props) {
   const [showChat, setShowChat] = useState(initialLayout?.showChat ?? DEFAULT_LAYOUT.showChat);
   const [showDocs, setShowDocs] = useState(initialLayout?.showDocs ?? DEFAULT_LAYOUT.showDocs);
   const [chatOnRight, setChatOnRight] = useState(
@@ -32,6 +52,9 @@ export function CardOverlay({ title, chatId, onClose, initialLayout, onLayoutCha
   const [activeFileId, setActiveFileId] = useState<string | null>(initialLayout?.activeFileId ?? null);
   const [docsRefreshSeq, setDocsRefreshSeq] = useState(0);
   const [selection, setSelection] = useState<{ text: string; file_id?: string } | null>(null);
+  const [cardsOpen, setCardsOpen] = useState(false);
+  const cardsWrapRef = useRef<HTMLDivElement | null>(null);
+  const cardsMenuRef = useRef<HTMLDivElement | null>(null);
 
   const isSplit = showChat && showDocs;
 
@@ -65,6 +88,19 @@ export function CardOverlay({ title, chatId, onClose, initialLayout, onLayoutCha
     setSelection(null);
     setDocsRefreshSeq((v) => v + 1);
   }, [chatId, initialLayout?.activeFileId]);
+
+  useEffect(() => {
+    if (!cardsOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const t = e.target as Node | null;
+      if (!t) return;
+      if (cardsMenuRef.current && cardsMenuRef.current.contains(t)) return;
+      if (cardsWrapRef.current && cardsWrapRef.current.contains(t)) return;
+      setCardsOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown, { capture: true });
+    return () => window.removeEventListener("pointerdown", onPointerDown, { capture: true } as any);
+  }, [cardsOpen]);
 
   const docsPane = useMemo(
     () => (
@@ -142,8 +178,7 @@ export function CardOverlay({ title, chatId, onClose, initialLayout, onLayoutCha
 
   return (
     <div
-      className={`chat-overlay card-overlay ${isFullscreen ? "card-overlay-fullscreen" : ""}`}
-      style={{ background: "rgba(0, 0, 0, 0.55)" }}
+      className="chat-overlay card-overlay card-overlay-fullscreen"
       role="dialog"
       aria-modal="true"
       aria-label="Card"
@@ -152,26 +187,101 @@ export function CardOverlay({ title, chatId, onClose, initialLayout, onLayoutCha
       }}
     >
       <div
-        className={`chat-overlay-window ${isFullscreen ? "card-overlay-window-fullscreen" : ""}`}
-        style={{ background: "#0f172a" }}
+        className="chat-overlay-window"
         onPointerDown={(e) => e.stopPropagation()}
       >
-        <div
-          className="chat-overlay-header"
-          onDoubleClick={() => setIsFullscreen((v) => !v)}
-          title="Double-click to toggle full screen"
-        >
-          <div className="chat-overlay-title">{title}</div>
-          <div className="card-overlay-actions">
+        <div className="chat-overlay-header card-overlay-header">
+          <div className="card-overlay-header-left" ref={cardsWrapRef}>
             <button
-              className="card-overlay-full-btn"
-              onClick={() => setIsFullscreen((v) => !v)}
-              aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
-              title={isFullscreen ? "Exit full screen" : "Full screen"}
+              className={`card-overlay-cards-btn ${cardsOpen ? "active" : ""}`}
               type="button"
+              aria-label={cardsOpen ? "Close cards" : "Open cards"}
+              title={cardsOpen ? "Close cards" : "Cards"}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setCardsOpen((v) => !v);
+              }}
             >
-              {isFullscreen ? "⤡" : "⤢"}
+              ▦
             </button>
+            {cardsOpen ? (
+              <div className="card-overlay-cards-menu" ref={cardsMenuRef}>
+                <div className="card-overlay-cards-menu-row">
+                  <button
+                    className="canvas-dock-btn"
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      const created = onCreateCard();
+                      setCardsOpen(false);
+                      if (created) onOpenCard(created);
+                    }}
+                  >
+                    + Card
+                  </button>
+                  <button
+                    className="canvas-dock-icon"
+                    type="button"
+                    aria-label="Settings"
+                    title="Settings"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setCardsOpen(false);
+                      onOpenSettings();
+                    }}
+                  >
+                    ⚙
+                  </button>
+                </div>
+                <div className="canvas-chatlist" role="menu" aria-label="Cards">
+                  {loadingSessions ? <div className="canvas-chatlist-muted">Syncing…</div> : null}
+                  {!loadingSessions && sessions.length === 0 ? (
+                    <div className="canvas-chatlist-muted">No cards yet</div>
+                  ) : null}
+                  {sessions.map((s) => (
+                    <div key={s.chat_id} className="canvas-chatlist-row">
+                      <button
+                        type="button"
+                        className={`canvas-chatlist-item ${s.chat_id === chatId ? "active" : ""}`}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setCardsOpen(false);
+                          onOpenCard(s.chat_id);
+                        }}
+                        title={s.chat_id}
+                      >
+                        {s.title || s.chat_id}
+                      </button>
+                      <button
+                        type="button"
+                        className={`canvas-chatlist-del ${confirmDeleteChatId === s.chat_id ? "confirm" : ""}`}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onDeleteChat(s.chat_id);
+                        }}
+                        title={
+                          confirmDeleteChatId === s.chat_id
+                            ? "Click again to confirm delete"
+                            : "Delete card"
+                        }
+                        aria-label={`Delete card ${s.chat_id}`}
+                      >
+                        {confirmDeleteChatId === s.chat_id ? "Del" : "×"}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+          <div className="chat-overlay-title card-overlay-title">{title}</div>
+          <div className="card-overlay-header-right">
+            <div className="card-overlay-actions">
             <button
               className={`card-overlay-chat-btn ${showChat ? "active" : ""}`}
               onClick={toggleChatPane}
@@ -204,6 +314,7 @@ export function CardOverlay({ title, chatId, onClose, initialLayout, onLayoutCha
             <button className="chat-overlay-close" onClick={onClose}>
               ×
             </button>
+            </div>
           </div>
         </div>
         <div className="card-overlay-body">

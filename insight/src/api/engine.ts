@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 
 export interface EngineResponse<T = any> {
   ok: boolean;
@@ -23,13 +23,11 @@ const finishWaiters = new Map<
   { resolve: () => void; reject: (err: Error) => void; timer?: number }
 >();
 let streamBridgeInit: Promise<void> | null = null;
-let unlistenDone: UnlistenFn | null = null;
-let unlistenError: UnlistenFn | null = null;
 
 async function ensureStreamBridge() {
   if (streamBridgeInit) return streamBridgeInit;
   streamBridgeInit = (async () => {
-    unlistenDone = await listen<StreamDonePayload>("llm-done", (event) => {
+    await listen<StreamDonePayload>("llm-done", (event) => {
       const rid = event.payload?.request_id;
       if (!rid) return;
       if (activeStream?.requestId === rid) activeStream = null;
@@ -42,7 +40,7 @@ async function ensureStreamBridge() {
       }
     });
 
-    unlistenError = await listen<StreamErrorPayload>("llm-error", (event) => {
+    await listen<StreamErrorPayload>("llm-error", (event) => {
       const rid = event.payload?.request_id;
       if (!rid) return;
       // Important: don't clear `activeStream` on llm-error. Rust emits llm-error as soon

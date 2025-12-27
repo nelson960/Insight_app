@@ -8,7 +8,7 @@ from uuid import uuid4
 from typing import Dict, Set
 
 from backend.services.ingestion import IngestionPipeline
-from backend.services.ingestion.models import IngestionRequest
+from backend.services.ingestion.models import FileIngestionStatus, IngestionRequest
 from backend.services.ingestion.pipeline import IngestionCancelled
 from backend.services.storage.sqlite_store import SQLiteMetadataStore
 
@@ -21,6 +21,7 @@ class IngestionScheduler:
     def __init__(self, pipeline: IngestionPipeline, metadata_store: SQLiteMetadataStore) -> None:
         self._pipeline = pipeline
         self._metadata_store = metadata_store
+        self._reconcile_stale_jobs()
         self._queue: Queue[tuple[str, IngestionRequest]] = Queue()
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -29,6 +30,38 @@ class IngestionScheduler:
         self._running_cancel: Dict[str, threading.Event] = {}
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
+
+    def _reconcile_stale_jobs(self) -> None:
+        """
+        Best-effort cleanup for queued/running jobs from a previous app instance.
+
+        The current desktop architecture runs ingestion in-process; if the app is
+        restarted mid-ingestion, the worker thread is gone but the job row remains
+        stuck in `queued`/`running`, causing `/settings/busy` to show "ingestion"
+        forever and blocking reset/clean operations.
+        """
+        try:
+            stale = self._metadata_store.list_jobs_with_status(("queued", "running"), limit=1000)
+        except Exception as exc:
+            logger.debug("Unable to list active jobs for reconciliation: %s", exc)
+            return
+        if not stale:
+            return
+        for job in stale:
+            job_id = str(job.get("id") or "")
+            file_id = str(job.get("file_id") or "")
+            if not job_id:
+                continue
+            try:
+                self._metadata_store.update_job_status(job_id, "failed", error="stale job from previous run")
+            except Exception:
+                pass
+            if file_id:
+                try:
+                    self._metadata_store.mark_file_status(file_id, FileIngestionStatus.FAILED)
+                except Exception:
+                    pass
+        logger.warning("Marked %d stale ingestion jobs as failed", len(stale))
 
     def schedule(self, request: IngestionRequest, job_id: str | None = None) -> str:
         job_id = job_id or f"job_{uuid4().hex}"

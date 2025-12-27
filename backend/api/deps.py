@@ -104,16 +104,31 @@ class AppDependencies:
     @classmethod
     def session_manager(cls) -> LlamaSessionManager:
         if cls._session_manager is None:
-            # Hardcoded local model path; ensure the file exists.
-            model_path = Path(__file__).resolve().parents[2] / "models" / "Llama-3.1-8B-Instruct-q4_k_m.gguf"
-            if not model_path.exists():
-                raise FileNotFoundError(f"Model not found at {model_path}")
-            persist_dir = Path(get_workspace().base) / "kv_sessions"
             sqlite_store, _ = cls.storage()
+
+            # Default local model path; can be overridden via app settings.
+            default_model_path = Path(__file__).resolve().parents[2] / "models" / "Llama-3.1-8B-Instruct-q4_k_m.gguf"
+            model_path_raw = sqlite_store.get_setting("llm_model_path", str(default_model_path))
+            model_path = Path(str(model_path_raw)).expanduser()
+            if not model_path.exists():
+                raise FileNotFoundError(
+                    f"Model not found at {model_path}. Update Settings → Model to select a valid .gguf file."
+                )
+
+            # Context length is intentionally fixed (not user-configurable).
+            ctx_size = 32768
+
+            gpu_layers_raw = sqlite_store.get_setting("llm_gpu_layers", 99)
+            try:
+                gpu_layers = int(gpu_layers_raw)
+            except Exception:
+                gpu_layers = 99
+
+            persist_dir = Path(get_workspace().base) / "kv_sessions"
             cls._session_manager = LlamaSessionManager(
                 str(model_path),
-                ctx_size=32768,
-                gpu_layers=99,
+                ctx_size=ctx_size,
+                gpu_layers=gpu_layers,
                 persist_dir=persist_dir,
                 ltm_store=AppDependencies.ltm_store(),
                 metadata_store=sqlite_store,
@@ -185,3 +200,95 @@ class AppDependencies:
 
         cls._query_embedder = _embed
         return cls._query_embedder
+
+    @classmethod
+    def busy_state(cls) -> dict[str, object]:
+        """
+        Best-effort activity check used to block destructive operations (reset/clean)
+        while background work is running (ingestion, streaming, KV snapshot/persist).
+        """
+        store, _ = cls.storage()
+        active_jobs = 0
+        try:
+            active_jobs = int(store.count_jobs_with_status(("queued", "running")))
+        except Exception:
+            active_jobs = 0
+
+        llm_state: dict[str, object] | None = None
+        llm_busy = False
+        if cls._session_manager is not None:
+            try:
+                llm_state = cls._session_manager.busy_state()
+                llm_busy = bool(llm_state.get("busy"))
+            except Exception as exc:
+                llm_busy = True
+                llm_state = {"busy": True, "error": str(exc)}
+
+        busy = bool(active_jobs) or llm_busy
+        reasons: list[str] = []
+        if active_jobs:
+            reasons.append("ingestion")
+        if llm_busy:
+            reasons.append("llm")
+
+        return {
+            "busy": busy,
+            "reasons": reasons,
+            "active_jobs": active_jobs,
+            "llm": llm_state or {"busy": False},
+        }
+
+    @classmethod
+    def reset_all(cls, *, confirm: bool = False) -> None:
+        """
+        Delete all user data and reset in-memory singletons.
+
+        This closes local Qdrant and SQLite connections so the workspace folder can
+        be removed safely, then recreates the workspace structure. The caller
+        should restart the engine/app after calling this.
+        """
+        if not confirm:
+            raise ValueError("Reset not confirmed.")
+
+        # Stop model/session workers first (they can hold open files under kv_sessions).
+        if cls._session_manager is not None:
+            try:
+                cls._session_manager._shutdown_snapshot_worker()
+            except Exception:
+                pass
+            try:
+                cls._session_manager._shutdown_persist_worker()
+            except Exception:
+                pass
+            cls._session_manager = None
+
+        # Close Qdrant local file lock.
+        if cls._vector_index is not None:
+            try:
+                cls._vector_index.client.close()
+            except Exception:
+                pass
+            cls._vector_index = None
+
+        # Close SQLite connection.
+        if cls._sqlite_store is not None:
+            try:
+                cls._sqlite_store.close()
+            except Exception:
+                pass
+            cls._sqlite_store = None
+
+        # Drop other cached singletons.
+        cls._ingestion_pipeline = None
+        cls._planner_service = None
+        cls._key_manager = None
+        cls._ingestion_scheduler = None
+        cls._query_embedder = None
+        cls._rag_store = None
+        cls._ltm_store = None
+        cls._search_service = None
+        cls._doc_search_service = None
+
+        ws = cls.workspace()
+        ws.reset(confirm=True)
+        cls._workspace = None

@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 
 import { engine } from "../api/engine";
 import { DocEditor } from "../editor/DocEditor";
+import { proseMirrorDocToHtml, proseMirrorDocToMarkdown, proseMirrorDocToPlainText } from "../editor/docExport";
 import { loadDocPage, saveDocPage } from "../editor/docPages";
 
 type ChatFile = {
@@ -68,6 +70,32 @@ function countWords(text: string) {
   const cleaned = (text || "").trim();
   if (!cleaned) return 0;
   return cleaned.split(/\s+/g).filter(Boolean).length;
+}
+
+function buildExportPdfHtml(bodyHtml: string): string {
+  const css = `
+    @page { margin: 18mm; }
+    html, body { margin: 0; padding: 0; background: #ffffff; color: #0f172a; }
+    body { box-sizing: border-box; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    .doc-root { max-width: 900px; margin: 0 auto; font-size: 14px; line-height: 1.6; }
+    .doc-root h1 { font-size: 26px; line-height: 1.15; margin: 22px 0 10px; }
+    .doc-root h2 { font-size: 20px; line-height: 1.22; margin: 18px 0 8px; }
+    .doc-root h3 { font-size: 17px; line-height: 1.3; margin: 14px 0 6px; }
+    .doc-root h4 { font-size: 15px; line-height: 1.4; margin: 12px 0 6px; }
+    .doc-root p { margin: 0 0 8px; }
+    .doc-root ul, .doc-root ol { margin: 0 0 10px; padding-left: 1.25em; }
+    .doc-root li { margin: 4px 0; }
+    .doc-root blockquote { margin: 12px 0; padding: 6px 0 6px 12px; border-left: 2px solid rgba(2, 132, 199, 0.35); color: rgba(15, 23, 42, 0.92); }
+    .doc-root hr { border: none; border-top: 1px solid rgba(15, 23, 42, 0.15); margin: 14px 0; }
+    .doc-root code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 0.92em; background: rgba(2, 132, 199, 0.08); padding: 0.12em 0.32em; border-radius: 6px; }
+    .doc-root pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; line-height: 1.5; background: rgba(15, 23, 42, 0.06); padding: 10px 12px; border-radius: 10px; overflow: auto; margin: 12px 0; }
+    .doc-root pre code { background: transparent; padding: 0; border-radius: 0; }
+    .doc-root table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    .doc-root th, .doc-root td { border: 1px solid rgba(15, 23, 42, 0.15); padding: 7px 9px; vertical-align: top; }
+    .doc-root th { font-weight: 650; background: rgba(15, 23, 42, 0.04); }
+    .doc-root a { color: #0369a1; text-decoration: underline; }
+  `;
+  return `<!doctype html><html><head><meta charset="utf-8" /><style>${css}</style></head><body><div class="doc-root">${bodyHtml}</div></body></html>`;
 }
 
 function plainTextFromProseMirror(doc: any): string {
@@ -275,6 +303,9 @@ export function DocumentsPane({
     editorRef.current = editor;
   }, []);
 
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
+
   const infoPopoverRef = useRef<HTMLDivElement | null>(null);
   const infoAnchorRef = useRef<HTMLElement | null>(null);
   const [infoPos, setInfoPos] = useState<{ x: number; y: number } | null>(null);
@@ -329,6 +360,7 @@ export function DocumentsPane({
     setIsSearchOpen(false);
     setReplaceQuery("");
     setIsReplaceMenuOpen(false);
+    setIsExportMenuOpen(false);
     setInfoPos(null);
     infoAnchorRef.current = null;
 
@@ -921,6 +953,23 @@ export function DocumentsPane({
   }, [isEditing]);
 
   useEffect(() => {
+    if (!isExportMenuOpen) return;
+    function onPointerDown(e: Event) {
+      const target = e.target as Node | null;
+      const el = exportMenuRef.current;
+      if (!el || !target) return;
+      if (el.contains(target)) return;
+      setIsExportMenuOpen(false);
+    }
+    window.addEventListener("pointerdown", onPointerDown, true);
+    return () => window.removeEventListener("pointerdown", onPointerDown, true);
+  }, [isExportMenuOpen]);
+
+  useEffect(() => {
+    if (!isEditing) setIsExportMenuOpen(false);
+  }, [isEditing]);
+
+  useEffect(() => {
     if (!infoPos) return;
     function onPointerDown(e: Event) {
       const target = e.target as Node | null;
@@ -978,6 +1027,69 @@ export function DocumentsPane({
     setInfoPos(null);
     infoAnchorRef.current = null;
   }, [effectiveActiveFileId]);
+
+  function exportBaseNameFromFilename(name: string): string {
+    const cleaned = (name || "").trim();
+    if (!cleaned) return "document";
+    const base = cleaned.replace(/\.[^/.]+$/, "");
+    return base.trim() || "document";
+  }
+
+  async function saveExportFile(opts: { defaultName: string; content: string }) {
+    try {
+      const res = await invoke<{ path?: string | null; cancelled?: boolean }>("save_export_file", {
+        defaultName: opts.defaultName,
+        content: opts.content,
+      });
+      if (res?.path) setError(null);
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    }
+  }
+
+  function exportMarkdown() {
+    if (!activeFile) return;
+    const d = docRef.current;
+    if (!d) {
+      setError("No document content to export.");
+      return;
+    }
+    const base = exportBaseNameFromFilename(activeFile.filename);
+    const md = proseMirrorDocToMarkdown(d);
+    void saveExportFile({ defaultName: `${base}.md`, content: md });
+  }
+
+  function exportText() {
+    if (!activeFile) return;
+    const d = docRef.current;
+    if (!d) {
+      setError("No document content to export.");
+      return;
+    }
+    const base = exportBaseNameFromFilename(activeFile.filename);
+    const txt = proseMirrorDocToPlainText(d);
+    void saveExportFile({ defaultName: `${base}.txt`, content: txt });
+  }
+
+  function exportPdf() {
+    if (!activeFile) return;
+    const d = docRef.current;
+    if (!d) {
+      setError("No document content to export.");
+      return;
+    }
+    const base = exportBaseNameFromFilename(activeFile.filename);
+    const bodyHtml = proseMirrorDocToHtml(d);
+    const html = buildExportPdfHtml(bodyHtml);
+    invoke<{ path?: string | null; cancelled?: boolean }>("export_pdf_file", {
+      defaultName: `${base}.pdf`,
+      html,
+    })
+      .then((res) => {
+        if (res?.path) setError(null);
+      })
+      .catch((e: any) => setError(e?.message ?? String(e)));
+  }
 
   return (
     <div className="docs-pane">
@@ -1160,25 +1272,79 @@ export function DocumentsPane({
 			                    ⌕
 			                  </button>
 
-		                  <button
-		                    type="button"
-		                    className="docs-reader-edit-toggle"
-		                    aria-label={isEditing ? "Done editing" : "Edit document"}
-		                    title={isEditing ? "Done" : "Edit"}
-	                    onClick={() => {
-	                      if (isEditing) {
-	                        void flushDocSaveNow().finally(() => {
-	                          editingFileIdRef.current = null;
-	                          setIsEditing(false);
-	                        });
-	                        return;
-	                      }
-	                      editingFileIdRef.current = effectiveActiveFileId;
-	                      setIsEditing(true);
-		                    }}
-		                  >
-		                    <span className="docs-reader-edit-icon">{isEditing ? "✓" : "✎"}</span>
-		                  </button>
+		                  <div className="docs-reader-header-actions">
+		                    {isEditing ? (
+		                      <div className="docs-reader-export-actions" ref={exportMenuRef}>
+		                        <button
+		                          type="button"
+		                          className="docs-reader-export-toggle"
+		                          aria-label="Export document"
+		                          title="Export"
+		                          onClick={() => setIsExportMenuOpen((prev) => !prev)}
+		                        >
+		                          ⤓
+		                        </button>
+		                        {isExportMenuOpen ? (
+		                          <div className="docs-reader-export-menu" role="menu" aria-label="Export options">
+		                            <button
+		                              type="button"
+		                              className="docs-reader-export-menu-item"
+		                              role="menuitem"
+		                              onClick={() => {
+		                                setIsExportMenuOpen(false);
+		                                exportPdf();
+		                              }}
+		                            >
+		                              PDF (.pdf)
+		                            </button>
+		                            <button
+		                              type="button"
+		                              className="docs-reader-export-menu-item"
+		                              role="menuitem"
+		                              onClick={() => {
+		                                setIsExportMenuOpen(false);
+		                                exportMarkdown();
+		                              }}
+		                            >
+		                              Markdown (.md)
+		                            </button>
+		                            <button
+		                              type="button"
+		                              className="docs-reader-export-menu-item"
+		                              role="menuitem"
+		                              onClick={() => {
+		                                setIsExportMenuOpen(false);
+		                                exportText();
+		                              }}
+		                            >
+		                              Text (.txt)
+		                            </button>
+		                          </div>
+		                        ) : null}
+		                      </div>
+		                    ) : null}
+
+		                    <button
+		                      type="button"
+		                      className="docs-reader-edit-toggle"
+		                      aria-label={isEditing ? "Done editing" : "Edit document"}
+		                      title={isEditing ? "Done" : "Edit"}
+		                      onClick={() => {
+		                        setIsExportMenuOpen(false);
+		                        if (isEditing) {
+		                          void flushDocSaveNow().finally(() => {
+		                            editingFileIdRef.current = null;
+		                            setIsEditing(false);
+		                          });
+		                          return;
+		                        }
+		                        editingFileIdRef.current = effectiveActiveFileId;
+		                        setIsEditing(true);
+		                      }}
+		                    >
+		                      <span className="docs-reader-edit-icon">{isEditing ? "✓" : "✎"}</span>
+		                    </button>
+		                  </div>
 			                </div>
 
                 <div className={`docs-reader-search-wrap ${effectiveSearchOpen ? "open" : ""}`}>

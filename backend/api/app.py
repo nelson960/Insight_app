@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from backend.api.routers import chat, docs, files, jobs, search, session
+from backend.api.routers import chat, docs, files, jobs, search, session, settings
 from backend.services.logging_config import configure_logging
 
 
@@ -15,6 +15,7 @@ def create_app() -> FastAPI:
     app.include_router(jobs.router)
     app.include_router(search.router)
     app.include_router(session.router)
+    app.include_router(settings.router)
     return app
 
 

@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
-function safeText(children: unknown) {
+function safeText(children: unknown): string {
   if (Array.isArray(children)) return children.map((c) => safeText(c)).join("");
   return String(children ?? "");
 }

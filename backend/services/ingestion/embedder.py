@@ -23,7 +23,9 @@ class EmbeddingConnector(Protocol):
 class EmbeddingConfig:
     """Configuration knobs for embedding execution."""
 
-    batch_size: int = 64
+    # Keep batches small for local CPU embedding to avoid huge ORT calls that can
+    # appear "hung" on long-sequence models (e.g., 2048 token encoders).
+    batch_size: int = 8
     prefer_local: bool = True
 
 

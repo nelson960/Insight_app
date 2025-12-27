@@ -35,12 +35,25 @@ class RagStore:
         )
         hits: List[Dict[str, Any]] = []
         for res in results:
+            filename = None
+            page = None
+            if isinstance(res.metadata, dict):
+                fn = res.metadata.get("filename")
+                if isinstance(fn, str) and fn.strip():
+                    filename = fn
+                meta = res.metadata.get("metadata")
+                if isinstance(meta, dict):
+                    p = meta.get("page")
+                    if isinstance(p, int):
+                        page = p
             hits.append(
                 {
                     "doc_id": res.file_id,
                     "chunk_id": res.chunk_id,
                     "text": res.text or "",
                     "score": res.score or 0.0,
+                    "filename": filename,
+                    "page": page,
                 }
             )
         return hits

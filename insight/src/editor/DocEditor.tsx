@@ -123,7 +123,7 @@ const SearchHighlights = Extension.create({
       new Plugin<HighlightPluginState>({
         key: highlightKey,
         state: {
-          init: (_, state) => ({
+          init: () => ({
             matches: [],
             activeIndex: 0,
             decorations: DecorationSet.empty,

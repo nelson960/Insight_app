@@ -45,7 +45,8 @@ fn engine_request(
     payload: Option<Value>,
     state: tauri::State<'_, SharedEngine>,
 ) -> Result<EngineResponse, String> {
-    if ipc_debug() {
+    // Avoid spamming logs for the Settings busy poll endpoint.
+    if ipc_debug() && endpoint != "/settings/busy" {
         eprintln!("[cmd] engine_request endpoint={endpoint}");
     }
     let engine = state.inner();
@@ -312,6 +313,163 @@ fn pick_files() -> Result<Value, String> {
     Ok(serde_json::json!({ "files": out }))
 }
 
+#[tauri::command]
+fn pick_model_file() -> Result<Value, String> {
+    let file = rfd::FileDialog::new()
+        .add_filter("GGUF", &["gguf"])
+        .pick_file();
+    if let Some(p) = file {
+        let path = p.to_str().unwrap_or("").to_string();
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let size_bytes = std::fs::metadata(&p).ok().map(|m| m.len()).unwrap_or(0);
+        return Ok(serde_json::json!({
+            "path": path,
+            "name": name,
+            "size_bytes": size_bytes
+        }));
+    }
+    Ok(serde_json::json!({ "path": null }))
+}
+
+#[tauri::command]
+fn save_export_file(default_name: String, content: String) -> Result<Value, String> {
+    let name = default_name.trim();
+    let file = rfd::FileDialog::new()
+        .set_file_name(if name.is_empty() { "export.txt" } else { name })
+        .save_file();
+    if let Some(path) = file {
+        std::fs::write(&path, content.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+        return Ok(serde_json::json!({ "path": path.to_string_lossy().to_string(), "cancelled": false }));
+    }
+    Ok(serde_json::json!({ "path": null, "cancelled": true }))
+}
+
+#[tauri::command]
+fn print_current_webview(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.print().map_err(|e| format!("Print failed: {e}"))
+}
+
+#[tauri::command]
+async fn export_pdf_file(
+    default_name: String,
+    html: String,
+    window: tauri::WebviewWindow,
+) -> Result<Value, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (default_name, html, window);
+        return Err("PDF export is currently supported on macOS only.".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ptr::NonNull;
+        use std::sync::mpsc;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+        let name = default_name.trim();
+        let file = rfd::FileDialog::new()
+            .set_file_name(if name.is_empty() { "document.pdf" } else { name })
+            .add_filter("PDF", &["pdf"])
+            .save_file();
+        let Some(path) = file else {
+            return Ok(serde_json::json!({ "path": null, "cancelled": true }));
+        };
+
+        let app = window.app_handle();
+        let label = {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            format!("export-pdf-{ts}")
+        };
+
+        let about_blank = tauri::Url::parse("about:blank")
+            .map_err(|e| format!("Failed to parse about:blank URL: {e}"))?;
+        let export_window = WebviewWindowBuilder::new(app, label, WebviewUrl::External(about_blank))
+            .title("Export PDF")
+            .visible(false)
+            .decorations(false)
+            .resizable(false)
+            .skip_taskbar(true)
+            .inner_size(1024.0, 768.0)
+            .build()
+            .map_err(|e| format!("Failed to create export window: {e}"))?;
+
+        let load_html = html.clone();
+        export_window
+            .with_webview(move |webview| unsafe {
+                let view: &objc2_web_kit::WKWebView = &*webview.inner().cast();
+                let ns_html = objc2_foundation::NSString::from_str(&load_html);
+                view.loadHTMLString_baseURL(&ns_html, None);
+            })
+            .map_err(|e| format!("Failed to load export HTML into webview: {e}"))?;
+
+        // Allow the WebView to finish laying out the document before exporting.
+        // The export HTML is self-contained (no external resources), so a small
+        // delay is sufficient and avoids impacting the visible app UI.
+        tauri::async_runtime::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(120));
+        })
+        .await
+        .map_err(|e| format!("PDF export wait task failed: {e}"))?;
+
+        let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
+        export_window
+            .with_webview(move |webview| unsafe {
+                let view: &objc2_web_kit::WKWebView = &*webview.inner().cast();
+                let completion = block2::StackBlock::new(
+                    move |data: *mut objc2_foundation::NSData, error: *mut objc2_foundation::NSError| {
+                        let out = if !error.is_null() {
+                            let err: &objc2_foundation::NSError = &*error;
+                            let desc = err.localizedDescription();
+                            Err(desc.to_string())
+                        } else if data.is_null() {
+                            Err("WKWebView returned no PDF data.".to_string())
+                        } else {
+                            let d: &objc2_foundation::NSData = &*data;
+                            let len = d.length() as usize;
+                            let mut buf = vec![0u8; len];
+                            if len > 0 {
+                                let ptr = NonNull::new(buf.as_mut_ptr().cast())
+                                    .expect("Vec pointer should not be null");
+                                d.getBytes_length(ptr, len as objc2_foundation::NSUInteger);
+                            }
+                            Ok(buf)
+                        };
+                        let _ = tx.send(out);
+                    },
+                );
+
+                view.createPDFWithConfiguration_completionHandler(None, &completion);
+            })
+            .map_err(|e| format!("Failed to access export webview: {e}"))?;
+
+        let path_str = path.to_string_lossy().to_string();
+        let res = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+            let bytes = rx
+                .recv_timeout(Duration::from_secs(120))
+                .map_err(|_| "Timed out generating PDF.".to_string())??;
+            std::fs::write(&path, &bytes)
+                .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("PDF export task failed: {e}"))?;
+        res?;
+
+        let _ = export_window.close();
+        Ok(serde_json::json!({ "path": path_str, "cancelled": false }))
+    }
+}
+
 fn spawn_kv_watcher(app: tauri::AppHandle, kv_dir: PathBuf) -> notify::Result<RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
@@ -351,6 +509,10 @@ pub fn run() {
             list_sessions,
             get_session_messages,
             pick_files,
+            pick_model_file,
+            save_export_file,
+            print_current_webview,
+            export_pdf_file,
             engine_stream_request,
             engine_cancel_request
         ])

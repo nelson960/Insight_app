@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
@@ -62,7 +63,11 @@ class NomicOnnxEmbedTextConnector:
         pad_id = self._tokenizer.token_to_id(pad_token)
         if pad_id is None:
             pad_id = 0
-        self._tokenizer.enable_padding(length=self.config.max_length, pad_id=pad_id, pad_token=pad_token)
+        # Important: do NOT pad to a fixed max_length. Padding to 2048 forces the ONNX model
+        # to process the full sequence length even for short chunks, which can make ingestion
+        # appear "hung" (minutes+) on CPU. Dynamic padding keeps shapes consistent per-batch,
+        # but only pads to the longest sequence in that batch.
+        self._tokenizer.enable_padding(pad_id=pad_id, pad_token=pad_token)
 
         providers = list(self.config.providers) if self.config.providers else None
         logger.info("Loading ONNX runtime session from %s (providers=%s)", self.model_path, providers)
@@ -71,6 +76,7 @@ class NomicOnnxEmbedTextConnector:
             providers=providers or self._ort.get_available_providers(),
         )
         self._output_name = self._session.get_outputs()[0].name
+        self._lock = threading.Lock()
 
     def supports(self, model: str) -> bool:
         return model in {
@@ -82,19 +88,22 @@ class NomicOnnxEmbedTextConnector:
     def embed(self, model: str, texts: Sequence[str]) -> Sequence[Sequence[float]]:
         if not texts:
             return []
-        encodings = self._tokenizer.encode_batch(list(texts))
-        input_ids = np.asarray([encoding.ids for encoding in encodings], dtype=np.int64)
-        attention_mask = np.asarray([encoding.attention_mask for encoding in encodings], dtype=np.int64)
-        type_ids = np.asarray([encoding.type_ids for encoding in encodings], dtype=np.int64)
+        # The Tokenizer + ORT session are not guaranteed to be thread-safe across all builds.
+        # We serialize calls to avoid rare hangs under concurrent ingestion + retrieval load.
+        with self._lock:
+            encodings = self._tokenizer.encode_batch(list(texts))
+            input_ids = np.asarray([encoding.ids for encoding in encodings], dtype=np.int64)
+            attention_mask = np.asarray([encoding.attention_mask for encoding in encodings], dtype=np.int64)
+            type_ids = np.asarray([encoding.type_ids for encoding in encodings], dtype=np.int64)
 
-        outputs = self._session.run(
-            [self._output_name],
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "token_type_ids": type_ids,
-            },
-        )
+            outputs = self._session.run(
+                [self._output_name],
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "token_type_ids": type_ids,
+                },
+            )
         hidden = outputs[0]
         embeddings = self._mean_pool(hidden, attention_mask)
         if self.config.normalize_embeddings:
