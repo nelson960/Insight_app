@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { isValidElement, memo, useCallback, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
@@ -23,35 +23,33 @@ type MarkdownProps = {
 };
 
 function MarkdownRenderer({ markdown }: MarkdownProps) {
-  const renderCode = useCallback(
-    (props: {
-      inline?: boolean;
-      className?: string;
-      children?: unknown;
-    }) => {
-      const inline = Boolean(props.inline);
+  const renderInlineCode = useCallback(
+    (props: { className?: string; children?: unknown }) => {
       const className = props.className || "";
-      const raw = safeText(props.children);
-      const text = raw.replace(/\n$/, "");
-      const langMatch = /language-([A-Za-z0-9_+-]+)/.exec(className);
-      const language = langMatch?.[1] || "";
-
-      if (inline) {
-        return <code className="chat-md-code">{props.children as any}</code>;
-      }
-
-      return <CodeBlock text={text} language={language} />;
+      return <code className={`chat-md-code ${className}`}>{props.children as any}</code>;
     },
     []
   );
 
+  const renderPre = useCallback((props: { children?: unknown }) => {
+    // In `react-markdown@10`, the `code` component props no longer include `inline`.
+    // Block code is represented as a `<pre><code>…</code></pre>` pair, so we render
+    // the whole block here and keep `code` for inline backticks only.
+    const child = Array.isArray(props.children) ? (props.children[0] as any) : (props.children as any);
+    const className = isValidElement(child) ? String((child.props as any)?.className || "") : "";
+    const raw = isValidElement(child) ? safeText((child.props as any)?.children) : safeText(props.children);
+    const text = raw.replace(/\n$/, "");
+    const langMatch = /language-([A-Za-z0-9_+-]+)/.exec(className);
+    const language = langMatch?.[1] || "";
+    return <CodeBlock text={text} language={language} />;
+  }, []);
+
   const components = useMemo(() => {
     return {
-      // Unwrap `pre` so our `code` renderer can own block layout without nested <pre>.
-      pre: ({ children }: { children?: any }) => <>{children}</>,
-      code: renderCode as any,
+      pre: renderPre as any,
+      code: renderInlineCode as any,
     };
-  }, [renderCode]);
+  }, [renderInlineCode, renderPre]);
 
   return (
     <ReactMarkdown

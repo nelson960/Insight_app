@@ -472,7 +472,13 @@ function App() {
                 </div>
                 <div className="chat-overlay-body">
                   <OverlayBoundary title="Chat UI crashed" onClose={closeOverlay}>
-                    <ChatWindow chatId={overlayChatId} active={true} embedded={false} showTopbar={false} />
+                    <ChatWindow
+                      chatId={overlayChatId}
+                      active={true}
+                      embedded={false}
+                      showTopbar={false}
+                      docsVisible={false}
+                    />
                   </OverlayBoundary>
                 </div>
               </div>

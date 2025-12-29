@@ -22,6 +22,7 @@ class PlannerService:
             documents_text=getattr(request, "documents_text", []) or [],
             attachments=getattr(request, "attachments", []) or [],
             focus_document_id=getattr(request, "focus_document_id", None),
+            doc_scope_mode=getattr(request, "doc_scope_mode", None),
             selection=getattr(request, "selection", None),
         )
         return PlannerResult(
@@ -41,6 +42,7 @@ class PlannerService:
             documents_text=getattr(request, "documents_text", []) or [],
             attachments=getattr(request, "attachments", []) or [],
             focus_document_id=getattr(request, "focus_document_id", None),
+            doc_scope_mode=getattr(request, "doc_scope_mode", None),
             selection=getattr(request, "selection", None),
             request_id=getattr(request, "request_id", None),
         )

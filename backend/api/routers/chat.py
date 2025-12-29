@@ -236,9 +236,10 @@ async def _ingest_paths_for_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
             # Synchronous extraction for immediate use (inline docs in prompt)
             extracted = await asyncio.to_thread(extraction_service.extract, temp_path, mime_type=mime)
             truncated = _truncate_doc_text(extracted.text or "")
-            if truncated.strip():
-                doc_texts.append(truncated)
-            else:
+            # Preserve index alignment with `documents` and `attachments` by always appending
+            # a string entry for each uploaded file (empty if extraction yielded no text).
+            doc_texts.append(truncated)
+            if not truncated.strip():
                 logger.warning("Extraction returned empty text for desktop path filename=%s mime=%s", filename, mime)
             doc_ids.append(file_id)
 
@@ -290,7 +291,12 @@ async def _ingest_paths_for_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload["documents_text"] = doc_texts
         payload["attachments"] = attachment_names
         # If no explicit focus was provided, default focus to the most recently ingested doc.
-        payload.setdefault("focus_document_id", doc_ids[-1] if doc_ids else None)
+        #
+        # IMPORTANT: when the UI explicitly requests "all documents" scope, do not invent a focus
+        # (it would hard-bias retrieval to a single file and defeat compare-style queries).
+        scope_mode = payload.get("doc_scope_mode")
+        if not (isinstance(scope_mode, str) and scope_mode.strip().lower() == "all"):
+            payload.setdefault("focus_document_id", doc_ids[-1] if doc_ids else None)
         return payload
 
 
@@ -563,6 +569,9 @@ def _build_request(payload: Dict[str, Any]) -> PlannerRequest:
         selection = payload.get("selection")
         if selection is not None and not isinstance(selection, dict):
             selection = None
+        doc_scope_mode = payload.get("doc_scope_mode")
+        if not isinstance(doc_scope_mode, str):
+            doc_scope_mode = None
         return PlannerRequest(
             chat_id=payload["chat_id"],
             query=payload["query"],
@@ -570,6 +579,7 @@ def _build_request(payload: Dict[str, Any]) -> PlannerRequest:
             documents_text=payload.get("documents_text", []),
             attachments=payload.get("attachments", []) or [],
             focus_document_id=focus_document_id if isinstance(focus_document_id, str) else None,
+            doc_scope_mode=doc_scope_mode,
             selection=selection,
             screenshot=payload.get("screenshot"),
             request_id=payload.get("request_id"),

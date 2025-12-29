@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
 from ..extraction import FileExtractionResult, FileExtractionService, ExtractionError
-from .chunker import SimpleChunker
 from .embedder import EmbeddingClient
 from .index_writer import ChunkStore, VectorIndexWriter
 from .models import (
@@ -26,6 +25,13 @@ from .retry import RetryPolicy, classify_exception
 logger = logging.getLogger(__name__)
 
 CancelCheck = Callable[[], bool]
+
+
+class Chunker(Protocol):
+    """Chunker interface (block-aware or plain-text)."""
+
+    def chunk(self, extraction: ExtractionResult) -> Sequence[ChunkPayload]:
+        ...
 
 
 class IngestionCancelled(RuntimeError):
@@ -104,7 +110,7 @@ class IngestionPipeline:
         self,
         *,
         extraction_service: FileExtractionService,
-        chunker: SimpleChunker,
+        chunker: Chunker,
         embedder: EmbeddingClient,
         index_writer: VectorIndexWriter,
         metadata_store: MetadataStore,

@@ -15,6 +15,7 @@ type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  request_id?: string;
   attachments?: string[];
   selection?: { text: string; file_id?: string; page?: number };
   focus_document_id?: string;
@@ -26,6 +27,7 @@ type Props = {
   embedded?: boolean;
   showTopbar?: boolean;
   activeDocumentId?: string | null;
+  docsVisible?: boolean;
   selection?: { text: string; file_id?: string } | null;
   onSetSelection?: (sel: { text: string; file_id?: string } | null) => void;
   onClearSelection?: () => void;
@@ -38,6 +40,9 @@ type ContextStatus = {
   capacity_tokens: number;
   percent: number;
   compacted?: boolean;
+  last_gen_tps?: number;
+  last_ttft_ms?: number;
+  last_gen_tokens?: number;
 };
 
 type MarkdownStreamState = {
@@ -127,6 +132,7 @@ export function ChatWindow({
   embedded = false,
   showTopbar = true,
   activeDocumentId = null,
+  docsVisible = true,
   selection,
   onSetSelection,
   onClearSelection,
@@ -624,6 +630,11 @@ export function ChatWindow({
           ? (globalThis.crypto as any).randomUUID()
           : `${Date.now()}-${Math.random()}`) as string;
       activeRequestIdRef.current = requestId;
+      // Attach the request_id to the placeholder assistant message so out-of-band
+      // events (e.g. citations) can update the correct message even after streaming ends.
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, request_id: requestId } : m))
+      );
       const paths = attached;
       // Option A (backend contract): `focus_document_id` biases retrieval but does not hard-filter.
       // Do NOT send `documents` from the UI (it can cause the backend to inline-stitch that doc
@@ -634,7 +645,8 @@ export function ChatWindow({
       const focusDocForTurn =
         paths.length > 0
           ? undefined
-          : activeDocumentId || undefined;
+          : (docsVisible ? activeDocumentId : null) || undefined;
+      const docScopeMode = docsVisible ? "focused" : "all";
 
       unlistenTokenRef.current = await listen<{ token: string; chat_id?: string; request_id?: string }>(
         "llm-token",
@@ -728,6 +740,7 @@ export function ChatWindow({
         requestId,
         paths,
         focusDocumentId: focusDocForTurn,
+        docScopeMode,
         selection: selectionPayload,
       });
     } catch (err: any) {
@@ -936,7 +949,12 @@ export function ChatWindow({
               const cap = Number(contextStatus.capacity_tokens || 0);
               const pctUsed = Math.max(0, Math.min(100, Number(contextStatus.percent || 0)));
               const left = Math.max(0, cap - used);
-              const tooltip = `Used ${pctUsed}%\nRemaining ${formatInt(left)} / ${formatInt(cap)} tokens`;
+              const tps =
+                typeof contextStatus.last_gen_tps === "number" && Number.isFinite(contextStatus.last_gen_tps)
+                  ? contextStatus.last_gen_tps
+                  : null;
+              const speedLine = tps ? `\nSpeed ~${tps.toFixed(1)} tok/s` : "";
+              const tooltip = `Used ${pctUsed}%\nRemaining ${formatInt(left)} / ${formatInt(cap)} tokens${speedLine}`;
               const r = 16;
               const cx = 18;
               const cy = 18;
@@ -971,7 +989,10 @@ export function ChatWindow({
                     <div className="chat-context-tooltip" role="tooltip">
                       <div className="chat-context-tooltip-title">Context</div>
                       <div className="chat-context-tooltip-body">
-                        Used {pctUsed}% · Remaining {formatInt(left)} / {formatInt(cap)} tokens
+                        <div>
+                          Used {pctUsed}% · Remaining {formatInt(left)} / {formatInt(cap)} tokens
+                        </div>
+                        {tps ? <div>Speed ~{tps.toFixed(1)} tok/s</div> : null}
                       </div>
                     </div>
                   </div>

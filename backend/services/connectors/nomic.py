@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -24,6 +25,8 @@ def _lazy_import_sentence_transformer():
 
 
 DEFAULT_MODEL_REPO_ID = "nomic-ai/nomic-embed-text-v1.5"
+
+_download_lock = threading.Lock()
 
 
 def _lazy_import_snapshot_download():
@@ -58,6 +61,68 @@ def ensure_local_nomic_model(
     )
     if not any(target_dir.iterdir()):
         raise RuntimeError(f"Model download for {repo_id} produced no files in {target_dir}")
+    return target_dir
+
+
+def ensure_local_nomic_model_files(
+    target_dir: Path,
+    *,
+    required_paths: Sequence[str],
+    repo_id: str = DEFAULT_MODEL_REPO_ID,
+    revision: Optional[str] = None,
+) -> Path:
+    """
+    Ensure specific model assets exist under `target_dir`, downloading them if missing.
+
+    This is useful for the ONNX embedding connector which only needs a small subset
+    of the repo (e.g. `tokenizer.json` + `onnx/model.onnx`) and should not require
+    bundling the full embedding repository inside the app.
+    """
+    target_dir = Path(target_dir)
+    req = [str(p) for p in required_paths if isinstance(p, str) and p.strip()]
+    missing: list[str] = []
+    for rel in req:
+        rel_path = Path(rel)
+        if rel_path.is_absolute():
+            raise ValueError(f"required_paths must be relative, got: {rel}")
+        if not (target_dir / rel_path).exists():
+            missing.append(rel)
+
+    if not missing:
+        return target_dir
+
+    # Avoid concurrent downloads from multiple ingestion workers / threads.
+    with _download_lock:
+        # Re-check after acquiring the lock (another thread may have completed it).
+        still_missing: list[str] = []
+        for rel in missing:
+            if not (target_dir / rel).exists():
+                still_missing.append(rel)
+        if not still_missing:
+            return target_dir
+
+        snapshot_download = _lazy_import_snapshot_download()
+        logger.info(
+            "Downloading Nomic embedding model assets (%s) into %s (missing=%s)",
+            repo_id,
+            target_dir,
+            ", ".join(still_missing),
+        )
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            local_dir=str(target_dir),
+            local_dir_use_symlinks=False,
+            allow_patterns=req,
+        )
+
+        final_missing = [rel for rel in still_missing if not (target_dir / rel).exists()]
+        if final_missing:
+            raise RuntimeError(
+                f"Model download for {repo_id} did not produce required files in {target_dir}: {final_missing}"
+            )
+
     return target_dir
 
 
@@ -116,4 +181,9 @@ class NomicEmbedTextConnector:
         return self._model
 
 
-__all__ = ["NomicEmbedTextConnector", "MissingDependencyError", "ensure_local_nomic_model"]
+__all__ = [
+    "NomicEmbedTextConnector",
+    "MissingDependencyError",
+    "ensure_local_nomic_model",
+    "ensure_local_nomic_model_files",
+]

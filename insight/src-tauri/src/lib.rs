@@ -228,7 +228,7 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
 
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open db.sqlite: {e}"))?;
     let mut stmt = conn
-        .prepare("SELECT role, content_json FROM messages WHERE chat_id=? ORDER BY created_at ASC")
+        .prepare("SELECT role, content_json, citations_json FROM messages WHERE chat_id=? ORDER BY created_at ASC")
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
     let mut out: Vec<Value> = Vec::new();
@@ -236,12 +236,13 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
         .query_map([chat_id], |row| {
             let role: String = row.get(0)?;
             let content_json: String = row.get(1)?;
-            Ok((role, content_json))
+            let citations_json: Option<String> = row.get(2)?;
+            Ok((role, content_json, citations_json))
         })
         .map_err(|e| format!("Query failed: {e}"))?;
 
     for row in rows.flatten() {
-        let (role, content_json) = row;
+        let (role, content_json, citations_json) = row;
         let content: String;
         let mut attachments: Vec<String> = Vec::new();
         let mut selection: Option<Value> = None;
@@ -285,6 +286,16 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
         }
         if let Some(fid) = focus_document_id {
             msg["focus_document_id"] = serde_json::json!(fid);
+        }
+        if let Some(raw) = citations_json {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if v.is_array() {
+                        msg["sources"] = v;
+                    }
+                }
+            }
         }
         out.push(msg);
     }

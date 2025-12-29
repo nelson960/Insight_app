@@ -8,7 +8,7 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
-from .nomic import MissingDependencyError
+from .nomic import DEFAULT_MODEL_REPO_ID, MissingDependencyError, ensure_local_nomic_model_files
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +45,28 @@ class NomicOnnxConfig:
 class NomicOnnxEmbedTextConnector:
     is_local = True
 
-    def __init__(self, model_dir: Path, *, config: Optional[NomicOnnxConfig] = None) -> None:
+    def __init__(
+        self,
+        model_dir: Path,
+        *,
+        config: Optional[NomicOnnxConfig] = None,
+        auto_download: bool = False,
+        repo_id: str = DEFAULT_MODEL_REPO_ID,
+        revision: Optional[str] = None,
+    ) -> None:
         self.model_dir = Path(model_dir)
         self.config = config or NomicOnnxConfig()
         self.model_path = self.model_dir / self.config.model_filename
         self.tokenizer_path = self.model_dir / "tokenizer.json"
+        if auto_download:
+            # Only download the minimal required assets for the ONNX runtime:
+            # tokenizer.json + the chosen ONNX model file.
+            ensure_local_nomic_model_files(
+                self.model_dir,
+                required_paths=[self.config.model_filename, "tokenizer.json"],
+                repo_id=repo_id,
+                revision=revision,
+            )
         if not self.model_path.exists():
             raise FileNotFoundError(f"ONNX model not found at {self.model_path}")
         if not self.tokenizer_path.exists():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 import logging
 import re
+import math
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -681,6 +682,10 @@ class LlamaSessionManager:
                     self._abort_request_id = request_id
                     self._abort_event = threading.Event() if request_id else None
 
+                t_gen_start: Optional[float] = None
+                t_first_token: Optional[float] = None
+                t_gen_end: Optional[float] = None
+
                 try:
                     # Allow a larger hard cap for "normal" answers so we don't cut off
                     # mid-thought when the initial dynamic output budget is small.
@@ -709,10 +714,16 @@ class LlamaSessionManager:
                         stop=["<|eot_id|>", "<|end_of_text|>"],
                     )
 
+                    # Measure decode speed excluding KV persistence and prompt build work.
+                    # We start the timer immediately before consuming the generator so TTFT is
+                    # meaningful and the throughput reflects user-perceived streaming.
+                    t_gen_start = time.perf_counter()
                     for chunk in stream:
                         token = (chunk.get("choices") or [{}])[0].get("text") or ""
                         if not token:
                             continue
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter()
                         reply_parts.append(token)
                         yield token
                 except Exception:
@@ -729,6 +740,8 @@ class LlamaSessionManager:
                         )
                         raise
                 finally:
+                    if t_gen_end is None:
+                        t_gen_end = time.perf_counter()
                     # 🔔 NEW: notify UI immediately when streaming stops
                     try:
                         emit_event(
@@ -744,11 +757,33 @@ class LlamaSessionManager:
                         self._abort_request_id = None
                         self._abort_event = None
                 reply = "".join(reply_parts)
+                gen_tokens = len(reply_parts)
+                session["last_gen_tokens"] = int(gen_tokens)
+                # "TTFT" = time-to-first-token; "tps" = tokens/sec after first token.
+                # These are best-effort and omitted if we cannot compute them safely.
+                if t_gen_start is not None and t_first_token is not None and t_gen_end is not None and gen_tokens > 0:
+                    ttft_ms = max(0.0, (t_first_token - t_gen_start) * 1000.0)
+                    gen_s = max(0.0, float(t_gen_end - t_first_token))
+                    if gen_s > 1e-6:
+                        tps = float(gen_tokens) / gen_s
+                        if math.isfinite(tps):
+                            session["last_gen_tps"] = round(tps, 2)
+                        else:
+                            session.pop("last_gen_tps", None)
+                    else:
+                        session.pop("last_gen_tps", None)
+                    if math.isfinite(ttft_ms):
+                        session["last_ttft_ms"] = int(round(ttft_ms))
+                    else:
+                        session.pop("last_ttft_ms", None)
+                else:
+                    session.pop("last_gen_tps", None)
+                    session.pop("last_ttft_ms", None)
                 logger.info(
                     "ask_stream_with_context llama done chat=%s request_id=%s tokens=%d cancelled=%s",
                     session_id,
                     request_id or "-",
-                    len(reply_parts),
+                    gen_tokens,
                     cancelled,
                 )
                 try:
@@ -756,7 +791,7 @@ class LlamaSessionManager:
                         "llm_generation_done",
                         chat_id=session_id,
                         request_id=request_id or "",
-                        tokens=len(reply_parts),
+                        tokens=gen_tokens,
                         cancelled=bool(cancelled),
                     )
                 except Exception:
@@ -832,7 +867,7 @@ class LlamaSessionManager:
             return context_pack
 
         margin = 128
-        ephemeral_cap = 1800  # hard cap to keep "context pack" bounded even on empty chats
+        ephemeral_cap = 2400  # hard cap to keep "context pack" bounded even on empty chats
 
         # Compact if the clean session is already near full.
         self._maybe_compact(session_id, session, force=False)
@@ -1308,13 +1343,23 @@ class LlamaSessionManager:
             used_tokens = self._estimate_tokens(messages)
         capacity = self.ctx_size
         percent = used_tokens / capacity if capacity else 0.0
-        return {
+        status: Dict[str, object] = {
             "chat_id": session_id,
             "used_tokens": used_tokens,
             "capacity_tokens": capacity,
             "percent": round(percent * 100, 2),
             "compacted": bool(session.get("compacted", False)),
         }
+        last_tps = session.get("last_gen_tps")
+        if isinstance(last_tps, (int, float)) and math.isfinite(float(last_tps)) and float(last_tps) > 0:
+            status["last_gen_tps"] = float(last_tps)
+        last_ttft = session.get("last_ttft_ms")
+        if isinstance(last_ttft, (int, float)) and math.isfinite(float(last_ttft)) and float(last_ttft) >= 0:
+            status["last_ttft_ms"] = int(float(last_ttft))
+        last_tokens = session.get("last_gen_tokens")
+        if isinstance(last_tokens, (int, float)) and math.isfinite(float(last_tokens)) and float(last_tokens) >= 0:
+            status["last_gen_tokens"] = int(float(last_tokens))
+        return status
 
     def fork_session(self, session_id: str) -> str:
         session = self.sessions.get(session_id)

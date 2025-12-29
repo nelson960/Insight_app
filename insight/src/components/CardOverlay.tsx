@@ -124,6 +124,7 @@ export function CardOverlay({
         embedded={true}
         showTopbar={false}
         activeDocumentId={activeFileId}
+        docsVisible={showDocs}
         selection={selection}
         onSetSelection={setSelection}
         onClearSelection={() => {
@@ -137,7 +138,7 @@ export function CardOverlay({
         onRequestDocsRefresh={() => setDocsRefreshSeq((v) => v + 1)}
       />
     ),
-    [activeFileId, chatId, selection]
+    [activeFileId, chatId, selection, showDocs]
   );
 
   const left = useMemo(() => {

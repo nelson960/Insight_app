@@ -42,6 +42,7 @@ class AppDependencies:
     _ltm_store: Optional[Any] = None
     _search_service: Optional[FileSearchService] = None
     _doc_search_service: Optional[DocSearchService] = None
+    _nomic_model_dir: Optional[Path] = None
 
     @classmethod
     def workspace(cls) -> Workspace:
@@ -69,15 +70,15 @@ class AppDependencies:
     def ingestion_pipeline(cls) -> IngestionPipeline:
         if cls._ingestion_pipeline is None:
             sqlite_store, vector_index = cls.storage()
-            base_dir = Path(__file__).resolve().parents[2]
             cls._ingestion_pipeline = create_ingestion_pipeline(
                 metadata_store=sqlite_store,
                 vector_index=vector_index,
                 pipeline_config=IngestionPipelineConfig(embedding_model="nomic-embed-text-v1.5", embedding_version=1),
-                # Use an absolute path so desktop/IPC mode doesn't depend on cwd.
-                nomic_model_dir=base_dir / "backend" / "em_models" / "nomic-embed-text",
+                # Use a writable workspace location (download-on-missing) with a fallback
+                # to the bundled repo directory during development.
+                nomic_model_dir=cls.nomic_model_dir(),
                 use_onnx_embeddings=True,
-                nomic_auto_download=False,
+                nomic_auto_download=True,
             )
         return cls._ingestion_pipeline
 
@@ -180,10 +181,10 @@ class AppDependencies:
         if cls._query_embedder is not None:
             return cls._query_embedder
         try:
-            base_dir = Path(__file__).resolve().parents[2]
             connector = NomicOnnxEmbedTextConnector(
-                model_dir=base_dir / "backend" / "em_models" / "nomic-embed-text",
+                model_dir=cls.nomic_model_dir(),
                 config=NomicOnnxConfig(),
+                auto_download=True,
             )
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to initialize local query embedder: %s", exc)
@@ -200,6 +201,36 @@ class AppDependencies:
 
         cls._query_embedder = _embed
         return cls._query_embedder
+
+    @classmethod
+    def nomic_model_dir(cls) -> Path:
+        """
+        Resolve the Nomic embedding model directory.
+
+        Preference order:
+        1) previously resolved value (cached)
+        2) workspace-local (writable) model dir, if it contains required assets
+        3) bundled repo model dir under `backend/em_models`, if it contains required assets
+        4) workspace-local model dir (will be auto-downloaded on first use)
+        """
+        if cls._nomic_model_dir is not None:
+            return cls._nomic_model_dir
+
+        workspace_dir = Path(cls.workspace().base) / "em_models" / "nomic-embed-text"
+        project_root = Path(__file__).resolve().parents[2]
+        bundled_dir = project_root / "backend" / "em_models" / "nomic-embed-text"
+
+        def _has_required_assets(base: Path) -> bool:
+            return bool((base / "tokenizer.json").exists() and (base / "onnx" / "model.onnx").exists())
+
+        if _has_required_assets(workspace_dir):
+            cls._nomic_model_dir = workspace_dir
+        elif _has_required_assets(bundled_dir):
+            cls._nomic_model_dir = bundled_dir
+        else:
+            cls._nomic_model_dir = workspace_dir
+
+        return cls._nomic_model_dir
 
     @classmethod
     def busy_state(cls) -> dict[str, object]:

@@ -94,10 +94,9 @@ def get_settings() -> Dict[str, Any]:
         theme_mode = "system"
 
     # Embedding model is fixed (nomic ONNX). Report presence for UX.
-    base_dir = Path(__file__).resolve().parents[3]
-    embed_dir = base_dir / "backend" / "em_models" / "nomic-embed-text" / "onnx"
-    embed_model_path = embed_dir / "model.onnx"
-    embed_ok = embed_model_path.exists()
+    embed_base = AppDependencies.nomic_model_dir()
+    embed_model_path = embed_base / "onnx" / "model.onnx"
+    embed_ok = bool((embed_base / "tokenizer.json").exists() and embed_model_path.exists())
 
     return {
         "settings": {
@@ -110,6 +109,7 @@ def get_settings() -> Dict[str, Any]:
             "model": "nomic-embed-text (onnx)",
             "path": str(embed_model_path),
             "present": bool(embed_ok),
+            "auto_download": True,
         },
     }
 
