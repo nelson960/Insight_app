@@ -86,6 +86,16 @@ class IngestionScheduler:
             for job_id, req in list(self._known_jobs.items()):
                 if getattr(req, "chat_id", None) != chat_id:
                     continue
+                # If the underlying file is shared by other chats, keep ingestion running so
+                # the remaining chats don't lose their indexing progress when a parent card
+                # is deleted mid-ingestion.
+                try:
+                    other_chats = self._metadata_store.list_chat_ids_for_file(req.file_id)
+                    if any(cid != chat_id for cid in other_chats):
+                        continue
+                except Exception:
+                    # Best-effort: if we can't determine sharing, proceed with cancellation.
+                    pass
                 if job_id in self._cancelled:
                     continue
                 self._cancelled.add(job_id)
@@ -99,6 +109,36 @@ class IngestionScheduler:
                     pass
         if cancelled:
             logger.info("Cancelled %d ingestion jobs for chat_id=%s", cancelled, chat_id)
+        return cancelled
+
+    def cancel_file(self, file_id: str, *, chat_id: str | None = None) -> int:
+        """
+        Best-effort cancellation for queued/running ingestion jobs for a single file_id.
+
+        If chat_id is provided, only cancels jobs scheduled for that chat.
+        """
+        if not file_id:
+            return 0
+        cancelled = 0
+        with self._lock:
+            for job_id, req in list(self._known_jobs.items()):
+                if getattr(req, "file_id", None) != file_id:
+                    continue
+                if chat_id and getattr(req, "chat_id", None) != chat_id:
+                    continue
+                if job_id in self._cancelled:
+                    continue
+                self._cancelled.add(job_id)
+                ev = self._running_cancel.get(job_id)
+                if ev is not None:
+                    ev.set()
+                cancelled += 1
+                try:
+                    self._metadata_store.update_job_status(job_id, "cancelled")
+                except Exception:
+                    pass
+        if cancelled:
+            logger.info("Cancelled %d ingestion jobs for file_id=%s", cancelled, file_id)
         return cancelled
 
     def _worker(self) -> None:

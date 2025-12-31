@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
-import { Canvas, CanvasNote } from "./components/Canvas";
+import { Canvas, CanvasLink, CanvasNote } from "./components/Canvas";
 import type { CardLayout } from "./components/Canvas";
 import { CardOverlay } from "./components/CardOverlay";
 import { ChatWindow } from "./components/ChatWindow";
@@ -11,6 +11,7 @@ import { setTheme as setAppTheme } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const NOTES_STORAGE_KEY = "insight.canvas.notes.v1";
+const LINKS_STORAGE_KEY = "insight.canvas.links.v1";
 const DEFAULT_CARD_LAYOUT: CardLayout = {
   showChat: true,
   showDocs: true,
@@ -61,6 +62,14 @@ function loadPersistedNotes(): CanvasNote[] | null {
       if (typeof chatId !== "string" || !chatId) continue;
       if (![x, y, w, h, z].every(Number.isFinite)) continue;
       const layout = coerceCardLayout((item as any).layout);
+      const locked = typeof (item as any).locked === "boolean" ? (item as any).locked : undefined;
+      const collapsed =
+        typeof (item as any).collapsed === "boolean" ? (item as any).collapsed : undefined;
+      const groupColorRaw = (item as any).groupColor;
+      const groupColor =
+        typeof groupColorRaw === "string" && groupColorRaw.trim()
+          ? groupColorRaw.trim()
+          : undefined;
       out.push({
         chatId,
         x,
@@ -69,6 +78,9 @@ function loadPersistedNotes(): CanvasNote[] | null {
         h,
         z,
         title: (item as any).title,
+        locked,
+        collapsed,
+        groupColor,
         layout: layout ?? undefined,
       });
     }
@@ -86,10 +98,44 @@ function persistNotes(notes: CanvasNote[]) {
   }
 }
 
+function loadPersistedLinks(): CanvasLink[] | null {
+  try {
+    const raw = localStorage.getItem(LINKS_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const out: CanvasLink[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const id = (item as any).id;
+      const fromChatId = (item as any).fromChatId;
+      const toChatId = (item as any).toChatId;
+      const kind = (item as any).kind;
+      if (typeof id !== "string" || !id) continue;
+      if (typeof fromChatId !== "string" || !fromChatId) continue;
+      if (typeof toChatId !== "string" || !toChatId) continue;
+      if (kind !== "branch") continue;
+      out.push({ id, fromChatId, toChatId, kind });
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function persistLinks(links: CanvasLink[]) {
+  try {
+    localStorage.setItem(LINKS_STORAGE_KEY, JSON.stringify(links));
+  } catch {
+    // ignore
+  }
+}
+
 function App() {
   const { sessions, loading, reload, removeSession, addLocalChat } = useSessions();
   const [activeChat, setActiveChat] = useState<string | null>(null);
   const [notes, setNotes] = useState<CanvasNote[]>([]);
+  const [links, setLinks] = useState<CanvasLink[]>([]);
   const [overlayChatId, setOverlayChatId] = useState<string | null>(null);
   const [overlayCardId, setOverlayCardId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -170,11 +216,24 @@ function App() {
     }
   }, []);
 
+  useEffect(() => {
+    const restored = loadPersistedLinks();
+    if (restored && restored.length) {
+      setLinks(restored);
+    }
+  }, []);
+
   // Persist notes as they change (debounced).
   useEffect(() => {
     const t = window.setTimeout(() => persistNotes(notes), 250);
     return () => window.clearTimeout(t);
   }, [notes]);
+
+  // Persist links as they change (debounced).
+  useEffect(() => {
+    const t = window.setTimeout(() => persistLinks(links), 250);
+    return () => window.clearTimeout(t);
+  }, [links]);
 
   // Pick the first session automatically when loaded.
   useEffect(() => {
@@ -308,6 +367,16 @@ function App() {
     });
   }, [sessions, loading]);
 
+  // Drop links for chats that no longer exist.
+  useEffect(() => {
+    if (loading) return;
+    const sessionIds = new Set(sessions.map((s) => s.chat_id));
+    setLinks((prev) => {
+      const next = prev.filter((l) => sessionIds.has(l.fromChatId) && sessionIds.has(l.toChatId));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [sessions, loading]);
+
   async function deleteChat(chatId: string) {
     // Note: window.confirm/alert can be blocked in the Tauri WebView.
     // Use an inline two-click confirmation instead.
@@ -324,6 +393,7 @@ function App() {
       setActiveChat(remaining.length ? remaining[0].chat_id : null);
     }
     setNotes((prev) => prev.filter((n) => n.chatId !== chatId));
+    setLinks((prev) => prev.filter((l) => l.fromChatId !== chatId && l.toChatId !== chatId));
     setOverlayChatId((prev) => (prev === chatId ? null : prev));
 
     console.log("Deleting chat", chatId);
@@ -338,6 +408,65 @@ function App() {
 
     console.log("Deleted chat", chatId, res.data);
     // Ensure we converge to backend truth (also refreshes ordering).
+    await reload();
+  }
+
+  function collectChatTreeIds(rootChatId: string): string[] {
+    const childrenByParent = new Map<string, string[]>();
+    for (const l of links) {
+      if (l.kind !== "branch") continue;
+      const arr = childrenByParent.get(l.fromChatId) || [];
+      arr.push(l.toChatId);
+      childrenByParent.set(l.fromChatId, arr);
+    }
+    const out: string[] = [];
+    const stack = [rootChatId];
+    const seen = new Set<string>();
+    while (stack.length) {
+      const id = stack.pop();
+      if (!id) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+      const kids = childrenByParent.get(id);
+      if (kids && kids.length) stack.push(...kids);
+    }
+    // Delete children first, parent last.
+    return out.reverse();
+  }
+
+  async function deleteChatTree(rootChatId: string) {
+    if (!rootChatId) return;
+    const ids = collectChatTreeIds(rootChatId);
+    if (!ids.length) return;
+
+    setConfirmDeleteChatId(null);
+
+    // Optimistic UI update.
+    for (const id of ids) removeSession(id);
+
+    if (activeChat && ids.includes(activeChat)) {
+      const remaining = sessions.filter((s) => !ids.includes(s.chat_id));
+      setActiveChat(remaining.length ? remaining[0].chat_id : null);
+    }
+    setNotes((prev) => prev.filter((n) => !ids.includes(n.chatId)));
+    setLinks((prev) => prev.filter((l) => !ids.includes(l.fromChatId) && !ids.includes(l.toChatId)));
+    setOverlayChatId((prev) => (prev && ids.includes(prev) ? null : prev));
+    setOverlayCardId((prev) => (prev && ids.includes(prev) ? null : prev));
+
+    console.log("Deleting chat group", rootChatId, ids);
+    for (const id of ids) {
+      const local = sessions.find((s) => s.chat_id === id)?.local;
+      if (local) continue;
+      const res = await engine(`/chat/sessions/${encodeURIComponent(id)}`, undefined, "DELETE");
+      if (!res.ok) {
+        console.error("Delete group failed", id, res);
+        await reload();
+        return;
+      }
+    }
+
+    console.log("Deleted chat group", rootChatId);
     await reload();
   }
 
@@ -363,6 +492,66 @@ function App() {
     return id;
   }
 
+  // Branch/open a new child card (triggered from ChatWindow "Branch" action).
+  useEffect(() => {
+    function onOpenCard(e: Event) {
+      const ce = e as CustomEvent;
+      const childId = ce?.detail?.chatId;
+      const parentId = ce?.detail?.parentChatId;
+      const requestedTitle =
+        typeof ce?.detail?.title === "string" ? (ce.detail.title as string).trim() : "";
+      if (typeof childId !== "string" || !childId) return;
+
+      addLocalChat(childId);
+      setActiveChat(childId);
+
+      if (typeof parentId === "string" && parentId) {
+        const linkId = `branch:${parentId}:${childId}`;
+        setLinks((prev) => {
+          if (prev.some((l) => l.id === linkId)) return prev;
+          return [...prev, { id: linkId, fromChatId: parentId, toChatId: childId, kind: "branch" }];
+        });
+      }
+
+      setNotes((prev) => {
+        const existing = prev.find((n) => n.chatId === childId);
+        const nextZ = (prev.reduce((m, n) => Math.max(m, n.z), 0) || 0) + 1;
+        if (existing) {
+          return prev.map((n) => {
+            if (n.chatId !== childId) return n;
+            const hasTitle = typeof n.title === "string" && n.title.trim().length > 0;
+            const nextTitle = !hasTitle && requestedTitle ? requestedTitle : n.title;
+            return { ...n, z: nextZ, title: nextTitle };
+          });
+        }
+
+        const parent = typeof parentId === "string" ? prev.find((n) => n.chatId === parentId) : null;
+        const x = parent ? parent.x + Math.max(260, parent.w) + 40 : 80;
+        const y = parent ? parent.y + 20 : 80;
+
+        return [
+          ...prev,
+          {
+            chatId: childId,
+            x,
+            y,
+            w: 360,
+            h: 220,
+            z: nextZ,
+            title: requestedTitle || undefined,
+            layout: { ...DEFAULT_CARD_LAYOUT },
+          },
+        ];
+      });
+
+      // Auto-open the child card immediately.
+      setOverlayCardId(childId);
+      setOverlayChatId(null);
+    }
+    window.addEventListener("insight:open-card", onOpenCard as any);
+    return () => window.removeEventListener("insight:open-card", onOpenCard as any);
+  }, [addLocalChat]);
+
   return (
     <div className="app-root">
       <div className="shell">
@@ -371,6 +560,7 @@ function App() {
             sessions={sortedSessions}
             activeChatId={activeChat}
             notes={notes}
+            links={links}
             onFocusChat={focusChat}
             onUpdateNote={updateNote}
             onOpenChat={(chatId) => {
@@ -386,6 +576,7 @@ function App() {
             }}
             onOpenSettings={() => setSettingsOpen(true)}
             onDeleteChat={deleteChat}
+            onDeleteChatTree={deleteChatTree}
             confirmDeleteChatId={confirmDeleteChatId}
             loadingSessions={loading}
             dockVisible={!overlayCardId && !overlayChatId}

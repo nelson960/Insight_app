@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from backend.services.connectors.llama_session_manager import LlamaSessionManager
-from backend.services.docs import blocks_to_plain_text, prosemirror_doc_to_blocks
 from backend.services.retrieval.rag_store import RagStore
 from backend.services.memory.ltm_store import LongTermMemoryStore, MemoryHit
 from backend.services.ipc_events import emit_event
@@ -17,11 +16,16 @@ from backend.services.storage.sqlite_store import SQLiteMetadataStore
 
 logger = logging.getLogger(__name__)
 
-# Minimal inline-doc budgeting defaults (backend-owned; no config system yet).
-INLINE_DOC_FRACTION = 0.30
-INLINE_DOC_MAX_TOKENS = 1500
+# RAG budgeting defaults (backend-owned; no config system yet).
 RAG_CONTEXT_FRACTION = 0.30
 RAG_CONTEXT_MAX_TOKENS = 2400
+
+# Retrieval policy (UI-driven focus/scope).
+RAG_PRIMARY_K = 12
+RAG_PRIMARY_K_SELECTION = 6
+RAG_PRIMARY_K_SUMMARY = 16
+RAG_ALL_K_TOTAL = 14
+RAG_SECONDARY_K_TOTAL = 3
 # Output budgeting (dynamic; avoids hard-coded long generations).
 #
 # NOTE: The previous defaults (120 words → ~244 tokens) were frequently too small and
@@ -34,51 +38,9 @@ OUTPUT_TOKENS_PER_WORD = 2.0
 OUTPUT_TOKENS_BUFFER = 96
 
 
-def build_turn_prompt(
-    system_hint: str,
-    user_message: str,
-    ltm_hits: List[MemoryHit],
-    doc_texts: List[str],
-    *,
-    selection: Optional[Dict[str, Any]] = None,	
-    turn_index: int = 0,
-) -> str:
-    first_turn = turn_index == 0
-    mem_block = "\n".join(m.text for m in ltm_hits) if ltm_hits else ""
-    docs_block = "\n\n".join(doc_texts) if doc_texts else ""
-
-    # Note: `system_hint` is injected as a system message into the session manager.
-    # Do not duplicate it inside the per-turn user prompt.
-    parts: List[str] = []
-    if selection and isinstance(selection, dict):
-        sel_text = selection.get("text")
-        if isinstance(sel_text, str) and sel_text.strip():
-            sel_file = selection.get("filename") if isinstance(selection.get("filename"), str) else None
-            sel_page = selection.get("page") if isinstance(selection.get("page"), int) else None
-            header = "Selected Excerpt (highest priority):"
-            if sel_file and sel_page:
-                header = f"Selected Excerpt (highest priority) from {sel_file} page {sel_page}:"
-            elif sel_file:
-                header = f"Selected Excerpt (highest priority) from {sel_file}:"
-            elif sel_page:
-                header = f"Selected Excerpt (highest priority) page {sel_page}:"
-            # Prevent extremely large selections from polluting context.
-            sel_trimmed = sel_text.strip()
-            if len(sel_trimmed) > 5000:
-                sel_trimmed = sel_trimmed[:5000] + "…"
-            parts.append(f"{header}\n{sel_trimmed}")
-    parts.append(f"User Query:\n{user_message}" if first_turn else f"Follow-up Query:\n{user_message}")
-    if mem_block:
-        parts.append(f"Long-Term Memory:\n{mem_block}")
-    if doc_texts:
-        parts.append(f"Documents:\n{docs_block}")
-    return "\n\n".join(parts).strip()
-
-
 def build_context_pack(
     *,
     ltm_hits: List[MemoryHit],
-    doc_texts: List[str],
     rag_hits: List[Dict[str, Any]],
     selection: Optional[Dict[str, Any]] = None,
     effective_focus: Optional[str] = None,
@@ -105,8 +67,7 @@ def build_context_pack(
     else:
         # Optional override: allow the caller to define an explicit "document scope"
         # using safe, user-facing filenames (never internal IDs). This is useful for:
-        # - doc_scope_mode="all" turns (compare/multi-doc)
-        # - multi-upload compare turns where UI focus would otherwise "hide" scope
+        # - compare/multi-doc turns where UI focus would otherwise "hide" scope
         names_in_scope: List[str] = []
         if isinstance(scope_files, list) and scope_files:
             for raw in scope_files:
@@ -189,10 +150,9 @@ def build_context_pack(
         if mem_block.strip():
             parts.append(f"LONG-TERM MEMORY (relevant):\n{mem_block.strip()}")
 
-    if doc_texts:
-        docs_block = "\n\n".join(t for t in doc_texts if isinstance(t, str) and t.strip())
-        if docs_block.strip():
-            parts.append(f"INLINE DOCUMENT TEXT (truncated):\n{docs_block.strip()}")
+    # IMPORTANT: Strict RAG mode — never inject raw/extracted document blobs into the
+    # model-visible context pack. Documents should only enter the prompt via retrieved
+    # evidence chunks (Qdrant) or edited-doc lexical windows (doc_pages).
 
     if rag_hits:
         # Group evidence by *doc_id* to avoid mixing when filenames collide or are missing.
@@ -371,137 +331,131 @@ class InsightOrchestrator:
         return any(k in q for k in ("summarize", "summary", "tl;dr", "tldr"))
 
     @staticmethod
-    def _is_compare_request(user_message: str) -> bool:
-        q = (user_message or "").strip().lower()
-        if not q:
-            return False
-        if q in {"compare", "compare them", "compare both", "compare files", "compare documents"}:
-            return True
-        return any(k in q for k in ("compare", "contrast", "difference", "differences", "vs", "versus", "similarity"))
+    def _uniq_file_ids(values: List[Any]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for v in values or []:
+            if not isinstance(v, str):
+                continue
+            s = v.strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
 
-    def _apply_inline_doc_budget(self, chat_id: str, doc_texts: List[str]) -> List[str]:
-        if not doc_texts:
-            return []
-
-        # Session must exist so context status includes system prompt.
-        self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
-        try:
-            status = self.session_mgr.get_context_status(chat_id)
-            used = int(status.get("used_tokens") or 0)
-            capacity = int(status.get("capacity_tokens") or 0)
-        except Exception:
-            used = 0
-            capacity = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
-
-        remaining = max(0, capacity - used)
-        budget = min(int(remaining * INLINE_DOC_FRACTION), INLINE_DOC_MAX_TOKENS)
-        if budget <= 0:
-            logger.info("Inline docs omitted (no budget) chat=%s used=%d cap=%d", chat_id, used, capacity)
-            return []
-
-        approx_doc_tokens = sum(self._approx_token_count(t) for t in doc_texts if t)
-        if approx_doc_tokens <= budget:
-            return doc_texts
-        # IMPORTANT: if the attachment is too large to inline, we do NOT include
-        # a partial prefix in the prompt (it’s often irrelevant). We fall back
-        # to RAG retrieval instead.
-        logger.info(
-            "Inline docs skipped (too large) chat=%s approx_doc_tokens=%d budget_tokens=%d used=%d cap=%d",
-            chat_id,
-            approx_doc_tokens,
-            budget,
-            used,
-            capacity,
-        )
-        return []
-
-    def _apply_inline_doc_budget_partial(self, chat_id: str, text: str) -> str:
-        """
-        Like `_apply_inline_doc_budget`, but returns a truncated prefix instead of dropping the doc.
-
-        This is used for summary-style queries where vector search is not meaningful
-        (e.g. user asks just "brief"), so we must provide some sequential doc text.
-        """
-        if not text:
-            return ""
-
-        self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
-        try:
-            status = self.session_mgr.get_context_status(chat_id)
-            used = int(status.get("used_tokens") or 0)
-            capacity = int(status.get("capacity_tokens") or 0)
-        except Exception:
-            used = 0
-            capacity = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
-
-        remaining = max(0, capacity - used)
-        budget = min(int(remaining * INLINE_DOC_FRACTION), INLINE_DOC_MAX_TOKENS)
-        if budget <= 0:
-            return ""
-        budget_chars = max(0, budget * 4)
-        if len(text) <= budget_chars:
-            return text
-        return text[:budget_chars]
-
-    def _resolve_focus_for_turn(
+    def _resolve_scope_for_turn(
         self,
         chat_id: str,
         *,
         documents: List[str],
         focus_document_id: Optional[str],
-        doc_scope_mode: Optional[str] = None,
+        doc_pane_open: Optional[bool],
         selection: Optional[Dict[str, Any]],
-    ) -> Optional[str]:
+    ) -> Dict[str, Any]:
         """
-        Resolve the "effective" focused file for this turn.
+        Resolve the retrieval plan for this turn based on UI state.
 
-        Priority:
-          1) explicit selection.file_id
-          2) explicit focus_document_id from UI
-          3) last document id in the request payload (upload/attach turn)
-          4) last file registered for this chat (SQLite)
+        Rules (high level):
+        - Selection from docs (selection.file_id): hard-focus that file only.
+        - Chat pane only + multi-upload in this turn: scope=all across uploaded docs (equal priority).
+        - Otherwise: scope=focused with a primary focus file, plus a small secondary budget across other files.
         """
+        turn_doc_ids = self._uniq_file_ids(documents or [])
+
+        # Infer doc pane visibility if the UI didn't send it yet.
+        doc_pane_open_bool = bool(doc_pane_open) if doc_pane_open is not None else bool(focus_document_id)
+
+        chat_doc_ids = self._uniq_file_ids(self._chat_file_ids(chat_id))
+        for fid in turn_doc_ids:
+            if fid not in chat_doc_ids:
+                chat_doc_ids.append(fid)
+
+        latest_doc_id: Optional[str] = None
+        if turn_doc_ids:
+            latest_doc_id = turn_doc_ids[-1]
+        elif chat_doc_ids:
+            latest_doc_id = chat_doc_ids[-1]
+
         sel_file_id = (
             selection.get("file_id")
             if isinstance(selection, dict) and isinstance(selection.get("file_id"), str)
             else None
         )
         if isinstance(sel_file_id, str) and sel_file_id:
-            return sel_file_id
+            return {
+                "doc_pane_open": doc_pane_open_bool,
+                "scope": "focused",
+                "focus": sel_file_id,
+                "scope_doc_ids": [],
+                "secondary_doc_ids": [],
+                "chat_doc_ids": chat_doc_ids,
+                "latest_doc_id": latest_doc_id,
+            }
 
-        # If the UI explicitly requests "all documents" scope, do not invent a focus.
-        # This enables compare-style retrieval across every file in the chat.
-        if isinstance(doc_scope_mode, str) and doc_scope_mode.strip().lower() == "all":
-            return None
+        # If the user uploaded document(s) in *this* turn, always prioritize the new upload(s)
+        # even if the docs pane is open and still focused on an older file at send-time.
+        #
+        # - Single upload: focus that new file.
+        # - Multi-upload: scope=all across the uploaded files for this turn.
+        if turn_doc_ids:
+            if len(turn_doc_ids) > 1:
+                return {
+                    "doc_pane_open": doc_pane_open_bool,
+                    "scope": "all",
+                    "focus": None,
+                    "scope_doc_ids": turn_doc_ids,
+                    "secondary_doc_ids": [],
+                    "chat_doc_ids": chat_doc_ids,
+                    "latest_doc_id": latest_doc_id,
+                }
 
-        attached_docs = [fid for fid in (documents or []) if isinstance(fid, str) and fid]
-        if isinstance(focus_document_id, str) and focus_document_id:
-            # Upload/attach turns include `documents`. If the UI sent a stale focus id
-            # (not in this request's document list), prefer the most recently attached
-            # doc so "upload → ask" matches the documents pane selection.
-            if not attached_docs:
-                return focus_document_id
-            if focus_document_id in attached_docs:
-                return focus_document_id
-            return attached_docs[-1]
+            focus = turn_doc_ids[-1]
+            secondary_doc_ids = [fid for fid in chat_doc_ids if fid != focus]
+            return {
+                "doc_pane_open": doc_pane_open_bool,
+                "scope": "focused",
+                "focus": focus,
+                "scope_doc_ids": [],
+                "secondary_doc_ids": secondary_doc_ids,
+                "chat_doc_ids": chat_doc_ids,
+                "latest_doc_id": latest_doc_id,
+            }
 
-        # If the request included documents (e.g. upload+chat), default to the most recent
-        # doc in that list so "upload → ask" works without extra UI wiring.
-        if attached_docs:
-            return attached_docs[-1]
+        # Multi-upload in the chat pane: treat all uploaded files equally.
+        if (not doc_pane_open_bool) and len(turn_doc_ids) > 1:
+            return {
+                "doc_pane_open": doc_pane_open_bool,
+                "scope": "all",
+                "focus": None,
+                "scope_doc_ids": turn_doc_ids,
+                "secondary_doc_ids": [],
+                "chat_doc_ids": chat_doc_ids,
+                "latest_doc_id": latest_doc_id,
+            }
 
-        # Fallback: when the frontend doesn't send focus_document_id, use the most recently
-        # registered file for this chat so we don't accidentally keep answering from the
-        # first uploaded doc forever.
-        try:
-            if hasattr(self.metadata_store, "latest_file_id_for_chat"):
-                fid = self.metadata_store.latest_file_id_for_chat(chat_id)  # type: ignore[attr-defined]
-                if isinstance(fid, str) and fid:
-                    return fid
-        except Exception:
-            return None
+        # Default: focused mode with a primary focus file.
+        focus: Optional[str] = None
+        if doc_pane_open_bool and isinstance(focus_document_id, str) and focus_document_id.strip():
+            cand = focus_document_id.strip()
+            if cand in chat_doc_ids or cand in turn_doc_ids:
+                focus = cand
+        if not focus:
+            focus = latest_doc_id
 
-        return None
+        secondary_doc_ids: List[str] = []
+        if focus:
+            secondary_doc_ids = [fid for fid in chat_doc_ids if fid != focus]
+
+        return {
+            "doc_pane_open": doc_pane_open_bool,
+            "scope": "focused",
+            "focus": focus,
+            "scope_doc_ids": [],
+            "secondary_doc_ids": secondary_doc_ids,
+            "chat_doc_ids": chat_doc_ids,
+            "latest_doc_id": latest_doc_id,
+        }
 
     def _chat_file_ids(self, chat_id: str) -> List[str]:
         try:
@@ -513,7 +467,7 @@ class InsightOrchestrator:
             fid = r.get("id") if isinstance(r, dict) else None
             if isinstance(fid, str) and fid:
                 out.append(fid)
-        return out
+        return self._uniq_file_ids(out)
 
     @staticmethod
     def _rebalance_hits_by_file(rag_hits: List[Dict[str, Any]], *, max_hits: int) -> List[Dict[str, Any]]:
@@ -547,393 +501,6 @@ class InsightOrchestrator:
                     break
             if not progressed:
                 break
-        return out
-
-    def _is_user_edited_doc(self, chat_id: str, file_id: str) -> bool:
-        if not isinstance(chat_id, str) or not chat_id:
-            return False
-        if not isinstance(file_id, str) or not file_id:
-            return False
-        try:
-            row = self.metadata_store.get_doc_page(chat_id, file_id)
-            return bool(row.get("is_user_edited")) if row else False
-        except Exception:
-            return False
-
-    def _fetch_focus_doc_text(self, chat_id: str, file_id: str) -> str:
-        """
-        Best-effort: get canonical extracted text for a single file.
-        """
-        if not isinstance(file_id, str) or not file_id:
-            return ""
-        # If the user edited the doc page, treat the editor content as canonical for this file.
-        try:
-            doc_page = self.metadata_store.get_doc_page(chat_id, file_id)
-            if doc_page and bool(doc_page.get("is_user_edited")):
-                doc = doc_page.get("doc")
-                if isinstance(doc, dict):
-                    blocks = prosemirror_doc_to_blocks(doc)
-                    text = blocks_to_plain_text(blocks)
-                    if isinstance(text, str) and text.strip():
-                        return text
-        except Exception:
-            pass
-        try:
-            row = self.metadata_store.get_file_text(file_id)
-            if row and isinstance(row.get("plain_text"), str):
-                return row.get("plain_text") or ""
-        except Exception:
-            pass
-        # Fallback: stitch chunk texts if file_text isn't available.
-        try:
-            if hasattr(self.metadata_store, "fetch_chunk_texts_for_file"):
-                texts = self.metadata_store.fetch_chunk_texts_for_file(file_id, limit=None)
-                return "\n\n".join(t for t in texts if isinstance(t, str) and t.strip())
-        except Exception:
-            pass
-        return ""
-
-    def _edited_doc_evidence(self, chat_id: str, file_id: str, query: str, *, max_windows: int = 6) -> List[Dict[str, Any]]:
-        """
-        Retrieve "chunk-like" evidence from an edited doc page without embeddings.
-
-        We score blocks by literal overlap with the user query, then return small block windows
-        (block + neighbors) in document order. This avoids mixing stale Qdrant chunks with the
-        user-edited doc content.
-        """
-        if not isinstance(chat_id, str) or not chat_id:
-            return []
-        if not isinstance(file_id, str) or not file_id:
-            return []
-        q = (query or "").strip()
-        if not q:
-            return []
-        try:
-            doc_page = self.metadata_store.get_doc_page(chat_id, file_id)
-        except Exception:
-            doc_page = None
-        if not doc_page or not bool(doc_page.get("is_user_edited")):
-            return []
-        doc = doc_page.get("doc")
-        if not isinstance(doc, dict):
-            return []
-
-        filename: Optional[str] = None
-        try:
-            rec = self.metadata_store.get_file(file_id)
-            name = rec.get("filename") if isinstance(rec, dict) else None
-            if isinstance(name, str) and name.strip():
-                filename = name
-        except Exception:
-            filename = None
-
-        blocks_raw = prosemirror_doc_to_blocks(doc)
-        blocks: List[Dict[str, Any]] = []
-        for b in blocks_raw:
-            if not isinstance(b, dict):
-                continue
-            text = b.get("text")
-            if not isinstance(text, str) or not text.strip():
-                continue
-            blocks.append(b)
-        if not blocks:
-            return []
-
-        phrase = q.casefold()
-        # Keep this cheap: use only word-like tokens of length >= 3.
-        terms = [t for t in re.findall(r"[a-z0-9_]{3,}", phrase) if t]
-        terms = terms[:12]
-
-        scored: List[tuple[int, float]] = []
-        for i, b in enumerate(blocks):
-            text = (b.get("text") or "")
-            text_ci = text.casefold()
-            score = 0.0
-            if phrase and phrase in text_ci:
-                score += 10.0
-            for t in terms:
-                if t in text_ci:
-                    # Cheap frequency-ish score.
-                    score += float(text_ci.count(t))
-            if score > 0:
-                scored.append((i, score))
-        if not scored:
-            return []
-
-        scored.sort(key=lambda x: (-x[1], x[0]))
-        picked: List[int] = []
-        for idx, _score in scored:
-            # Avoid picking blocks that are immediately adjacent to already picked ones;
-            # we merge them via windows anyway.
-            if any(abs(idx - p) <= 1 for p in picked):
-                continue
-            picked.append(idx)
-            if len(picked) >= max_windows:
-                break
-
-        if not picked:
-            return []
-
-        # Build windows (block + neighbors) and merge overlaps.
-        windows: List[tuple[int, int]] = []
-        for idx in sorted(picked):
-            start = max(0, idx - 1)
-            end = min(len(blocks) - 1, idx + 1)
-            windows.append((start, end))
-
-        merged: List[tuple[int, int]] = []
-        for start, end in sorted(windows):
-            if not merged:
-                merged.append((start, end))
-                continue
-            last_s, last_e = merged[-1]
-            if start <= last_e + 1:
-                merged[-1] = (last_s, max(last_e, end))
-            else:
-                merged.append((start, end))
-
-        evidence: List[Dict[str, Any]] = []
-        for start, end in merged:
-            lines: List[str] = []
-            pages: List[int] = []
-            for b in blocks[start : end + 1]:
-                kind = str(b.get("kind") or "paragraph")
-                text = str(b.get("text") or "").strip()
-                meta = b.get("metadata") if isinstance(b.get("metadata"), dict) else {}
-                page = meta.get("page")
-                if isinstance(page, int):
-                    pages.append(page)
-                if kind == "heading":
-                    level = meta.get("level", 2)
-                    try:
-                        level = int(level)
-                    except Exception:
-                        level = 2
-                    level = max(1, min(level, 6))
-                    lines.append(f"{'#' * level} {text}")
-                elif kind == "list" and isinstance(meta.get("items"), list):
-                    items = [str(x).strip() for x in meta.get("items") if str(x).strip()]
-                    if items:
-                        lines.extend([f"- {it}" for it in items])
-                    else:
-                        lines.append(text)
-                elif kind == "code":
-                    lines.append("```")
-                    lines.append(text)
-                    lines.append("```")
-                else:
-                    lines.append(text)
-                lines.append("")
-            excerpt = "\n".join(lines).strip()
-            if not excerpt:
-                continue
-            page = min(pages) if pages else None
-            evidence.append(
-                {
-                    "doc_id": file_id,
-                    "chunk_id": f"doc_page:{start}-{end}",
-                    "score": 1.0,
-                    "text": excerpt,
-                    "filename": filename,
-                    "page": page,
-                }
-            )
-
-        return evidence
-
-    def _build_upload_doc_evidence(
-        self,
-        *,
-        chat_id: str,
-        query: str,
-        doc_ids: List[str],
-        documents_text: List[str],
-        attachments: List[str],
-    ) -> List[Dict[str, Any]]:
-        """
-        Build cheap, deterministic per-file evidence windows from `documents_text`.
-
-        This is used for upload/attach turns so the model can answer immediately,
-        even before embeddings are available in Qdrant.
-
-        IMPORTANT: Never embed internal IDs into the *text* we send to the model.
-        We keep `doc_id/chunk_id` only as internal metadata for dedupe/debug.
-        """
-        if not doc_ids or not isinstance(doc_ids, list):
-            return []
-        if not isinstance(query, str) or not query.strip():
-            return []
-
-        # Preserve index alignment: documents_text and attachments are "best effort".
-        # (Callers sometimes omit empty extracted text entries.)
-        docs_count = len(doc_ids)
-        if docs_count <= 0:
-            return []
-
-        # Heuristic: cap total upload evidence so we don't crowd out RAG evidence.
-        # (~1200 tokens ~= 4800 chars; per-file budget scales with file count.)
-        total_chars_budget = 4800
-        per_file_chars_budget = max(900, min(2400, total_chars_budget // max(1, docs_count)))
-
-        phrase = query.casefold()
-        # Keep this cheap: use only word-like tokens of length >= 3.
-        terms = [t for t in re.findall(r"[a-z0-9_]{3,}", phrase) if t]
-        # Avoid pathological queries (long pasted text) from exploding work.
-        terms = terms[:16]
-
-        def _split_blocks(text: str) -> List[str]:
-            # Prefer paragraph-ish blocks; keep page markers inside the excerpt text.
-            return [b.strip() for b in re.split(r"\n\s*\n+", text or "") if b and b.strip()]
-
-        def _score_block(block: str) -> float:
-            blk = (block or "").casefold()
-            if not blk:
-                return 0.0
-            score = 0.0
-            if phrase and phrase in blk:
-                score += 10.0
-            for t in terms:
-                if t in blk:
-                    score += float(blk.count(t))
-            return score
-
-        def _pick_windows(blocks: List[str], *, desired: int) -> List[tuple[int, int]]:
-            if not blocks or desired <= 0:
-                return []
-
-            scored: List[tuple[int, float]] = []
-            for i, b in enumerate(blocks):
-                s = _score_block(b)
-                if s > 0:
-                    scored.append((i, s))
-            scored.sort(key=lambda x: (-x[1], x[0]))
-
-            picked: List[int] = []
-            if scored:
-                for idx, _s in scored:
-                    if any(abs(idx - p) <= 1 for p in picked):
-                        continue
-                    picked.append(idx)
-                    if len(picked) >= desired:
-                        break
-            else:
-                # Fallback (e.g. "compare these") when no lexical hits exist:
-                # pick representative positions across the document.
-                candidates = [0]
-                if desired >= 2:
-                    candidates.append(len(blocks) // 2)
-                if desired >= 3:
-                    candidates.append(max(0, len(blocks) - 1))
-                for idx in candidates:
-                    if idx < 0 or idx >= len(blocks):
-                        continue
-                    if any(abs(idx - p) <= 1 for p in picked):
-                        continue
-                    picked.append(idx)
-
-            if not picked:
-                return []
-
-            windows: List[tuple[int, int]] = []
-            for idx in sorted(picked):
-                start = max(0, idx - 1)
-                end = min(len(blocks) - 1, idx + 1)
-                windows.append((start, end))
-
-            merged: List[tuple[int, int]] = []
-            for start, end in windows:
-                if not merged:
-                    merged.append((start, end))
-                    continue
-                last_s, last_e = merged[-1]
-                if start <= last_e + 1:
-                    merged[-1] = (last_s, max(last_e, end))
-                else:
-                    merged.append((start, end))
-            return merged
-
-        evidence: List[Dict[str, Any]] = []
-        for i, doc_id in enumerate(doc_ids):
-            if not isinstance(doc_id, str) or not doc_id:
-                continue
-            text = documents_text[i] if i < len(documents_text) and isinstance(documents_text[i], str) else ""
-            if not text.strip():
-                continue
-
-            filename = attachments[i] if i < len(attachments) and isinstance(attachments[i], str) else None
-            if not filename:
-                try:
-                    rec = self.metadata_store.get_file(doc_id)
-                    name = rec.get("filename") if isinstance(rec, dict) else None
-                    if isinstance(name, str) and name.strip():
-                        filename = name.strip()
-                except Exception:
-                    filename = None
-
-            approx_tokens = self._approx_token_count(text)
-            if approx_tokens < 600:
-                desired_windows = 1
-            elif approx_tokens < 2400:
-                desired_windows = 2
-            else:
-                desired_windows = 3
-
-            blocks = _split_blocks(text)
-            if not blocks:
-                continue
-
-            # Cap windows based on per-file budget.
-            max_windows_by_budget = max(1, min(3, per_file_chars_budget // 800))
-            desired_windows = max(1, min(desired_windows, max_windows_by_budget))
-            windows = _pick_windows(blocks, desired=desired_windows)
-            if not windows:
-                continue
-
-            per_window_budget = max(320, per_file_chars_budget // max(1, len(windows)))
-            for w_i, (start, end) in enumerate(windows):
-                excerpt = "\n\n".join(blocks[start : end + 1]).strip()
-                if not excerpt:
-                    continue
-                if len(excerpt) > per_window_budget:
-                    excerpt = excerpt[:per_window_budget].rstrip() + "…"
-                evidence.append(
-                    {
-                        "doc_id": doc_id,
-                        "chunk_id": f"upload_window:{doc_id}:{i}:{w_i}:{start}-{end}",
-                        "score": 1.0,
-                        "text": excerpt,
-                        "filename": filename,
-                        "page": None,
-                        "source": "upload",
-                    }
-                )
-
-        return evidence
-
-    def _doc_fallback_preview(self, chat_id: str, text: str, *, max_chars: int = 4000) -> str:
-        """
-        Small, safe excerpt used when focused RAG returns no hits.
-
-        Keeps the UI/chat responsive for queries like "brief" where embeddings may not
-        retrieve anything meaningful, while still avoiding prompt pollution.
-        """
-        if not text:
-            return ""
-        trimmed = self._apply_inline_doc_budget_partial(chat_id, text)
-        if max_chars > 0 and len(trimmed) > max_chars:
-            return trimmed[:max_chars]
-        return trimmed
-
-    def _list_chat_file_ids(self, chat_id: str) -> List[str]:
-        try:
-            rows = self.metadata_store.list_files_for_chat(chat_id)
-        except Exception:
-            return []
-        out: List[str] = []
-        for r in rows:
-            fid = r.get("id")
-            if isinstance(fid, str) and fid:
-                out.append(fid)
         return out
 
     def _apply_rag_budget(self, chat_id: str, rag_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1131,385 +698,33 @@ class InsightOrchestrator:
         chat_id: str,
         user_message: str,
         documents: Optional[List[str]] = None,
-        documents_text: Optional[List[str]] = None,
         attachments: Optional[List[str]] = None,
         focus_document_id: Optional[str] = None,
-        doc_scope_mode: Optional[str] = None,
+        doc_pane_open: Optional[bool] = None,
         selection: Optional[Dict[str, Any]] = None,
     ) -> str:
-        start = time.perf_counter()
-        documents = documents or []
-        # Keep index alignment with `documents` and `attachments` (upload turns rely on it).
-        # Do NOT drop empty entries here; callers sometimes omit empty extracted text entries.
-        documents_text = [t if isinstance(t, str) else "" for t in (documents_text or [])]
-        attachments = attachments or []
-        if len(documents_text) < len(documents):
-            documents_text = documents_text + [""] * (len(documents) - len(documents_text))
-        elif len(documents_text) > len(documents):
-            documents_text = documents_text[: len(documents)]
-        if len(attachments) < len(documents):
-            attachments = attachments + [""] * (len(documents) - len(attachments))
-        elif len(attachments) > len(documents):
-            attachments = attachments[: len(documents)]
-        # Best-effort: fill missing attachment names from metadata store to keep labels stable.
-        # (The UI sometimes omits/shortens attachment arrays across turn types.)
-        if documents and attachments:
-            for i, fid in enumerate(documents):
-                if i >= len(attachments):
-                    break
-                if isinstance(attachments[i], str) and attachments[i].strip():
-                    continue
-                if not isinstance(fid, str) or not fid:
-                    continue
-                try:
-                    rec = self.metadata_store.get_file(fid)
-                    name = rec.get("filename") if isinstance(rec, dict) else None
-                    if isinstance(name, str) and name.strip():
-                        attachments[i] = name.strip()
-                except Exception:
-                    continue
-        analysis = self._analyze_query(user_message, has_docs=bool(documents or documents_text))
-        max_tokens = self._compute_output_max_tokens(analysis)
-        summary_request = self._is_summary_request(user_message)
-        compare_request = self._is_compare_request(user_message)
-        # Ensure deterministic session per chat_id (required even when no docs are attached).
-        self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
-
-        ltm_k = 2 if selection else 5
-        ltm_hits = self.ltm_store.retrieve(chat_id, user_message, top_k=ltm_k)
-        sel_file_id = selection.get("file_id") if isinstance(selection, dict) and isinstance(selection.get("file_id"), str) else None
-        effective_focus = self._resolve_focus_for_turn(
-            chat_id,
+        tokens: List[str] = []
+        for tok in self.handle_message_stream(
+            chat_id=chat_id,
+            user_message=user_message,
             documents=documents,
+            attachments=attachments,
             focus_document_id=focus_document_id,
-            doc_scope_mode=doc_scope_mode,
+            doc_pane_open=doc_pane_open,
             selection=selection,
-        )
-        scope_mode = (doc_scope_mode or "").strip().lower()
-        # Selection always hard-focuses, regardless of UI scope mode.
-        if sel_file_id:
-            scope_mode = "focused"
-        if scope_mode not in {"focused", "all"}:
-            scope_mode = "focused"
-        # Compare queries should consider multiple documents even if the UI is currently focused.
-        if compare_request and not sel_file_id and scope_mode == "focused":
-            try:
-                existing = self._chat_file_ids(chat_id)
-            except Exception:
-                existing = []
-            if len(documents) > 1 or len(set(existing or [])) >= 2:
-                scope_mode = "all"
-        logger.debug(
-            "Planner turn chat=%s summary=%s scope=%s focus=%s docs_payload=%d docs_text=%d attachments=%d",
-            chat_id,
-            summary_request,
-            scope_mode,
-            effective_focus,
-            len(documents),
-            len(documents_text),
-            len(attachments),
-        )
-
-        focus_user_edited = bool(effective_focus and self._is_user_edited_doc(chat_id, effective_focus))
-        effective_focus_name: Optional[str] = None
-        if effective_focus:
-            try:
-                rec = self.metadata_store.get_file(effective_focus)
-                name = rec.get("filename") if isinstance(rec, dict) else None
-                if isinstance(name, str) and name.strip():
-                    effective_focus_name = name.strip()
-            except Exception:
-                effective_focus_name = None
-
-        upload_has_text = bool(any(isinstance(t, str) and t.strip() for t in documents_text))
-        # Multi-doc uploads should never inline full doc blobs; use per-file windows + RAG.
-        upload_multi = bool(len(documents) > 1 and upload_has_text)
-        upload_evidence: List[Dict[str, Any]] = []
-
-        chat_doc_ids: List[str] = []
-
-        # Inline docs are reserved for summary-style queries and small fallback previews.
-        # IMPORTANT: if the focused file is user-edited, do not inline cached chunk text
-        # (it may not match the edited doc page). We’ll pull evidence from doc_pages instead.
-        if focus_user_edited or upload_multi:
-            doc_texts = []
-        elif documents_text:
-            doc_texts = [t for t in documents_text if isinstance(t, str) and t.strip()]
-        elif effective_focus:
-            doc_texts = self._fetch_doc_texts([effective_focus])
-        else:
-            doc_texts = self._fetch_doc_texts(documents)
-        doc_texts = self._apply_inline_doc_budget(chat_id, doc_texts)
-
-        # Summary-style queries (e.g. "brief") should not rely on vector search;
-        # they need sequential doc text for the focused document.
-        if summary_request and effective_focus:
-            focus_text = self._fetch_focus_doc_text(chat_id, effective_focus) if focus_user_edited else ""
-            if documents and documents_text:
-                try:
-                    idx = documents.index(effective_focus)
-                    focus_text = documents_text[idx] if idx < len(documents_text) else ""
-                except ValueError:
-                    focus_text = ""
-            if not focus_text:
-                focus_text = self._fetch_focus_doc_text(chat_id, effective_focus)
-            focus_text = self._apply_inline_doc_budget_partial(chat_id, focus_text)
-            doc_texts = [focus_text] if focus_text.strip() else []
-            rag_hits_raw = []
-        elif doc_texts:
-            rag_hits_raw = []
-        else:
-            primary_k = 4 if selection else 6
-            # If documents were attached for this turn (upload/attach), build cheap evidence
-            # windows from the extracted text so "upload → ask" works even before Qdrant is ready.
-            if documents and upload_has_text:
-                upload_evidence = self._build_upload_doc_evidence(
-                    chat_id=chat_id,
-                    query=user_message,
-                    doc_ids=documents,
-                    documents_text=documents_text,
-                    attachments=attachments,
-                )
-            rag_hits_raw = list(upload_evidence)
-            chat_doc_ids = self._chat_file_ids(chat_id) or [d for d in documents if isinstance(d, str) and d]
-
-            if effective_focus and scope_mode == "focused":
-                # Focus-biased retrieval: primary from the focused doc, with a small allowance
-                # for other docs in the same chat (lower priority).
-                if self._is_user_edited_doc(chat_id, effective_focus):
-                    rag_hits_raw.extend(
-                        self._edited_doc_evidence(chat_id, effective_focus, user_message, max_windows=primary_k)
-                    )
-                    logger.info("Focused doc is user-edited; skipping Qdrant for file_id=%s chat=%s", effective_focus, chat_id)
-                else:
-                    rag_hits_raw.extend(
-                        self.rag_store.retrieve(
-                            user_message,
-                            chat_id=chat_id,
-                            doc_ids=[effective_focus],
-                            top_k=primary_k,
-                        )
-                    )
-
-                other_doc_ids = [fid for fid in chat_doc_ids if fid != effective_focus]
-                secondary_k = 2 if selection else 3
-                if other_doc_ids and secondary_k > 0:
-                    rag_hits_raw.extend(
-                        self.rag_store.retrieve(
-                            user_message,
-                            chat_id=chat_id,
-                            doc_ids=other_doc_ids,
-                            top_k=secondary_k,
-                        )
-                    )
-            elif scope_mode == "all" and chat_doc_ids:
-                # Compare-style retrieval: ensure every file contributes evidence.
-                #
-                # A global "top-k across all docs" search can easily bias to a single file,
-                # especially for vague queries like "compare". For small doc sets, do a
-                # per-file retrieval pass so the model always sees at least some content
-                # from each file.
-                doc_ids_in_scope: List[str] = []
-                seen_docs = set()
-                for fid in chat_doc_ids:
-                    if isinstance(fid, str) and fid and fid not in seen_docs:
-                        seen_docs.add(fid)
-                        doc_ids_in_scope.append(fid)
-                if not doc_ids_in_scope:
-                    doc_ids_in_scope = chat_doc_ids
-
-                max_docs_for_per_file = 6
-                if len(doc_ids_in_scope) <= max_docs_for_per_file:
-                    q_vec = self.rag_store.embed(user_message)
-                    per_doc_k = max(1, (primary_k + len(doc_ids_in_scope) - 1) // max(1, len(doc_ids_in_scope)))
-                    for fid in doc_ids_in_scope:
-                        if self._is_user_edited_doc(chat_id, fid):
-                            rag_hits_raw.extend(self._edited_doc_evidence(chat_id, fid, user_message, max_windows=per_doc_k))
-                        elif q_vec is not None:
-                            rag_hits_raw.extend(
-                                self.rag_store.retrieve_with_vector(
-                                    q_vec,
-                                    chat_id=chat_id,
-                                    doc_ids=[fid],
-                                    top_k=per_doc_k,
-                                )
-                            )
-                        else:
-                            rag_hits_raw.extend(
-                                self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=[fid], top_k=per_doc_k)
-                            )
-                else:
-                    # Fallback: pull a larger pool across the whole chat, then rebalance so
-                    # multiple documents contribute evidence.
-                    k_total = primary_k
-                    pool_k = min(24, max(k_total, k_total * max(1, len(doc_ids_in_scope))))
-                    pool = self.rag_store.retrieve(
-                        user_message,
-                        chat_id=chat_id,
-                        doc_ids=doc_ids_in_scope,
-                        top_k=pool_k,
-                    )
-                    rag_hits_raw.extend(self._rebalance_hits_by_file(pool, max_hits=k_total))
-            elif documents:
-                rag_hits_raw.extend(
-                    self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=documents, top_k=primary_k)
-                )
-            else:
-                rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k))
-        selected_rag = self._dedup_rag(rag_hits_raw)
-        # IMPORTANT: when multiple files contribute evidence (multi-upload turns or
-        # doc_scope_mode="all"), interleave hits across files so budgeting/truncation
-        # can't drop an entire document from the model-visible context pack.
-        if selected_rag and (upload_multi or scope_mode == "all"):
-            selected_rag = self._rebalance_hits_by_file(selected_rag, max_hits=len(selected_rag))
-        if selected_rag and (upload_multi or scope_mode == "all"):
-            file_order = documents if upload_multi else chat_doc_ids
-            selected_rag = self._apply_rag_budget_balanced(chat_id, selected_rag, file_order=file_order)
-        else:
-            selected_rag = self._apply_rag_budget(chat_id, selected_rag)
-        if selected_rag and (upload_multi or scope_mode == "all"):
-            try:
-                mix: Dict[str, Dict[str, int]] = {}
-                for h in selected_rag:
-                    name = h.get("filename") if isinstance(h.get("filename"), str) and h.get("filename") else "unknown"
-                    mix.setdefault(name, {"hits": 0, "chars": 0})
-                    mix[name]["hits"] += 1
-                    txt = h.get("text")
-                    if isinstance(txt, str):
-                        mix[name]["chars"] += len(txt)
-                logger.debug("RAG mix chat=%s scope=%s files=%s", chat_id, scope_mode, mix)
-            except Exception:
-                pass
-        if scope_mode == "focused" and effective_focus and not doc_texts and not selected_rag:
-            # Focused retrieval yielded nothing; fall back to a small sequential excerpt.
-            preview = self._doc_fallback_preview(chat_id, self._fetch_focus_doc_text(chat_id, effective_focus))
-            if preview.strip():
-                doc_texts = [preview]
-        has_selection_text = bool(
-            isinstance(selection, dict)
-            and isinstance(selection.get("text"), str)
-            and str(selection.get("text")).strip()
-        )
-
-        scope_files: Optional[List[str]] = None
-        if not sel_file_id:
-            # For multi-doc compare turns (including multi-upload), explicitly list filenames
-            # in SCOPE so the model doesn't treat the turn as "focused only".
-            if compare_request and upload_multi:
-                scope_files = [a for a in attachments if isinstance(a, str) and a.strip()]
-            elif scope_mode == "all" or (compare_request and scope_mode == "focused"):
-                try:
-                    rows = self.metadata_store.list_files_for_chat(chat_id)
-                except Exception:
-                    rows = []
-                scope_files = []
-                for r in rows or []:
-                    name = r.get("filename") if isinstance(r, dict) else None
-                    if not isinstance(name, str):
-                        continue
-                    name = name.strip()
-                    if not name:
-                        continue
-                    scope_files.append(name)
-                    if len(scope_files) >= 12:
-                        break
-                if not scope_files:
-                    scope_files = None
-
-        context_pack = build_context_pack(
-            ltm_hits=ltm_hits,
-            doc_texts=doc_texts,
-            rag_hits=selected_rag,
-            selection=selection,
-            effective_focus=effective_focus,
-            effective_focus_name=effective_focus_name,
-            scope_files=scope_files,
-            include_selection_excerpt=not has_selection_text,
-        )
-        if (upload_multi or scope_mode == "all") and compare_request:
-            context_pack = (
-                "TASK:\n"
-                "- Compare the documents listed in SCOPE.\n"
-                "- Keep document evidence separate; do not blend details across files.\n"
-                "- Only claim similarities if supported by BOTH documents.\n"
-                "- For anything not supported by the evidence, say you can't tell.\n"
-                "- Avoid speculation/marketing; keep it grounded to the excerpts.\n\n"
-                + (context_pack or "")
-            ).strip()
-        if summary_request and effective_focus:
-            context_pack = (
-                "TASK:\n- Summarize the focused document briefly.\n"
-                "- Use only the provided document text/evidence.\n\n"
-                + (context_pack or "")
-            ).strip()
-
-        # Persist clean UI user message (not the giant turn_prompt).
-        try:
-            self._persist_ui_message(
-                chat_id=chat_id,
-                role="user",
-                text=user_message,
-                attachments=attachments,
-                focus_document_id=effective_focus,
-                selection=selection,
-            )
-        except Exception:
-            logger.exception("Failed to persist UI user message chat=%s", chat_id)
-
-        # Allow a bit more room for longer answers (cap still applies)
-        dirty_user: Optional[str] = None
-        if has_selection_text:
-            dirty_user = build_dirty_user_turn(user_message, selection=selection)
-        reply = self.session_mgr.ask_with_context(
-            chat_id,
-            user_text=user_message,
-            run_user_text=dirty_user,
-            context_pack=context_pack,
-            max_tokens=max_tokens,
-            temperature=0.2,
-        )
-
-        try:
-            if reply:
-                self._persist_ui_message(chat_id=chat_id, role="assistant", text=reply)
-        except Exception:
-            logger.exception("Failed to persist UI assistant message chat=%s", chat_id)
-
-        total_ms = (time.perf_counter() - start) * 1000
-        logger.info(
-            "Planner prompt chat=%s focus=%s summary=%s docs=%d rag_hits=%d ltm=%d target_words=%d time_ms=%.1f",
-            chat_id,
-            effective_focus,
-            summary_request,
-            len(documents) if documents else len(doc_texts),
-            len(selected_rag),
-            len(ltm_hits),
-            analysis["target_words"],
-            total_ms,
-        )
-
-        # If a new compaction summary was produced, persist it to LTM and clear marker
-        session_meta = self.session_mgr.sessions.get(chat_id, {})
-        tick = session_meta.get("compaction_tick", 0)
-        if tick and self._last_compaction_tick.get(chat_id) != tick:
-            summary_text = session_meta.get("ltm_summary")
-            if summary_text:
-                self.ltm_store.update_conv_summary(chat_id, summary_text)
-            self._last_compaction_tick[chat_id] = tick
-        else:
-            # If no compaction, update summary lightly with last turn
-            self.ltm_store.update_conv_summary(chat_id, f"Last turn: user='{user_message[:200]}', assistant='{reply[:200]}'")
-        return reply
+            request_id=None,
+        ):
+            tokens.append(tok)
+        return "".join(tokens)
 
     def handle_message_stream(
         self,
         chat_id: str,
         user_message: str,
         documents: Optional[List[str]] = None,
-        documents_text: Optional[List[str]] = None,
         attachments: Optional[List[str]] = None,
         focus_document_id: Optional[str] = None,
-        doc_scope_mode: Optional[str] = None,
+        doc_pane_open: Optional[bool] = None,
         selection: Optional[Dict[str, Any]] = None,
         *,
         request_id: Optional[str] = None,
@@ -1517,19 +732,16 @@ class InsightOrchestrator:
         """
         Streaming variant of handle_message yielding tokens.
         """
+        start = time.perf_counter()
         documents = documents or []
-        # Keep index alignment with `documents` and `attachments` (upload turns rely on it).
-        # Do NOT drop empty entries here; callers sometimes omit empty extracted text entries.
-        documents_text = [t if isinstance(t, str) else "" for t in (documents_text or [])]
         attachments = attachments or []
-        if len(documents_text) < len(documents):
-            documents_text = documents_text + [""] * (len(documents) - len(documents_text))
-        elif len(documents_text) > len(documents):
-            documents_text = documents_text[: len(documents)]
+
+        # Keep index alignment with `documents` for UI display (upload turns rely on it).
         if len(attachments) < len(documents):
             attachments = attachments + [""] * (len(documents) - len(attachments))
         elif len(attachments) > len(documents):
             attachments = attachments[: len(documents)]
+
         # Best-effort: fill missing attachment names from metadata store to keep labels stable.
         if documents and attachments:
             for i, fid in enumerate(documents):
@@ -1546,48 +758,71 @@ class InsightOrchestrator:
                         attachments[i] = name.strip()
                 except Exception:
                     continue
-        analysis = self._analyze_query(user_message, has_docs=bool(documents or documents_text))
+
+        analysis = self._analyze_query(user_message, has_docs=bool(documents))
         max_tokens = self._compute_output_max_tokens(analysis)
         summary_request = self._is_summary_request(user_message)
-        compare_request = self._is_compare_request(user_message)
+
         # Ensure deterministic session per chat_id (required even when no docs are attached).
         self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
 
-        ltm_k = 2 if selection else 5
+        selection_obj: Optional[Dict[str, Any]] = selection if isinstance(selection, dict) else None
+        has_selection_text = bool(
+            selection_obj
+            and isinstance(selection_obj.get("text"), str)
+            and str(selection_obj.get("text")).strip()
+        )
+        sel_file_id = (
+            selection_obj.get("file_id")
+            if selection_obj and isinstance(selection_obj.get("file_id"), str)
+            else None
+        )
+
+        # Fill selection filename for better scope headers (never internal ids).
+        selection_for_prompt = selection_obj
+        if sel_file_id and selection_obj and not isinstance(selection_obj.get("filename"), str):
+            try:
+                rec = self.metadata_store.get_file(sel_file_id)
+                name = rec.get("filename") if isinstance(rec, dict) else None
+                if isinstance(name, str) and name.strip():
+                    selection_for_prompt = {**selection_obj, "filename": name.strip()}
+            except Exception:
+                pass
+
+        ltm_k = 2 if has_selection_text else 5
         ltm_hits = self.ltm_store.retrieve(chat_id, user_message, top_k=ltm_k)
-        sel_file_id = selection.get("file_id") if isinstance(selection, dict) and isinstance(selection.get("file_id"), str) else None
-        effective_focus = self._resolve_focus_for_turn(
+
+        scope = self._resolve_scope_for_turn(
             chat_id,
             documents=documents,
             focus_document_id=focus_document_id,
-            doc_scope_mode=doc_scope_mode,
-            selection=selection,
+            doc_pane_open=doc_pane_open,
+            selection=selection_obj,
         )
-        scope_mode = (doc_scope_mode or "").strip().lower()
-        if sel_file_id:
-            scope_mode = "focused"
-        if scope_mode not in {"focused", "all"}:
-            scope_mode = "focused"
-        if compare_request and not sel_file_id and scope_mode == "focused":
-            try:
-                existing = self._chat_file_ids(chat_id)
-            except Exception:
-                existing = []
-            if len(documents) > 1 or len(set(existing or [])) >= 2:
-                scope_mode = "all"
+        scope_mode = scope.get("scope") or "focused"
+        effective_focus = scope.get("focus") if isinstance(scope.get("focus"), str) else None
+        scope_doc_ids = scope.get("scope_doc_ids") if isinstance(scope.get("scope_doc_ids"), list) else []
+        secondary_doc_ids = scope.get("secondary_doc_ids") if isinstance(scope.get("secondary_doc_ids"), list) else []
+        chat_doc_ids = scope.get("chat_doc_ids") if isinstance(scope.get("chat_doc_ids"), list) else []
+
+        primary_k = RAG_PRIMARY_K
+        if summary_request:
+            primary_k = RAG_PRIMARY_K_SUMMARY
+        elif has_selection_text:
+            primary_k = RAG_PRIMARY_K_SELECTION
+
         logger.debug(
-            "Planner stream turn chat=%s summary=%s scope=%s focus=%s docs_payload=%d docs_text=%d attachments=%d request_id=%s",
+            "Planner stream turn chat=%s summary=%s scope=%s doc_pane_open=%s focus=%s docs_payload=%d attachments=%d request_id=%s",
             chat_id,
             summary_request,
             scope_mode,
+            bool(scope.get("doc_pane_open")),
             effective_focus,
             len(documents),
-            len(documents_text),
             len(attachments),
             request_id,
         )
 
-        focus_user_edited = bool(effective_focus and self._is_user_edited_doc(chat_id, effective_focus))
         effective_focus_name: Optional[str] = None
         if effective_focus:
             try:
@@ -1598,136 +833,85 @@ class InsightOrchestrator:
             except Exception:
                 effective_focus_name = None
 
-        upload_has_text = bool(any(isinstance(t, str) and t.strip() for t in documents_text))
-        upload_multi = bool(len(documents) > 1 and upload_has_text)
-        upload_evidence: List[Dict[str, Any]] = []
+        rag_hits_raw: List[Dict[str, Any]] = []
+        scope_files: Optional[List[str]] = None
 
-        chat_doc_ids: List[str] = []
-
-        # Inline docs are reserved for summary-style queries and small fallback previews.
-        # IMPORTANT: if the focused file is user-edited, do not inline cached chunk text
-        # (it may not match the edited doc page). We’ll pull evidence from doc_pages instead.
-        if focus_user_edited or upload_multi:
-            doc_texts = []
-        elif documents_text:
-            doc_texts = [t for t in documents_text if isinstance(t, str) and t.strip()]
+        if scope_mode == "all" and scope_doc_ids:
+            doc_ids_in_scope = self._uniq_file_ids(scope_doc_ids)
+            total_k = RAG_ALL_K_TOTAL
+            if doc_ids_in_scope:
+                q_vec = self.rag_store.embed(user_message)
+                per_doc_k = max(1, (total_k + len(doc_ids_in_scope) - 1) // max(1, len(doc_ids_in_scope)))
+                for fid in doc_ids_in_scope:
+                    if q_vec is not None:
+                        rag_hits_raw.extend(
+                            self.rag_store.retrieve_with_vector(
+                                q_vec,
+                                chat_id=None,
+                                doc_ids=[fid],
+                                top_k=per_doc_k,
+                            )
+                        )
+                    else:
+                        rag_hits_raw.extend(
+                            self.rag_store.retrieve(
+                                user_message,
+                                chat_id=None,
+                                doc_ids=[fid],
+                                top_k=per_doc_k,
+                            )
+                        )
+                scope_files = []
+                for fid in doc_ids_in_scope:
+                    try:
+                        rec = self.metadata_store.get_file(fid)
+                        name = rec.get("filename") if isinstance(rec, dict) else None
+                        if isinstance(name, str) and name.strip():
+                            scope_files.append(name.strip())
+                    except Exception:
+                        continue
+                if not scope_files:
+                    scope_files = None
         elif effective_focus:
-            doc_texts = self._fetch_doc_texts([effective_focus])
-        else:
-            doc_texts = self._fetch_doc_texts(documents)
-        doc_texts = self._apply_inline_doc_budget(chat_id, doc_texts)
-
-        if summary_request and effective_focus:
-            focus_text = self._fetch_focus_doc_text(chat_id, effective_focus) if focus_user_edited else ""
-            if documents and documents_text:
-                try:
-                    idx = documents.index(effective_focus)
-                    focus_text = documents_text[idx] if idx < len(documents_text) else ""
-                except ValueError:
-                    focus_text = ""
-            if not focus_text:
-                focus_text = self._fetch_focus_doc_text(chat_id, effective_focus)
-            focus_text = self._apply_inline_doc_budget_partial(chat_id, focus_text)
-            doc_texts = [focus_text] if focus_text.strip() else []
-            rag_hits_raw = []
-        elif doc_texts:
-            rag_hits_raw = []
-        else:
-            primary_k = 4 if selection else 6
-            if documents and upload_has_text:
-                upload_evidence = self._build_upload_doc_evidence(
-                    chat_id=chat_id,
-                    query=user_message,
-                    doc_ids=documents,
-                    documents_text=documents_text,
-                    attachments=attachments,
+            rag_hits_raw.extend(
+                self.rag_store.retrieve(
+                    user_message,
+                    chat_id=None,
+                    doc_ids=[effective_focus],
+                    top_k=primary_k,
                 )
-            rag_hits_raw = list(upload_evidence)
-            chat_doc_ids = self._chat_file_ids(chat_id) or [d for d in documents if isinstance(d, str) and d]
-
-            if effective_focus and scope_mode == "focused":
-                if self._is_user_edited_doc(chat_id, effective_focus):
-                    rag_hits_raw.extend(
-                        self._edited_doc_evidence(chat_id, effective_focus, user_message, max_windows=primary_k)
-                    )
-                    logger.info("Focused doc is user-edited; skipping Qdrant for file_id=%s chat=%s", effective_focus, chat_id)
-                else:
-                    rag_hits_raw.extend(
-                        self.rag_store.retrieve(
-                            user_message,
-                            chat_id=chat_id,
-                            doc_ids=[effective_focus],
-                            top_k=primary_k,
-                        )
-                    )
-
-                other_doc_ids = [fid for fid in chat_doc_ids if fid != effective_focus]
-                secondary_k = 2 if selection else 3
-                if other_doc_ids and secondary_k > 0:
-                    rag_hits_raw.extend(
-                        self.rag_store.retrieve(
-                            user_message,
-                            chat_id=chat_id,
-                            doc_ids=other_doc_ids,
-                            top_k=secondary_k,
-                        )
-                    )
-            elif scope_mode == "all" and chat_doc_ids:
-                doc_ids_in_scope: List[str] = []
-                seen_docs = set()
-                for fid in chat_doc_ids:
-                    if isinstance(fid, str) and fid and fid not in seen_docs:
-                        seen_docs.add(fid)
-                        doc_ids_in_scope.append(fid)
-                if not doc_ids_in_scope:
-                    doc_ids_in_scope = chat_doc_ids
-
-                max_docs_for_per_file = 6
-                if len(doc_ids_in_scope) <= max_docs_for_per_file:
-                    q_vec = self.rag_store.embed(user_message)
-                    per_doc_k = max(1, (primary_k + len(doc_ids_in_scope) - 1) // max(1, len(doc_ids_in_scope)))
-                    for fid in doc_ids_in_scope:
-                        if self._is_user_edited_doc(chat_id, fid):
-                            rag_hits_raw.extend(self._edited_doc_evidence(chat_id, fid, user_message, max_windows=per_doc_k))
-                        elif q_vec is not None:
-                            rag_hits_raw.extend(
-                                self.rag_store.retrieve_with_vector(
-                                    q_vec,
-                                    chat_id=chat_id,
-                                    doc_ids=[fid],
-                                    top_k=per_doc_k,
-                                )
-                            )
-                        else:
-                            rag_hits_raw.extend(
-                                self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=[fid], top_k=per_doc_k)
-                            )
-                else:
-                    k_total = primary_k
-                    pool_k = min(24, max(k_total, k_total * max(1, len(doc_ids_in_scope))))
-                    pool = self.rag_store.retrieve(
-                        user_message,
-                        chat_id=chat_id,
-                        doc_ids=doc_ids_in_scope,
-                        top_k=pool_k,
-                    )
-                    rag_hits_raw.extend(self._rebalance_hits_by_file(pool, max_hits=k_total))
-            elif documents:
+            )
+            if secondary_doc_ids and RAG_SECONDARY_K_TOTAL > 0:
                 rag_hits_raw.extend(
-                    self.rag_store.retrieve(user_message, chat_id=chat_id, doc_ids=documents, top_k=primary_k)
+                    self.rag_store.retrieve(
+                        user_message,
+                        chat_id=None,
+                        doc_ids=[fid for fid in secondary_doc_ids if isinstance(fid, str) and fid],
+                        top_k=RAG_SECONDARY_K_TOTAL,
+                    )
                 )
-            else:
-                rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k))
+        elif documents:
+            rag_hits_raw.extend(
+                self.rag_store.retrieve(
+                    user_message,
+                    chat_id=None,
+                    doc_ids=self._uniq_file_ids(documents),
+                    top_k=primary_k,
+                )
+            )
+        else:
+            rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k))
+
         selected_rag = self._dedup_rag(rag_hits_raw)
-        if selected_rag and (upload_multi or scope_mode == "all"):
-            selected_rag = self._rebalance_hits_by_file(selected_rag, max_hits=len(selected_rag))
-        if selected_rag and (upload_multi or scope_mode == "all"):
-            file_order = documents if upload_multi else chat_doc_ids
-            selected_rag = self._apply_rag_budget_balanced(chat_id, selected_rag, file_order=file_order)
+        if scope_mode == "all" and scope_doc_ids:
+            selected_rag = self._rebalance_hits_by_file(selected_rag, max_hits=RAG_ALL_K_TOTAL)
+            selected_rag = self._apply_rag_budget_balanced(chat_id, selected_rag, file_order=scope_doc_ids)
         else:
             selected_rag = self._apply_rag_budget(chat_id, selected_rag)
-        if selected_rag and (upload_multi or scope_mode == "all"):
-            try:
+
+        # Debug: show how many hits per file made it through budgeting (backend logs only).
+        try:
+            if selected_rag:
                 mix: Dict[str, Dict[str, int]] = {}
                 for h in selected_rag:
                     name = h.get("filename") if isinstance(h.get("filename"), str) and h.get("filename") else "unknown"
@@ -1737,69 +921,18 @@ class InsightOrchestrator:
                     if isinstance(txt, str):
                         mix[name]["chars"] += len(txt)
                 logger.debug("RAG mix chat=%s scope=%s files=%s request_id=%s", chat_id, scope_mode, mix, request_id)
-            except Exception:
-                pass
-        if scope_mode == "focused" and effective_focus and not doc_texts and not selected_rag:
-            preview = self._doc_fallback_preview(chat_id, self._fetch_focus_doc_text(chat_id, effective_focus))
-            if preview.strip():
-                doc_texts = [preview]
-        has_selection_text = bool(
-            isinstance(selection, dict)
-            and isinstance(selection.get("text"), str)
-            and str(selection.get("text")).strip()
-        )
-
-        scope_files: Optional[List[str]] = None
-        if not sel_file_id:
-            if compare_request and upload_multi:
-                scope_files = [a for a in attachments if isinstance(a, str) and a.strip()]
-            elif scope_mode == "all" or (compare_request and scope_mode == "focused"):
-                try:
-                    rows = self.metadata_store.list_files_for_chat(chat_id)
-                except Exception:
-                    rows = []
-                scope_files = []
-                seen_names = set()
-                for r in rows or []:
-                    name = r.get("filename") if isinstance(r, dict) else None
-                    if not isinstance(name, str):
-                        continue
-                    name = name.strip()
-                    if not name or name in seen_names:
-                        continue
-                    seen_names.add(name)
-                    scope_files.append(name)
-                    if len(scope_files) >= 12:
-                        break
-                if not scope_files:
-                    scope_files = None
+        except Exception:
+            pass
 
         context_pack = build_context_pack(
             ltm_hits=ltm_hits,
-            doc_texts=doc_texts,
             rag_hits=selected_rag,
-            selection=selection,
+            selection=selection_for_prompt,
             effective_focus=effective_focus,
             effective_focus_name=effective_focus_name,
             scope_files=scope_files,
             include_selection_excerpt=not has_selection_text,
         )
-        if (upload_multi or scope_mode == "all") and compare_request:
-            context_pack = (
-                "TASK:\n"
-                "- Compare the documents listed in SCOPE.\n"
-                "- Keep document evidence separate; do not blend details across files.\n"
-                "- Only claim similarities if supported by BOTH documents.\n"
-                "- For anything not supported by the evidence, say you can't tell.\n"
-                "- Avoid speculation/marketing; keep it grounded to the excerpts.\n\n"
-                + (context_pack or "")
-            ).strip()
-        if summary_request and effective_focus:
-            context_pack = (
-                "TASK:\n- Summarize the focused document briefly.\n"
-                "- Use only the provided document text/evidence.\n\n"
-                + (context_pack or "")
-            ).strip()
 
         def generator():
             tokens: List[str] = []
@@ -1816,7 +949,9 @@ class InsightOrchestrator:
             except Exception:
                 logger.exception("Failed to persist UI user message chat=%s", chat_id)
 
-            dirty_user = build_dirty_user_turn(user_message, selection=selection) if has_selection_text else None
+            dirty_user = (
+                build_dirty_user_turn(user_message, selection=selection_for_prompt) if has_selection_text else None
+            )
             for token in self.session_mgr.ask_stream_with_context(
                 chat_id,
                 user_text=user_message,
@@ -1846,15 +981,21 @@ class InsightOrchestrator:
             else:
                 self.ltm_store.update_conv_summary(chat_id, f"Last turn: user='{user_message[:200]}', assistant='{reply[:200]}'")
 
-        return generator()
+            total_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "Planner stream done chat=%s scope=%s focus=%s summary=%s docs=%d rag_hits=%d ltm=%d time_ms=%.1f request_id=%s",
+                chat_id,
+                scope_mode,
+                effective_focus,
+                summary_request,
+                len(chat_doc_ids),
+                len(selected_rag),
+                len(ltm_hits),
+                total_ms,
+                request_id,
+            )
 
-    def _should_use_docs(self, rag_hits: List[Dict[str, Any]], user_hint_doc: bool = False) -> bool:
-        if user_hint_doc:
-            return True
-        if not rag_hits:
-            return False
-        max_score = max((h.get("score", 0.0) for h in rag_hits), default=0.0)
-        return len(rag_hits) >= 2 or max_score >= 0.55
+        return generator()
 
     def _dedup_rag(self, rag_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen = set()
@@ -1877,23 +1018,6 @@ class InsightOrchestrator:
             seen.add(key)
             deduped.append(h)
         return deduped
-
-    def _fetch_doc_texts(self, document_ids: List[str], *, max_chars_per_doc: int = 12000, max_docs: int = 3) -> List[str]:
-        texts: List[str] = []
-        if not document_ids:
-            return texts
-        # Stitch using our normalized chunk store (SQLite), ordered by seq.
-        try:
-            if hasattr(self.metadata_store, "fetch_chunks_for_files"):
-                chunks_by_file = self.metadata_store.fetch_chunks_for_files(document_ids[:max_docs], limit_per_file=999)
-                for _fid, chunks in chunks_by_file.items():
-                    doc_text = "\n".join((c.get("text") or "") for c in chunks)
-                    doc_text = doc_text[:max_chars_per_doc]
-                    if doc_text:
-                        texts.append(doc_text)
-        except Exception:
-            pass
-        return texts
 
     def _analyze_query(self, query: str, has_docs: bool) -> Dict[str, Any]:
         q = query.lower()

@@ -160,5 +160,47 @@ class RetrievalService:
         except Exception as exc:
             logger.warning("Failed to delete chunks for chat_id=%s: %s", chat_id, exc)
 
+    def delete_chunks_for_file(self, file_id: str) -> None:
+        """Delete all chunks in this collection that belong to a file_id."""
+        if not file_id:
+            return
+        try:
+            self._qdrant.delete(
+                collection_name=self._collection,
+                points_selector={
+                    "filter": {
+                        "must": [
+                            {"key": "file_id", "match": {"value": file_id}}
+                        ]
+                    }
+                },
+            )
+        except Exception as exc:
+            logger.warning("Failed to delete chunks for file_id=%s: %s", file_id, exc)
+
+    def delete_chunks_for_chat_file(self, chat_id: str, file_id: str) -> None:
+        """Delete all chunks in this collection that belong to a (chat_id, file_id)."""
+        if not chat_id or not file_id:
+            return
+        try:
+            self._qdrant.delete(
+                collection_name=self._collection,
+                points_selector={
+                    "filter": {
+                        "must": [
+                            {"key": "chat_id", "match": {"value": chat_id}},
+                            {"key": "file_id", "match": {"value": file_id}},
+                        ]
+                    }
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to delete chunks for chat_id=%s file_id=%s: %s",
+                chat_id,
+                file_id,
+                exc,
+            )
+
 
 __all__ = ["RetrievalService"]

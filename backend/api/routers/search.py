@@ -52,8 +52,7 @@ def search_doc(
     whole_word: bool = Query(False),
 ):
     store, _ = AppDependencies.storage()
-    record = store.get_file(file_id) or {}
-    if record.get("chat_id") != chat_id:
+    if not store.chat_has_file(chat_id, file_id):
         return {
             "chat_id": chat_id,
             "file_id": file_id,

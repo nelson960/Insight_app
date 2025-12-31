@@ -18,7 +18,7 @@ def get_doc_page(chat_id: str, file_id: str):
     record = store.get_file(file_id)
     if not record:
         raise HTTPException(status_code=404, detail="file not found")
-    if record.get("chat_id") != chat_id:
+    if not store.chat_has_file(chat_id, file_id):
         raise HTTPException(status_code=404, detail="file not found for chat")
 
     existing = store.get_doc_page(chat_id, file_id)
@@ -86,7 +86,7 @@ def save_doc_page(chat_id: str, file_id: str, payload: Dict[str, Any] = Body(...
     record = store.get_file(file_id)
     if not record:
         raise HTTPException(status_code=404, detail="file not found")
-    if record.get("chat_id") != chat_id:
+    if not store.chat_has_file(chat_id, file_id):
         raise HTTPException(status_code=404, detail="file not found for chat")
 
     title = payload.get("title")

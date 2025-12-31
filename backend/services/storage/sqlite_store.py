@@ -145,6 +145,19 @@ class SQLiteMetadataStore:
             )
             """
         )
+        # Map file_ids to one or more chats. This replaces the legacy `files.chat_id`
+        # field for association checks and listing, enabling document sharing across
+        # branched cards without re-ingestion.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_files (
+                chat_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                created_at TEXT,
+                PRIMARY KEY (chat_id, file_id)
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS chunks (
@@ -184,8 +197,26 @@ class SQLiteMetadataStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_seq ON chunks(file_id, seq)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_chat ON chunks(chat_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_created ON chunks(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_files_chat ON chat_files(chat_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_files_file ON chat_files(file_id)")
         conn.execute(f"PRAGMA journal_mode={self._config.journal_mode}")
         conn.execute(f"PRAGMA busy_timeout={self._config.busy_timeout_ms}")
+
+        # Backfill chat_files mapping from legacy files.chat_id for older databases.
+        # This is idempotent and safe to run at startup.
+        try:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO chat_files (chat_id, file_id, created_at)
+                SELECT chat_id, id, created_at
+                FROM files
+                WHERE chat_id IS NOT NULL AND chat_id != ''
+                """
+            )
+            conn.commit()
+        except Exception:
+            # Best effort; older/broken DBs should still boot.
+            pass
 
     # ------------------------------------------------------------------ #
     # App settings (simple key/value JSON)
@@ -420,6 +451,14 @@ class SQLiteMetadataStore:
                     source,
                 ),
             )
+            if chat_id:
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO chat_files (chat_id, file_id, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (chat_id, file_id, created_at),
+                )
             self._connection.commit()
 
     def mark_file_status(self, file_id: str, status: FileIngestionStatus | str) -> None:
@@ -431,17 +470,15 @@ class SQLiteMetadataStore:
             )
             self._connection.commit()
             try:
-                cursor = self._connection.execute(
-                    "SELECT chat_id, filename FROM files WHERE id=?",
-                    (file_id,),
-                )
+                cursor = self._connection.execute("SELECT filename FROM files WHERE id=?", (file_id,))
                 row = cursor.fetchone()
-                if row and row["chat_id"]:
+                filename = (row["filename"] if row else "") or ""
+                for chat_id in self.list_chat_ids_for_file(file_id):
                     emit_event(
                         "file_status",
-                        chat_id=row["chat_id"],
+                        chat_id=chat_id,
                         file_id=file_id,
-                        filename=row["filename"] or "",
+                        filename=filename,
                         status=status_value,
                     )
             except Exception:
@@ -459,19 +496,14 @@ class SQLiteMetadataStore:
         now = _now_iso()
         blocks_json = json.dumps(list(blocks) if blocks else [])
         with self._lock:
-            chat_id: str | None = None
             filename = ""
             try:
-                cursor = self._connection.execute(
-                    "SELECT chat_id, filename FROM files WHERE id=?",
-                    (file_id,),
-                )
+                cursor = self._connection.execute("SELECT filename FROM files WHERE id=?", (file_id,))
                 row = cursor.fetchone()
                 if row:
-                    chat_id = row["chat_id"]
                     filename = row["filename"] or ""
             except Exception:
-                chat_id = None
+                filename = ""
             cursor = self._connection.execute("SELECT created_at FROM file_text WHERE file_id=?", (file_id,))
             row = cursor.fetchone()
             created_at = row["created_at"] if row else now
@@ -483,7 +515,7 @@ class SQLiteMetadataStore:
                 (file_id, blocks_json, text or "", created_at, now),
             )
             self._connection.commit()
-            if chat_id:
+            for chat_id in self.list_chat_ids_for_file(file_id):
                 emit_event(
                     "file_text_ready",
                     chat_id=chat_id,
@@ -779,22 +811,299 @@ class SQLiteMetadataStore:
             return None
         return dict(row)
 
+    # ------------------------------------------------------------------ #
+    # Chat ↔ file association (multi-chat document sharing)
+    # ------------------------------------------------------------------ #
+    def add_file_to_chat(self, chat_id: str, file_id: str) -> None:
+        if not chat_id or not file_id:
+            return
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO chat_files (chat_id, file_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (chat_id, file_id, _now_iso()),
+            )
+            self._connection.commit()
+
+    def chat_has_file(self, chat_id: str, file_id: str) -> bool:
+        if not chat_id or not file_id:
+            return False
+        cursor = self._connection.execute(
+            "SELECT 1 FROM chat_files WHERE chat_id=? AND file_id=? LIMIT 1",
+            (chat_id, file_id),
+        )
+        return cursor.fetchone() is not None
+
+    def list_file_ids_for_chat(self, chat_id: str) -> list[str]:
+        if not chat_id:
+            return []
+        cursor = self._connection.execute(
+            "SELECT file_id FROM chat_files WHERE chat_id=? ORDER BY created_at ASC",
+            (chat_id,),
+        )
+        out: list[str] = []
+        for row in cursor.fetchall():
+            fid = row["file_id"] if isinstance(row, sqlite3.Row) else row[0]
+            if isinstance(fid, str) and fid:
+                out.append(fid)
+        return out
+
+    def list_chat_ids_for_file(self, file_id: str) -> list[str]:
+        if not file_id:
+            return []
+        cursor = self._connection.execute(
+            "SELECT chat_id FROM chat_files WHERE file_id=? ORDER BY created_at ASC",
+            (file_id,),
+        )
+        out: list[str] = []
+        for row in cursor.fetchall():
+            cid = row["chat_id"] if isinstance(row, sqlite3.Row) else row[0]
+            if isinstance(cid, str) and cid:
+                out.append(cid)
+        return out
+
+    def delete_chat_files(self, chat_id: str) -> int:
+        """
+        Remove all chat↔file links for a chat.
+
+        Note: this does NOT delete the underlying files. Use `delete_file_everywhere`
+        for fully unreferenced file cleanup.
+        """
+        if not chat_id:
+            return 0
+        with self._lock:
+            cur = self._connection.execute("DELETE FROM chat_files WHERE chat_id=?", (chat_id,))
+            self._connection.commit()
+            return int(cur.rowcount or 0)
+
+    def delete_chat_file(self, chat_id: str, file_id: str) -> int:
+        """
+        Remove a single chat↔file link for a chat.
+
+        This does NOT delete the underlying file or any chunks; callers should do
+        additional cleanup as needed.
+        """
+        if not chat_id or not file_id:
+            return 0
+        with self._lock:
+            cur = self._connection.execute(
+                "DELETE FROM chat_files WHERE chat_id=? AND file_id=?",
+                (chat_id, file_id),
+            )
+            self._connection.commit()
+            return int(cur.rowcount or 0)
+
+    def delete_doc_pages_for_chat(self, chat_id: str) -> int:
+        """Delete all per-chat editor pages for a chat_id."""
+        if not chat_id:
+            return 0
+        with self._lock:
+            cur = self._connection.execute("DELETE FROM doc_pages WHERE chat_id=?", (chat_id,))
+            self._connection.commit()
+            return int(cur.rowcount or 0)
+
+    def delete_doc_page(self, chat_id: str, file_id: str) -> int:
+        """Delete a single per-chat editor page (chat_id + file_id)."""
+        if not chat_id or not file_id:
+            return 0
+        with self._lock:
+            cur = self._connection.execute(
+                "DELETE FROM doc_pages WHERE chat_id=? AND file_id=?",
+                (chat_id, file_id),
+            )
+            self._connection.commit()
+            return int(cur.rowcount or 0)
+
+    def delete_chunks_for_chat_file(self, chat_id: str, file_id: str) -> int:
+        """
+        Delete all chunk rows for a given (chat_id, file_id).
+
+        This keeps other chats' chunk rows intact even if they reference the same file_id.
+        """
+        if not chat_id or not file_id:
+            return 0
+        with self._lock:
+            cur = self._connection.execute(
+                "DELETE FROM chunks WHERE chat_id=? AND file_id=?",
+                (chat_id, file_id),
+            )
+            self._connection.commit()
+            return int(cur.rowcount or 0)
+
+    def delete_file_everywhere(self, file_id: str) -> dict[str, int]:
+        """
+        Delete a file and all associated database rows.
+
+        This is only safe to call once a file is no longer referenced by ANY chat.
+        """
+        if not file_id:
+            return {"file_id": "", "deleted": 0}
+        with self._lock:
+            deleted_chat_files = int(
+                (self._connection.execute("DELETE FROM chat_files WHERE file_id=?", (file_id,)).rowcount or 0)
+            )
+            deleted_doc_pages = int(
+                (self._connection.execute("DELETE FROM doc_pages WHERE file_id=?", (file_id,)).rowcount or 0)
+            )
+            deleted_file_text = int(
+                (self._connection.execute("DELETE FROM file_text WHERE file_id=?", (file_id,)).rowcount or 0)
+            )
+            deleted_chunks = int(
+                (self._connection.execute("DELETE FROM chunks WHERE file_id=?", (file_id,)).rowcount or 0)
+            )
+            deleted_jobs = int(
+                (self._connection.execute("DELETE FROM jobs WHERE file_id=?", (file_id,)).rowcount or 0)
+            )
+            deleted_files = int(
+                (self._connection.execute("DELETE FROM files WHERE id=?", (file_id,)).rowcount or 0)
+            )
+            self._connection.commit()
+        return {
+            "file_id": file_id,
+            "chat_files": deleted_chat_files,
+            "doc_pages": deleted_doc_pages,
+            "file_text": deleted_file_text,
+            "chunks": deleted_chunks,
+            "jobs": deleted_jobs,
+            "files": deleted_files,
+        }
+
     def list_files_for_chat(self, chat_id: str) -> list[dict[str, object]]:
         cursor = self._connection.execute(
-            "SELECT id, filename, stored_path FROM files WHERE chat_id=?",
+            """
+            SELECT f.id, f.filename, f.stored_path, cf.created_at AS linked_at
+            FROM chat_files cf
+            JOIN files f ON f.id = cf.file_id
+            WHERE cf.chat_id=?
+            ORDER BY cf.created_at ASC
+            """,
             (chat_id,),
         )
         return [dict(row) for row in cursor.fetchall()]
 
+    def list_files_status_for_chat(self, chat_id: str) -> list[dict[str, object]]:
+        """
+        List files for a chat including ingestion status and basic metadata.
+
+        This is used by desktop UI and ingestion readiness checks.
+        """
+        cursor = self._connection.execute(
+            """
+            SELECT id, filename, mime, size_bytes, status, pages, created_at, updated_at, source
+            FROM files
+            WHERE id IN (SELECT file_id FROM chat_files WHERE chat_id=?)
+            ORDER BY created_at ASC
+            """,
+            (chat_id,),
+        )
+        out: list[dict[str, object]] = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            d["status"] = _normalize_file_ingestion_status(d.get("status") or "")
+            out.append(d)
+        return out
+
+    def chat_ingestion_progress(self, chat_id: str) -> dict[str, object]:
+        """
+        Return a cheap ingestion progress snapshot for a single chat_id.
+
+        This avoids polling global busy state and gives the UI an explicit readiness signal.
+        """
+        if not chat_id:
+            return {
+                "chat_id": chat_id,
+                "total": 0,
+                "done": 0,
+                "failed": 0,
+                "active_jobs": 0,
+                "counts": {},
+                "files": [],
+                "jobs": [],
+                "percent": 100.0,
+            }
+
+        files = self.list_files_status_for_chat(chat_id)
+        total = len(files)
+        counts: dict[str, int] = {}
+        done = 0
+        failed = 0
+        for f in files:
+            st = f.get("status") or ""
+            st = str(st)
+            counts[st] = counts.get(st, 0) + 1
+            if st in ("completed", "failed"):
+                done += 1
+            if st == "failed":
+                failed += 1
+
+        # Jobs table does not include chat_id; join via files table.
+        active_jobs = 0
+        jobs: list[dict[str, object]] = []
+        try:
+            cursor = self._connection.execute(
+                """
+                SELECT j.id, j.job_type, j.file_id, j.status, j.error, j.created_at, f.filename
+                FROM jobs j
+                JOIN chat_files cf ON cf.file_id = j.file_id
+                JOIN files f ON f.id = j.file_id
+                WHERE cf.chat_id=? AND j.status IN ('queued', 'running')
+                ORDER BY j.created_at DESC
+                LIMIT 200
+                """,
+                (chat_id,),
+            )
+            jobs = [dict(r) for r in cursor.fetchall()]
+            active_jobs = len(jobs)
+        except Exception:
+            jobs = []
+            active_jobs = 0
+
+        percent = 100.0
+        if total > 0:
+            percent = round((done / total) * 100.0, 2)
+
+        return {
+            "chat_id": chat_id,
+            "total": total,
+            "done": done,
+            "failed": failed,
+            "active_jobs": active_jobs,
+            "counts": counts,
+            "files": [
+                {
+                    "file_id": f.get("id"),
+                    "filename": f.get("filename") or "",
+                    "status": f.get("status") or "",
+                    "mime": f.get("mime") or "",
+                    "size_bytes": f.get("size_bytes") or 0,
+                    "pages": f.get("pages"),
+                    "created_at": f.get("created_at"),
+                    "updated_at": f.get("updated_at"),
+                    "source": f.get("source") or "",
+                }
+                for f in files
+            ],
+            "jobs": jobs,
+            "percent": percent,
+        }
+
     def latest_file_id_for_chat(self, chat_id: str) -> Optional[str]:
         cursor = self._connection.execute(
-            "SELECT id FROM files WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+            """
+            SELECT file_id
+            FROM chat_files
+            WHERE chat_id=?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
             (chat_id,),
         )
         row = cursor.fetchone()
         if not row:
             return None
-        fid = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+        fid = row["file_id"] if isinstance(row, sqlite3.Row) else row[0]
         return fid if isinstance(fid, str) and fid else None
 
     def delete_files_for_chat(self, chat_id: str) -> int:

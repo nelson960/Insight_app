@@ -159,6 +159,8 @@ async def _invoke_asgi(
     response_status: int | None = None
     response_headers: Dict[str, str] = {}
     response_body = bytearray()
+    error_body = bytearray()
+    is_error_response = False
 
     # Robust against multi-byte splits across chunks
     decoder = codecs.getincrementaldecoder("utf-8")()
@@ -186,9 +188,11 @@ async def _invoke_asgi(
     async def send(message: Dict[str, Any]) -> None:
         nonlocal response_status
         nonlocal stream_end_emitted
+        nonlocal is_error_response
 
         if message["type"] == "http.response.start":
             response_status = int(message.get("status", 200))
+            is_error_response = response_status >= 400
             for k, v in message.get("headers", []):
                 try:
                     response_headers[k.decode("utf-8")] = v.decode("utf-8")
@@ -219,6 +223,53 @@ async def _invoke_asgi(
 
         if stream:
             if stream_queue is None:
+                return
+
+            # If the ASGI app returns a non-2xx response in "stream mode" (e.g. 409 ingestion_not_ready),
+            # do NOT pass the body through as model tokens. Instead, buffer the body and emit a single
+            # stream_error so the frontend can handle it cleanly.
+            if is_error_response:
+                if chunk:
+                    error_body.extend(chunk)
+
+                if not more_body:
+                    if not stream_end_emitted:
+                        stream_end_emitted = True
+                        try:
+                            raw = bytes(error_body).decode("utf-8", errors="replace").strip()
+                            msg = raw or f"HTTP {response_status or 500}"
+                            try:
+                                parsed = json.loads(raw) if raw else None
+                                if isinstance(parsed, dict):
+                                    detail = parsed.get("detail")
+                                    if isinstance(detail, dict):
+                                        if detail.get("error") == "ingestion_not_ready":
+                                            progress = detail.get("progress") if isinstance(detail.get("progress"), dict) else None
+                                            if progress:
+                                                done = progress.get("done", 0)
+                                                total = progress.get("total", 0)
+                                                percent = progress.get("percent", None)
+                                                if percent is not None:
+                                                    msg = f"Indexing documents… {done}/{total} ({percent}%)."
+                                                else:
+                                                    msg = f"Indexing documents… {done}/{total}."
+                                            else:
+                                                msg = "Indexing documents… please wait."
+                                        else:
+                                            msg = str(detail.get("error") or detail.get("message") or msg)
+                                    elif isinstance(detail, str) and detail.strip():
+                                        msg = detail.strip()
+                            except Exception:
+                                pass
+
+                            await stream_queue.send({"request_id": request_id, "stream_error": msg})
+                        except Exception as exc:
+                            await stream_queue.send({"request_id": request_id, "stream_error": str(exc)})
+
+                        logger.info("ASGI stream_end request_id=%s (error status=%s)", request_id, response_status)
+                        await stream_queue.send({"request_id": request_id, "stream_end": True})
+                        await stream_queue.aclose()
+                        disconnect_event.set()
                 return
 
             if chunk:

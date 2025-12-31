@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import os
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Annotated
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Form, UploadFile, File, Request, Body
@@ -12,36 +15,148 @@ from fastapi.responses import StreamingResponse
 from backend.services.planner import PlannerRequest
 from backend.services.planner.summarizer import summarize_text as do_summarize_text
 from backend.api.deps import AppDependencies
-from backend.services.ingestion import create_extraction_service, IngestionRequest, FilePolicy
-from backend.services.extraction.detector import detect_mime_type
-from backend.services.security import encrypt_bytes
 from backend.services.ipc_events import emit_event
-import hashlib
-from datetime import datetime, timezone
 from pathlib import Path
-import asyncio
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 logger = logging.getLogger(__name__)
-_upload_locks: Dict[str, asyncio.Lock] = {}
 
-# Minimal backend-enforced defaults (avoid “frontend-only” limits).
-# Kept here (not a full config system) to stay simple and consistent across IPC/HTTP.
-MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024  # 5 MiB
+def _required_file_ids_for_turn(payload: dict) -> list[str]:
+    """
+    Determine which file_ids must be "RAG ready" for this /chat turn.
+
+    This is a defensive backend guard. The desktop UI already queues sends until
+    ingestion completes, but API callers (or UI edge cases) can still hit /chat
+    early and get low-quality answers with zero retrieval candidates.
+    """
+    docs_payload = payload.get("documents") or payload.get("document_ids") or []
+    _attachments = payload.get("attachments") or []
+
+    # Selection hard-focuses a single file.
+    selection = payload.get("selection")
+    if isinstance(selection, dict):
+        fid = selection.get("file_id")
+        if isinstance(fid, str) and fid.strip():
+            return [fid.strip()]
+
+    focus_document_id = payload.get("focus_document_id")
+    focus_document_id = focus_document_id.strip() if isinstance(focus_document_id, str) else ""
+    doc_pane_open = payload.get("doc_pane_open")
+    if not isinstance(doc_pane_open, bool):
+        doc_pane_open = None
+    doc_pane_open_bool = bool(doc_pane_open) if doc_pane_open is not None else bool(focus_document_id)
+
+    # Multi-upload in the chat pane: require all uploaded docs for this turn.
+    turn_doc_ids: list[str] = []
+    if isinstance(docs_payload, list):
+        for d in docs_payload:
+            if isinstance(d, str) and d.strip():
+                turn_doc_ids.append(d.strip())
+    if (not doc_pane_open_bool) and len(turn_doc_ids) > 1:
+        # De-dup while preserving order.
+        seen = set()
+        uniq: list[str] = []
+        for fid in turn_doc_ids:
+            if fid in seen:
+                continue
+            seen.add(fid)
+            uniq.append(fid)
+        return uniq
+
+    # Focused mode: require the focused file if provided, plus any newly attached docs.
+    out: list[str] = []
+    if doc_pane_open_bool and focus_document_id and not turn_doc_ids:
+        out.append(focus_document_id)
+
+    # Always include new attachments for this turn.
+    out.extend(turn_doc_ids)
+
+    # If the docs pane is hidden and no explicit focus is set, default to the latest file in the chat.
+    if (not doc_pane_open_bool) and not out:
+        chat_id = payload.get("chat_id")
+        if isinstance(chat_id, str) and chat_id:
+            try:
+                store, _ = AppDependencies.storage()
+                rows = store.list_files_for_chat(chat_id)
+                last_fid: Optional[str] = None
+                best_fid: Optional[str] = None
+                best_ts: Optional[float] = None
+                for r in rows or []:
+                    if not isinstance(r, dict):
+                        continue
+                    fid = r.get("id")
+                    if not isinstance(fid, str) or not fid.strip():
+                        continue
+                    last_fid = fid.strip()
+                    ts = r.get("created_at") or r.get("created") or r.get("ts")
+                    try:
+                        ts_val = float(ts) if ts is not None else None
+                    except Exception:
+                        ts_val = None
+                    if ts_val is not None and (best_ts is None or ts_val >= best_ts):
+                        best_fid = fid.strip()
+                        best_ts = ts_val
+                chosen = best_fid or last_fid
+                if chosen:
+                    out.append(chosen)
+            except Exception:
+                pass
+
+    # Defensive: some clients might send attachment names without documents; ignore those.
+    _ = _attachments
+
+    # De-dup while preserving order.
+    seen = set()
+    uniq: list[str] = []
+    for fid in out:
+        if fid in seen:
+            continue
+        seen.add(fid)
+        uniq.append(fid)
+    return uniq
 
 
-def _enforce_max_attachment_size(*, filename: str, size_bytes: int) -> None:
-    if size_bytes <= MAX_ATTACHMENT_BYTES:
+def _enforce_rag_ready(payload: dict) -> None:
+    """
+    Enforce "RAG always" on the backend: if the user is asking in a doc-scoped
+    context but ingestion hasn't finished, fail fast with a structured error.
+    """
+    chat_id = payload.get("chat_id")
+    if not isinstance(chat_id, str) or not chat_id:
         return
-    raise HTTPException(
-        status_code=413,
-        detail={
-            "error": "file_too_large",
-            "filename": filename,
-            "size_bytes": size_bytes,
-            "max_bytes": MAX_ATTACHMENT_BYTES,
-        },
-    )
+
+    required = _required_file_ids_for_turn(payload)
+    if not required:
+        return
+
+    store, _ = AppDependencies.storage()
+    files = store.list_files_status_for_chat(chat_id)
+    status_by_id: dict[str, str] = {}
+    for f in files or []:
+        fid = f.get("id")
+        if not isinstance(fid, str) or not fid:
+            continue
+        st = f.get("status") or ""
+        status_by_id[fid] = str(st)
+
+    missing = [fid for fid in required if fid not in status_by_id]
+    not_ready = [fid for fid in required if status_by_id.get(fid) not in {"completed", "failed"}]
+    failed = [fid for fid in required if status_by_id.get(fid) == "failed"]
+
+    if missing or not_ready or failed:
+        progress = store.chat_ingestion_progress(chat_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "ingestion_not_ready",
+                "chat_id": chat_id,
+                "required_file_ids": required,
+                "missing_file_ids": missing,
+                "not_ready_file_ids": not_ready,
+                "failed_file_ids": failed,
+                "progress": progress,
+            },
+        )
 
 
 @router.post("")
@@ -54,14 +169,14 @@ async def chat_entry(
 ):
     """
     Unified chat endpoint:
-    - If multipart with files is provided, extract text inline, queue ingestion, and answer with those docs.
+    - Uploads and local path ingestion are handled by the /files router (RAG-only flow).
     - Otherwise, treat body as JSON payload for regular chat.
     """
-    # If files were provided, do upload+chat
     if files:
-        if not chat_id or not query:
-            raise HTTPException(status_code=400, detail="chat_id and query are required with file upload")
-        return await _upload_and_chat_internal(chat_id, query, files, include_context_status=bool(include_context_status))
+        raise HTTPException(
+            status_code=400,
+            detail="Upload via /files/upload then call /chat once ingestion is complete.",
+        )
 
     # If form fields present without files, treat as a normal chat call
     if chat_id and query:
@@ -78,226 +193,12 @@ async def chat_entry(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON or missing payload")
 
-    # Desktop/IPC-friendly attachments: user provides local file paths.
-    # We only ingest when a query is sent (same call), and we attach extracted text inline.
     if payload.get("paths"):
-        payload = await _ingest_paths_for_chat(payload)
-    return _run_planner(payload)
-
-
-async def _upload_and_chat_internal(chat_id: str, query: str, files: List[UploadFile], include_context_status: bool = False):
-    # Use a dedicated async lock for upload flow to avoid deadlocks with session locks.
-    lock = _upload_locks.setdefault(chat_id, asyncio.Lock())
-    async with lock:
-        workspace = AppDependencies.workspace()
-        scheduler = AppDependencies.ingestion_scheduler()
-        key = AppDependencies.key_manager().get_key()
-        extraction_service = create_extraction_service()
-        doc_texts: list[str] = []
-        doc_ids: list[str] = []
-        for upload in files:
-            filename = upload.filename or ""
-            suffix = Path(filename).suffix if filename else ""
-            content = await upload.read()
-            _enforce_max_attachment_size(filename=filename or "upload", size_bytes=len(content))
-            hash_value = hashlib.sha256(content).hexdigest()
-            file_id = f"file_{hash_value}"
-            enc_path = workspace.uploads / f"{file_id}.enc"
-            logger.info("Encrypting upload %s as %s", upload.filename, enc_path.name)
-            await asyncio.to_thread(enc_path.write_bytes, encrypt_bytes(key, content))
-            temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
-            await asyncio.to_thread(temp_path.write_bytes, content)
-            size_bytes = len(content)
-            mime = await asyncio.to_thread(detect_mime_type, temp_path)
-
-            # Synchronous extraction for immediate use
-            extracted = await asyncio.to_thread(extraction_service.extract, temp_path, mime_type=mime)
-            truncated = _truncate_doc_text(extracted.text or "")
-            if truncated.strip():
-                doc_texts.append(truncated)
-            else:
-                logger.warning("Extraction returned empty text for upload filename=%s mime=%s", filename, mime)
-            doc_ids.append(file_id)
-
-            # Register and queue ingestion for indexing
-            metadata_store, _ = AppDependencies.storage()
-            metadata_store.register_file(
-                file_id=file_id,
-                filename=filename,
-                mime=mime,
-                size_bytes=size_bytes,
-                hash_value=hash_value,
-                stored_path=str(enc_path),
-                is_encrypted=True,
-                policy={"pii": False},
-            )
-            emit_event(
-                "files_changed",
-                chat_id=chat_id,
-                file_id=file_id,
-                filename=filename,
-                status="registered",
-            )
-            ingestion_request = IngestionRequest(
-                file_id=file_id,
-                source_path=str(temp_path),
-                filename=filename,
-                mime=mime,
-                size_bytes=size_bytes,
-                hash=hash_value,
-                policy=FilePolicy(),
-                created_at=datetime.now(timezone.utc),
-                user_id="default",
-                chat_id=chat_id,
-                source="upload",
-                cleanup_path=str(temp_path),
-            )
-            job_id = scheduler.schedule(ingestion_request)
-            logger.info("Queued ingestion job %s for %s", job_id, file_id)
-
-        # Invoke planner with inline documents_text
-        service = AppDependencies.planner_service()
-        req = PlannerRequest(
-            chat_id=chat_id,
-            query=query,
-            documents=doc_ids,
-            documents_text=doc_texts,
-            # Default focus to the most recently attached doc for this turn.
-            # This matches the UX: “upload → ask about the document I just uploaded”.
-            focus_document_id=(doc_ids[-1] if doc_ids else None),
+        raise HTTPException(
+            status_code=400,
+            detail="Use /files/ingest_path then call /chat once ingestion is complete.",
         )
-        result = service.handle_request(req)
-        resp: Dict[str, Any] = {
-            "answer": result.answer,
-        }
-        if include_context_status:
-            try:
-                mgr = AppDependencies.session_manager()
-                resp["context"] = mgr.get_context_status(chat_id)
-            except Exception as exc:
-                logger.warning("Failed to build context status: %s", exc)
-        return resp
-
-
-async def _ingest_paths_for_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
-    chat_id = payload.get("chat_id")
-    query = payload.get("query")
-    paths = payload.get("paths") or []
-
-    if not isinstance(chat_id, str) or not chat_id:
-        raise HTTPException(status_code=400, detail="chat_id is required")
-    if not isinstance(query, str) or not query:
-        raise HTTPException(status_code=400, detail="query is required when using paths")
-    if not isinstance(paths, list) or not paths:
-        raise HTTPException(status_code=400, detail="paths must be a non-empty list")
-
-    # Use the same upload lock strategy as multipart upload+chat.
-    lock = _upload_locks.setdefault(chat_id, asyncio.Lock())
-    async with lock:
-        workspace = AppDependencies.workspace()
-        scheduler = AppDependencies.ingestion_scheduler()
-        key = AppDependencies.key_manager().get_key()
-        extraction_service = create_extraction_service()
-        metadata_store, _ = AppDependencies.storage()
-
-        doc_texts: list[str] = []
-        doc_ids: list[str] = []
-        attachment_names: list[str] = []
-
-        for raw in paths:
-            if not isinstance(raw, str) or not raw:
-                continue
-            src_path = Path(raw).expanduser()
-            if not src_path.exists() or not src_path.is_file():
-                raise HTTPException(status_code=400, detail=f"Invalid file path: {raw}")
-
-            filename = src_path.name
-            suffix = src_path.suffix
-            attachment_names.append(filename)
-
-            try:
-                size_bytes = src_path.stat().st_size
-            except OSError as exc:
-                raise HTTPException(status_code=400, detail=f"Cannot stat file {raw}: {exc}") from exc
-            _enforce_max_attachment_size(filename=filename, size_bytes=size_bytes)
-
-            content = await asyncio.to_thread(src_path.read_bytes)
-            hash_value = hashlib.sha256(content).hexdigest()
-            file_id = f"file_{hash_value}"
-
-            enc_path = workspace.uploads / f"{file_id}.enc"
-            logger.info("Encrypting desktop path %s as %s", filename, enc_path.name)
-            await asyncio.to_thread(enc_path.write_bytes, encrypt_bytes(key, content))
-
-            temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
-            await asyncio.to_thread(temp_path.write_bytes, content)
-            mime = await asyncio.to_thread(detect_mime_type, temp_path)
-
-            # Synchronous extraction for immediate use (inline docs in prompt)
-            extracted = await asyncio.to_thread(extraction_service.extract, temp_path, mime_type=mime)
-            truncated = _truncate_doc_text(extracted.text or "")
-            # Preserve index alignment with `documents` and `attachments` by always appending
-            # a string entry for each uploaded file (empty if extraction yielded no text).
-            doc_texts.append(truncated)
-            if not truncated.strip():
-                logger.warning("Extraction returned empty text for desktop path filename=%s mime=%s", filename, mime)
-            doc_ids.append(file_id)
-
-            metadata_store.register_file(
-                file_id=file_id,
-                filename=filename,
-                mime=mime,
-                size_bytes=size_bytes,
-                hash_value=hash_value,
-                stored_path=str(enc_path),
-                is_encrypted=True,
-                policy={"pii": False},
-                user_id="default",
-                chat_id=chat_id,
-                source="desktop_path",
-            )
-            emit_event(
-                "files_changed",
-                chat_id=chat_id,
-                file_id=file_id,
-                filename=filename,
-                status="registered",
-            )
-
-            ingestion_request = IngestionRequest(
-                file_id=file_id,
-                source_path=str(temp_path),
-                filename=filename,
-                mime=mime,
-                size_bytes=size_bytes,
-                hash=hash_value,
-                policy=FilePolicy(),
-                created_at=datetime.now(timezone.utc),
-                user_id="default",
-                chat_id=chat_id,
-                source="desktop_path",
-                cleanup_path=str(temp_path),
-            )
-            job_id = scheduler.schedule(ingestion_request)
-            logger.info("Queued ingestion job %s for %s", job_id, file_id)
-
-        if not doc_ids:
-            raise HTTPException(status_code=400, detail="No valid paths provided")
-
-        # Mutate into planner-compatible fields and remove paths so it won't be reprocessed.
-        payload = dict(payload)
-        payload.pop("paths", None)
-        payload["documents"] = doc_ids
-        payload["documents_text"] = doc_texts
-        payload["attachments"] = attachment_names
-        # If no explicit focus was provided, default focus to the most recently ingested doc.
-        #
-        # IMPORTANT: when the UI explicitly requests "all documents" scope, do not invent a focus
-        # (it would hard-bias retrieval to a single file and defeat compare-style queries).
-        scope_mode = payload.get("doc_scope_mode")
-        if not (isinstance(scope_mode, str) and scope_mode.strip().lower() == "all"):
-            payload.setdefault("focus_document_id", doc_ids[-1] if doc_ids else None)
-        return payload
+    return _run_planner(payload)
 
 
 @router.websocket("/stream")
@@ -350,6 +251,11 @@ async def chat_stream(websocket: WebSocket):
 
 
 def _run_planner(payload: dict):
+    # Backend guard: if this turn is doc-scoped, require ingestion to be complete.
+    # The desktop UI also waits, but this prevents silent low-quality answers when
+    # /chat is called early (e.g. API callers, edge cases).
+    _enforce_rag_ready(payload)
+
     service = AppDependencies.planner_service()
     req = _build_request(payload)
     logger.info(
@@ -438,12 +344,118 @@ def summarize_text(payload: Dict[str, Any] = Body(...)):
     summary = do_summarize_text(text, mgr, max_tokens=max_tokens)
     return {"summary": summary}
 
+@router.post("/branch")
+def branch_chat(payload: Dict[str, Any] = Body(...)):
+    """
+    Create a new child chat/card branched from a single message.
+
+    - Seeds the child chat transcript with ONLY the selected message.
+    - Optionally shares all documents from the parent chat (no re-ingestion).
+    """
+    parent_chat_id = payload.get("parent_chat_id")
+    if not isinstance(parent_chat_id, str) or not parent_chat_id.strip():
+        raise HTTPException(status_code=400, detail="parent_chat_id is required")
+    parent_chat_id = parent_chat_id.strip()
+
+    msg = payload.get("message") or {}
+    if not isinstance(msg, dict):
+        raise HTTPException(status_code=400, detail="message must be an object")
+    role = msg.get("role")
+    if role not in {"user", "assistant"}:
+        raise HTTPException(status_code=400, detail="message.role must be 'user' or 'assistant'")
+    content = msg.get("content")
+    if not isinstance(content, str):
+        content = msg.get("text")
+    if not isinstance(content, str) or not content.strip():
+        raise HTTPException(status_code=400, detail="message.content is required")
+    content = content.strip()
+
+    share_docs = payload.get("share_docs")
+    share_docs = True if share_docs is None else bool(share_docs)
+
+    # Create a stable-ish ID that matches the rest of the app's "chat-*" convention.
+    child_chat_id = f"chat-{int(datetime.now(timezone.utc).timestamp() * 1000)}-{uuid.uuid4().hex[:6]}"
+
+    store, _ = AppDependencies.storage()
+
+    shared_file_ids: list[str] = []
+    if share_docs:
+        try:
+            shared_file_ids = store.list_file_ids_for_chat(parent_chat_id)
+        except Exception:
+            shared_file_ids = []
+
+        for fid in shared_file_ids:
+            try:
+                store.add_file_to_chat(child_chat_id, fid)
+            except Exception:
+                continue
+
+        # Copy any per-chat edited doc pages (best effort) so the child card opens with
+        # the same document view as the parent at branch time.
+        for fid in shared_file_ids:
+            try:
+                page = store.get_doc_page(parent_chat_id, fid)
+                if not page:
+                    continue
+                doc = page.get("doc")
+                if doc is None:
+                    continue
+                store.upsert_doc_page(
+                    child_chat_id,
+                    fid,
+                    title=str(page.get("title") or ""),
+                    doc=doc,
+                    is_user_edited=bool(page.get("is_user_edited") or False),
+                    source_file_updated_at=page.get("source_file_updated_at") if isinstance(page.get("source_file_updated_at"), str) else None,
+                )
+            except Exception:
+                continue
+
+    # Persist the seeded UI transcript message so the card shows up immediately.
+    message_id = f"msg_{uuid.uuid4().hex}"
+    created_at = datetime.now(timezone.utc).isoformat()
+    store.insert_message(
+        message_id=message_id,
+        chat_id=child_chat_id,
+        role=role,
+        content_json=json.dumps({"text": content}, ensure_ascii=False),
+        model="branch",
+        mode="chat",
+        planner_payload_json=None,
+        citations_json=None,
+        created_at=created_at,
+    )
+
+    # Seed the model session (clean KV) with the same message so the next turn
+    # continues naturally from the branched content.
+    try:
+        mgr = AppDependencies.session_manager()
+        mgr.seed_session_messages(
+            child_chat_id,
+            system_prompt="You are Insight, a local privacy-first AI assistant.",
+            messages=[{"role": role, "content": content}],
+        )
+    except Exception as exc:
+        logger.warning("Failed to seed branched KV session chat=%s: %s", child_chat_id, exc)
+
+    return {
+        "ok": True,
+        "child_chat_id": child_chat_id,
+        "parent_chat_id": parent_chat_id,
+        "shared_docs": share_docs,
+        "shared_file_ids": shared_file_ids if share_docs else [],
+    }
+
 @router.delete("/sessions/{chat_id}")
 def delete_session(chat_id: str):
     deleted: Dict[str, Any] = {"chat_id": chat_id}
 
+    store, _ = AppDependencies.storage()
+
     # 0) Cancel any in-flight ingestion jobs for this chat so they don't recreate chunks
-    # after we've deleted Qdrant/SQLite rows.
+    # after we've deleted Qdrant/SQLite rows. The scheduler will skip cancellation for
+    # files that are still shared by other chats.
     try:
         scheduler = AppDependencies.ingestion_scheduler()
         deleted["ingestion_jobs_cancelled"] = scheduler.cancel_chat(chat_id)
@@ -451,30 +463,51 @@ def delete_session(chat_id: str):
         logger.warning("Failed to cancel ingestion jobs for chat_id=%s: %s", chat_id, exc)
         deleted["ingestion_jobs_cancelled"] = 0
 
-    # 1) Gather file records before deleting metadata (for disk cleanup).
+    # 1) Gather file records and sharing info before deleting anything (for safe cleanup).
     file_rows: list[dict[str, object]] = []
+    file_ids: list[str] = []
+    file_ids_to_delete: list[str] = []
+    shared_file_ids: list[str] = []
     try:
-        store, _ = AppDependencies.storage()
         file_rows = store.list_files_for_chat(chat_id)
         deleted["files_found"] = len(file_rows)
+        file_ids = [r.get("id") for r in file_rows if isinstance(r.get("id"), str) and r.get("id")]
+        file_ids = [str(x) for x in file_ids if isinstance(x, str) and x]
+        for fid in file_ids:
+            chats = store.list_chat_ids_for_file(fid)
+            others = [c for c in chats if c != chat_id]
+            if others:
+                shared_file_ids.append(fid)
+            else:
+                file_ids_to_delete.append(fid)
     except Exception as exc:
         logger.warning("Failed to list files for chat_id=%s: %s", chat_id, exc)
+        file_rows = []
+        file_ids = []
+        file_ids_to_delete = []
+        shared_file_ids = []
 
-    # 2) Delete UI transcript + ingestion metadata in SQLite FIRST so any reload that
+    deleted["shared_file_ids"] = shared_file_ids
+    deleted["file_ids_deleted"] = file_ids_to_delete
+
+    # 2) Delete UI transcript + per-chat editor state in SQLite FIRST so any reload that
     # happens during KV deletion cannot "resurrect" the chat from transcript rows.
     try:
-        store, _ = AppDependencies.storage()
         deleted["sqlite_messages_deleted"] = store.delete_messages_for_chat(chat_id)
-        deleted["sqlite_chunks_deleted"] = None
-        try:
-            store.delete_chunks_for_chat(chat_id)
-            deleted["sqlite_chunks_deleted"] = True
-        except Exception:
-            deleted["sqlite_chunks_deleted"] = False
-        deleted["sqlite_jobs_deleted"] = store.delete_jobs_for_chat(chat_id)
-        deleted["sqlite_files_deleted"] = store.delete_files_for_chat(chat_id)
+        deleted["sqlite_doc_pages_deleted"] = store.delete_doc_pages_for_chat(chat_id)
+        deleted["sqlite_chat_files_deleted"] = store.delete_chat_files(chat_id)
     except Exception as exc:
         logger.warning("Failed to delete SQLite data for chat_id=%s: %s", chat_id, exc)
+
+    # 2b) Delete underlying file data ONLY if unreferenced by any other chat.
+    # This preserves shared documents across branched cards.
+    deleted["sqlite_file_cleanup"] = []
+    if file_ids_to_delete:
+        for fid in file_ids_to_delete:
+            try:
+                deleted["sqlite_file_cleanup"].append(store.delete_file_everywhere(fid))
+            except Exception as exc:
+                logger.warning("Failed to delete file rows for file_id=%s: %s", fid, exc)
 
     # 3) Delete KV session (model state + kv snapshots) AFTER SQLite transcript deletion.
     # This is what triggers the kv_sessions watcher event used by the UI.
@@ -486,18 +519,21 @@ def delete_session(chat_id: str):
         logger.warning("Failed to delete KV session for chat_id=%s: %s", chat_id, exc)
         deleted["kv_session_deleted"] = False
 
-    # 4) Delete RAG vectors from Qdrant (insight_chunks) for this chat
+    # 4) Delete RAG vectors from Qdrant (insight_chunks) for files that are no longer
+    # referenced by any chat. (Never delete by chat_id; documents can be shared.)
     try:
         rag_store = AppDependencies.rag_store()
         retrieval = getattr(rag_store, "retrieval", None)
-        if retrieval is not None and hasattr(retrieval, "delete_chunks_for_chat"):
-            retrieval.delete_chunks_for_chat(chat_id)
-            deleted["qdrant_chunks_deleted"] = True
-        else:
-            deleted["qdrant_chunks_deleted"] = False
+        deleted["qdrant_files_deleted"] = []
+        if retrieval is not None and hasattr(retrieval, "delete_chunks_for_file"):
+            for fid in file_ids_to_delete:
+                try:
+                    retrieval.delete_chunks_for_file(fid)
+                    deleted["qdrant_files_deleted"].append(fid)
+                except Exception as exc:
+                    logger.warning("Failed to delete Qdrant chunks for file_id=%s: %s", fid, exc)
     except Exception as exc:
-        logger.warning("Failed to delete Qdrant chunks for chat_id=%s: %s", chat_id, exc)
-        deleted["qdrant_chunks_deleted"] = False
+        logger.warning("Failed to delete Qdrant chunks for deleted files in chat_id=%s: %s", chat_id, exc)
 
     # 5) Delete LTM entries for this chat (Qdrant insight_memories)
     try:
@@ -509,13 +545,15 @@ def delete_session(chat_id: str):
         logger.warning("Failed to delete LTM for chat_id=%s: %s", chat_id, exc)
         deleted["ltm_deleted"] = False
 
-    # 6) Remove encrypted raw uploads from disk (best effort)
+    # 6) Remove encrypted raw uploads from disk (best effort, unreferenced files only)
     try:
         removed = 0
         workspace = AppDependencies.workspace()
         for row in file_rows:
             stored_path = row.get("stored_path")
             file_id = row.get("id")
+            if file_id not in file_ids_to_delete:
+                continue
             if isinstance(stored_path, str) and stored_path:
                 try:
                     p = Path(stored_path)
@@ -569,29 +607,19 @@ def _build_request(payload: Dict[str, Any]) -> PlannerRequest:
         selection = payload.get("selection")
         if selection is not None and not isinstance(selection, dict):
             selection = None
-        doc_scope_mode = payload.get("doc_scope_mode")
-        if not isinstance(doc_scope_mode, str):
-            doc_scope_mode = None
+        doc_pane_open = payload.get("doc_pane_open")
+        if not isinstance(doc_pane_open, bool):
+            doc_pane_open = None
         return PlannerRequest(
             chat_id=payload["chat_id"],
             query=payload["query"],
             documents=docs,
-            documents_text=payload.get("documents_text", []),
             attachments=payload.get("attachments", []) or [],
             focus_document_id=focus_document_id if isinstance(focus_document_id, str) else None,
-            doc_scope_mode=doc_scope_mode,
+            doc_pane_open=doc_pane_open,
             selection=selection,
             screenshot=payload.get("screenshot"),
             request_id=payload.get("request_id"),
         )
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=f"Missing field {exc.args[0]}") from exc
-
-
-def _truncate_doc_text(text: str) -> str:
-    # Only truncate very long inline docs to avoid overloading prompts.
-    if not text:
-        return ""
-    if len(text) > 20000:
-        return text[:20000]
-    return text

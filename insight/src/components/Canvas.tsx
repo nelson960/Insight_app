@@ -15,6 +15,9 @@ export type CardLayout = {
 export type CanvasNote = {
   chatId: string;
   title?: string;
+  locked?: boolean;
+  collapsed?: boolean;
+  groupColor?: string;
   x: number;
   y: number;
   w: number;
@@ -23,13 +26,43 @@ export type CanvasNote = {
   layout?: CardLayout;
 };
 
+export type CanvasLink = {
+  id: string;
+  fromChatId: string;
+  toChatId: string;
+  kind: "branch";
+};
+
 type Viewport = { x: number; y: number; scale: number };
 type Board = { w: number; h: number };
+type CardMenuState = {
+  chatId: string;
+  x: number;
+  y: number;
+  sub: null | "colors";
+  confirm: null | "deleteGroup";
+};
+
+type GroupStackAnim = {
+  mode: "collapse" | "expand";
+  active: boolean;
+  items: Record<
+    string,
+    {
+      dx: number; // world-space delta to move this card into the stack
+      dy: number; // world-space delta to move this card into the stack
+      scale: number;
+      rot: number; // degrees
+      z: number; // temporary z-index while stacking
+    }
+  >;
+};
 
 type Props = {
   sessions: ChatSummary[];
   activeChatId: string | null;
   notes: CanvasNote[];
+  links: CanvasLink[];
   onFocusChat: (chatId: string) => void;
   onUpdateNote: (chatId: string, patch: Partial<CanvasNote>) => void;
   onOpenChat: (chatId: string) => void;
@@ -37,6 +70,7 @@ type Props = {
   onOpenCard: (chatId: string) => void;
   onOpenSettings: () => void;
   onDeleteChat: (chatId: string) => void;
+  onDeleteChatTree: (rootChatId: string) => void;
   confirmDeleteChatId: string | null;
   loadingSessions: boolean;
   dockVisible?: boolean;
@@ -51,8 +85,56 @@ const ZOOM_SPEED = 0.0015;
 const BOARD_MULT = 3.2;
 const BOARD_MIN_W = 2200;
 const BOARD_MIN_H = 1400;
+const CARD_MENU_WIDTH = 220;
+const CARD_MENU_SUB_WIDTH = 200;
+const STACK_ANIM_MS = 340;
+const LINK_FADE_MS = 140;
+// Collapse should feel like "stacking cards behind" (not shrinking into a dot).
+// Keep this close to 1 so the animation blends into the full-size stack layers.
+const STACK_ANIM_SCALE = 0.92;
+
+const STACK_TARGETS: Array<{ ox: number; oy: number; rot: number }> = [
+  // Keep in sync with `.canvas-note-stack-*` transforms in `App.css`.
+  { ox: 7, oy: 7, rot: 0 },
+  { ox: 14, oy: 14, rot: 0 },
+  { ox: 21, oy: 21, rot: 0 },
+];
+
+const GROUP_COLORS: Array<{ id: string; label: string; value: string }> = [
+  { id: "blue", label: "Blue", value: "#3b82f6" },
+  { id: "purple", label: "Purple", value: "#a855f7" },
+  { id: "pink", label: "Pink", value: "#ec4899" },
+  { id: "red", label: "Red", value: "#ef4444" },
+  { id: "orange", label: "Orange", value: "#f97316" },
+  { id: "yellow", label: "Yellow", value: "#eab308" },
+  { id: "green", label: "Green", value: "#22c55e" },
+  { id: "slate", label: "Slate", value: "#64748b" },
+];
 
 const VIEWPORT_STORAGE_KEY = "insight.canvas.viewport.v1";
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const m = /^#([0-9a-fA-F]{6})$/.exec((hex || "").trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
+function rgbaFromHex(hex: string, alpha: number): string | null {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return null;
+  const a = Math.max(0, Math.min(1, alpha));
+  return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${a})`;
+}
+
+function hashString(input: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
 
 function loadPersistedViewport(): Viewport | null {
   try {
@@ -82,6 +164,7 @@ export function Canvas({
   sessions,
   activeChatId,
   notes,
+  links,
   onFocusChat,
   onUpdateNote,
   onOpenChat,
@@ -89,6 +172,7 @@ export function Canvas({
   onOpenCard,
   onOpenSettings,
   onDeleteChat,
+  onDeleteChatTree,
   confirmDeleteChatId,
   loadingSessions,
   dockVisible = true,
@@ -96,6 +180,10 @@ export function Canvas({
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [vp, setVp] = useState<Viewport>({ x: 0, y: 0, scale: 1 });
   const vpRef = useRef(vp);
+  const [groupStackAnim, setGroupStackAnim] = useState<Record<string, GroupStackAnim>>({});
+  const groupStackAnimTimersRef = useRef<Record<string, number>>({});
+  const groupStackAnimStartTimersRef = useRef<Record<string, number>>({});
+  const groupStackAnimRafRef = useRef<Record<string, number>>({});
   const [board, setBoard] = useState<Board>({ w: 0, h: 0 }); // world-space board size
   const boardRef = useRef(board);
   const viewRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 }); // screen-space canvas size
@@ -107,9 +195,11 @@ export function Canvas({
   });
   const [isPanning, setIsPanning] = useState(false);
   const [chatListOpen, setChatListOpen] = useState(false);
+  const [cardMenu, setCardMenu] = useState<CardMenuState | null>(null);
   const [filesByChatId, setFilesByChatId] = useState<Record<string, string[]>>({});
   const chatIdSetRef = useRef<Set<string>>(new Set());
   const fileReloadTimersRef = useRef<Record<string, number>>({});
+  const cardMenuRef = useRef<HTMLDivElement | null>(null);
   const panRef = useRef<{ startX: number; startY: number; startVpX: number; startVpY: number } | null>(
     null
   );
@@ -125,6 +215,245 @@ export function Canvas({
     for (const n of notes) map.set(n.chatId, n);
     return map;
   }, [notes]);
+
+  const tree = useMemo(() => {
+    const parentByChild = new Map<string, string>();
+    const childrenByParent = new Map<string, string[]>();
+    for (const l of links) {
+      if (l.kind !== "branch") continue;
+      if (!parentByChild.has(l.toChatId)) parentByChild.set(l.toChatId, l.fromChatId);
+      const arr = childrenByParent.get(l.fromChatId) || [];
+      arr.push(l.toChatId);
+      childrenByParent.set(l.fromChatId, arr);
+    }
+    return { parentByChild, childrenByParent };
+  }, [links]);
+
+  useEffect(() => {
+    return () => {
+      const timers = groupStackAnimTimersRef.current;
+      for (const k of Object.keys(timers)) window.clearTimeout(timers[k]);
+      const startTimers = groupStackAnimStartTimersRef.current;
+      for (const k of Object.keys(startTimers)) window.clearTimeout(startTimers[k]);
+      const rafs = groupStackAnimRafRef.current;
+      for (const k of Object.keys(rafs)) cancelAnimationFrame(rafs[k]);
+    };
+  }, []);
+
+  function listDescendants(rootChatId: string): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const stack = [...(tree.childrenByParent.get(rootChatId) || [])];
+    while (stack.length) {
+      const id = stack.pop();
+      if (!id) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+      const kids = tree.childrenByParent.get(id);
+      if (kids && kids.length) stack.push(...kids);
+    }
+    return out;
+  }
+
+  function startGroupStackAnimation(rootChatId: string, mode: "collapse" | "expand") {
+    const root = noteById.get(rootChatId);
+    if (!root) return;
+    const descendants = listDescendants(rootChatId);
+    if (!descendants.length) return;
+
+    const items: GroupStackAnim["items"] = {};
+    for (const id of descendants) {
+      const n = noteById.get(id);
+      if (!n) continue;
+      const h = hashString(`${rootChatId}:${id}`);
+      const target = STACK_TARGETS[h % STACK_TARGETS.length];
+      const rot = target.rot;
+      const stackZ = Math.max(1, root.z - 1);
+      const z = Math.min(n.z, stackZ);
+      items[id] = {
+        dx: root.x - n.x + target.ox,
+        dy: root.y - n.y + target.oy,
+        scale: STACK_ANIM_SCALE,
+        rot,
+        z,
+      };
+    }
+
+    const initialActive = mode === "expand";
+    const nextActive = mode === "collapse";
+
+    const timers = groupStackAnimTimersRef.current;
+    const startTimers = groupStackAnimStartTimersRef.current;
+    const rafs = groupStackAnimRafRef.current;
+    if (timers[rootChatId]) window.clearTimeout(timers[rootChatId]);
+    if (startTimers[rootChatId]) window.clearTimeout(startTimers[rootChatId]);
+    if (rafs[rootChatId]) cancelAnimationFrame(rafs[rootChatId]);
+
+    setGroupStackAnim((prev) => ({
+      ...prev,
+      [rootChatId]: { mode, active: initialActive, items },
+    }));
+
+    if (mode === "collapse") {
+      startTimers[rootChatId] = window.setTimeout(() => {
+        delete startTimers[rootChatId];
+        setGroupStackAnim((prev) => {
+          const cur = prev[rootChatId];
+          if (!cur || cur.mode !== mode) return prev;
+          return { ...prev, [rootChatId]: { ...cur, active: nextActive } };
+        });
+      }, LINK_FADE_MS);
+    } else {
+      rafs[rootChatId] = requestAnimationFrame(() => {
+        delete rafs[rootChatId];
+        setGroupStackAnim((prev) => {
+          const cur = prev[rootChatId];
+          if (!cur || cur.mode !== mode) return prev;
+          return { ...prev, [rootChatId]: { ...cur, active: nextActive } };
+        });
+      });
+    }
+
+    timers[rootChatId] = window.setTimeout(() => {
+      delete timers[rootChatId];
+      setGroupStackAnim((prev) => {
+        if (!prev[rootChatId]) return prev;
+        const next = { ...prev };
+        delete next[rootChatId];
+        return next;
+      });
+    }, (mode === "collapse" ? LINK_FADE_MS : 0) + STACK_ANIM_MS + 60);
+  }
+
+  const hiddenChatIds = useMemo(() => {
+    const hidden = new Set<string>();
+    const collapsedRoots = notes
+      .filter((n) => n.collapsed && groupStackAnim[n.chatId]?.mode !== "collapse")
+      .map((n) => n.chatId);
+    if (!collapsedRoots.length) return hidden;
+    for (const root of collapsedRoots) {
+      const stack = [...(tree.childrenByParent.get(root) || [])];
+      while (stack.length) {
+        const id = stack.pop();
+        if (!id) continue;
+        if (hidden.has(id)) continue;
+        hidden.add(id);
+        const kids = tree.childrenByParent.get(id);
+        if (kids && kids.length) stack.push(...kids);
+      }
+    }
+    return hidden;
+  }, [notes, tree, groupStackAnim]);
+
+  const visibleNotes = useMemo(() => {
+    if (!hiddenChatIds.size) return notes;
+    return notes.filter((n) => !hiddenChatIds.has(n.chatId));
+  }, [notes, hiddenChatIds]);
+
+  const stackCountByChatId = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const n of notes) {
+      if (!n.collapsed) continue;
+      const seen = new Set<string>();
+      const stack = [...(tree.childrenByParent.get(n.chatId) || [])];
+      while (stack.length) {
+        const id = stack.pop();
+        if (!id) continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const kids = tree.childrenByParent.get(id);
+        if (kids && kids.length) stack.push(...kids);
+      }
+      if (seen.size) out[n.chatId] = seen.size;
+    }
+    return out;
+  }, [notes, tree]);
+
+  const stackAnimByChatId = useMemo(() => {
+    const out: Record<
+      string,
+      {
+        active: boolean;
+        mode: "collapse" | "expand";
+        dx: number;
+        dy: number;
+        scale: number;
+        rot: number;
+        z: number;
+      }
+    > = {};
+    for (const rootId of Object.keys(groupStackAnim)) {
+      const anim = groupStackAnim[rootId];
+      if (!anim) continue;
+      for (const id of Object.keys(anim.items)) {
+        const it = anim.items[id];
+        if (!it) continue;
+        out[id] = {
+          active: anim.active,
+          mode: anim.mode,
+          dx: it.dx,
+          dy: it.dy,
+          scale: it.scale,
+          rot: it.rot,
+          z: it.z,
+        };
+      }
+    }
+    return out;
+  }, [groupStackAnim]);
+
+  const effectiveGroupColorByChatId = useMemo(() => {
+    const out: Record<string, string> = {};
+
+    const resolve = (chatId: string): string | null => {
+      let cur: string | undefined = chatId;
+      const seen = new Set<string>();
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        const note = noteById.get(cur);
+        const c = typeof note?.groupColor === "string" ? note.groupColor.trim() : "";
+        if (c) return c;
+        cur = tree.parentByChild.get(cur);
+      }
+      return null;
+    };
+
+    for (const n of notes) {
+      const c = resolve(n.chatId);
+      if (c) out[n.chatId] = c;
+    }
+    return out;
+  }, [notes, noteById, tree]);
+
+  const fadingLinkToChatIds = useMemo(() => {
+    const fading = new Set<string>();
+    for (const rootId of Object.keys(groupStackAnim)) {
+      const anim = groupStackAnim[rootId];
+      if (!anim || anim.mode !== "collapse") continue;
+      for (const id of Object.keys(anim.items)) fading.add(id);
+    }
+    return fading;
+  }, [groupStackAnim]);
+
+  function openCardMenu(chatId: string, clientX: number, clientY: number) {
+    if (!chatId) return;
+    onFocusChat(chatId);
+    setCardMenu({ chatId, x: clientX, y: clientY, sub: null, confirm: null });
+  }
+
+  function closeCardMenu() {
+    setCardMenu(null);
+  }
+
+  useEffect(() => {
+    if (!cardMenu) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeCardMenu();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [cardMenu]);
 
   const chatIdsKey = useMemo(() => {
     const ids = [...new Set(notes.map((n) => n.chatId))].sort();
@@ -340,6 +669,14 @@ export function Canvas({
       onUpdateNote(chatId, patch);
       return;
     }
+
+    if (typeof patch.collapsed === "boolean" && patch.collapsed !== !!current.collapsed) {
+      const hasChildren = (tree.childrenByParent.get(chatId) || []).length > 0;
+      if (hasChildren) {
+        startGroupStackAnimation(chatId, patch.collapsed ? "collapse" : "expand");
+      }
+    }
+
     const merged = { ...current, ...patch };
     let clamped = clampNoteToBoard(merged);
     if (opts?.clampToViewport) {
@@ -545,6 +882,75 @@ export function Canvas({
   const renderX = Math.round(vp.x * dpr) / dpr;
   const renderY = Math.round(vp.y * dpr) / dpr;
 
+  function pointOnRectEdge(from: CanvasNote, toward: { x: number; y: number }) {
+    const cx = from.x + from.w / 2;
+    const cy = from.y + from.h / 2;
+    const dx = toward.x - cx;
+    const dy = toward.y - cy;
+    if (!dx && !dy) return { x: cx, y: cy };
+    const hw = from.w / 2;
+    const hh = from.h / 2;
+    const t = 1 / Math.max(Math.abs(dx) / hw, Math.abs(dy) / hh);
+    return { x: cx + dx * t, y: cy + dy * t };
+  }
+
+  const linkPaths = useMemo(() => {
+    if (!links.length) return [];
+    const out: Array<{ id: string; d: string; color: string; arrowPoints: string; fade: boolean }> =
+      [];
+    for (const l of links) {
+      const from = noteById.get(l.fromChatId);
+      const to = noteById.get(l.toChatId);
+      if (!from || !to) continue;
+      if (hiddenChatIds.has(from.chatId) || hiddenChatIds.has(to.chatId)) continue;
+      const toCenter = { x: to.x + to.w / 2, y: to.y + to.h / 2 };
+      const fromCenter = { x: from.x + from.w / 2, y: from.y + from.h / 2 };
+
+      const sW = pointOnRectEdge(from, toCenter);
+      const eW = pointOnRectEdge(to, fromCenter);
+
+      const sx = Math.round(sW.x * vp.scale * dpr) / dpr;
+      const sy = Math.round(sW.y * vp.scale * dpr) / dpr;
+      const ex = Math.round(eW.x * vp.scale * dpr) / dpr;
+      const ey = Math.round(eW.y * vp.scale * dpr) / dpr;
+
+      const dx = ex - sx;
+      const curve = Math.max(70, Math.min(240, Math.abs(dx) * 0.55));
+      const dir = dx === 0 ? 1 : Math.sign(dx);
+      const c1x = sx + curve * dir;
+      const c1y = sy;
+      const c2x = ex - curve * dir;
+      const c2y = ey;
+
+      const color = effectiveGroupColorByChatId[l.fromChatId] || "var(--accent)";
+      const d = `M ${sx} ${sy} C ${c1x} ${c1y} ${c2x} ${c2y} ${ex} ${ey}`;
+      const fade = fadingLinkToChatIds.has(l.toChatId);
+
+      // Arrow head at the end of the curve. We avoid SVG markers so each link can be colored.
+      const tx = ex - c2x;
+      const ty = ey - c2y;
+      const mag = Math.hypot(tx, ty) || 1;
+      const ux = tx / mag;
+      const uy = ty / mag;
+      const arrowLen = 10;
+      const arrowW = 4.5;
+      const bx = ex - ux * arrowLen;
+      const by = ey - uy * arrowLen;
+      const px = -uy;
+      const py = ux;
+      const a1 = `${Math.round(ex * dpr) / dpr},${Math.round(ey * dpr) / dpr}`;
+      const a2 = `${Math.round((bx + px * arrowW) * dpr) / dpr},${Math.round(
+        (by + py * arrowW) * dpr
+      ) / dpr}`;
+      const a3 = `${Math.round((bx - px * arrowW) * dpr) / dpr},${Math.round(
+        (by - py * arrowW) * dpr
+      ) / dpr}`;
+
+      out.push({ id: l.id, d, color, fade, arrowPoints: `${a1} ${a2} ${a3}` });
+    }
+    return out;
+  }, [links, noteById, vp.scale, dpr, hiddenChatIds, effectiveGroupColorByChatId, fadingLinkToChatIds]);
+
   const dock = (
     <div className="canvas-dock" onPointerDown={(e) => e.stopPropagation()}>
       <div className="canvas-dock-row">
@@ -663,10 +1069,38 @@ export function Canvas({
             }}
           />
         ) : null}
-        {notes.map((n) => {
+        {board.w && board.h && linkPaths.length ? (
+          <svg
+            className="canvas-links"
+            width={Math.round(board.w * vp.scale * dpr) / dpr}
+            height={Math.round(board.h * vp.scale * dpr) / dpr}
+            aria-hidden="true"
+          >
+            {linkPaths.map((p) => (
+              <g key={p.id}>
+                <path
+                  d={p.d}
+                  className="canvas-link-path"
+                  style={{ stroke: p.color, opacity: p.fade ? 0 : undefined }}
+                />
+                <polygon
+                  points={p.arrowPoints}
+                  className="canvas-link-arrow"
+                  style={{ fill: p.color, opacity: p.fade ? 0 : undefined }}
+                />
+              </g>
+            ))}
+          </svg>
+        ) : null}
+        {visibleNotes.map((n) => {
           const noteTitle = typeof n.title === "string" ? n.title.trim() : "";
           const title = noteTitle || sessionById.get(n.chatId)?.title || n.chatId;
           const isActive = n.chatId === activeChatId;
+          const locked = !!n.locked;
+          const collapsed = !!n.collapsed;
+          const stackCount = stackCountByChatId[n.chatId] || 0;
+          const accentColor = effectiveGroupColorByChatId[n.chatId] || null;
+          const confirmDelete = confirmDeleteChatId === n.chatId;
           return (
             <ChatNote
               key={n.chatId}
@@ -681,11 +1115,23 @@ export function Canvas({
               scale={vp.scale}
               dpr={dpr}
               active={isActive}
+              locked={locked}
+              collapsed={collapsed}
+              stackCount={stackCount}
+              stackAnim={stackAnimByChatId[n.chatId] || null}
+              accentColor={accentColor}
+              confirmDelete={confirmDelete}
               onFocus={() => onFocusChat(n.chatId)}
               onUpdate={(patch, opts) => applyUpdateNote(n.chatId, patch, opts)}
               onOpen={() => onOpenChat(n.chatId)}
               // Default card open shows split view (docs + chat).
               onOpenCard={() => onOpenCard(n.chatId)}
+              onDelete={() => onDeleteChat(n.chatId)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openCardMenu(n.chatId, e.clientX, e.clientY);
+              }}
             />
           );
         })}
@@ -693,6 +1139,153 @@ export function Canvas({
       </div>
       {dockVisible && typeof document !== "undefined" && document.body
         ? createPortal(dock, document.body)
+        : null}
+      {cardMenu && typeof document !== "undefined" && document.body
+        ? createPortal(
+            (() => {
+              const note = noteById.get(cardMenu.chatId);
+              if (!note) return null;
+              const locked = !!note.locked;
+              const collapsed = !!note.collapsed;
+              const hasChildren = (tree.childrenByParent.get(cardMenu.chatId) || []).length > 0;
+              const stackCount = stackCountByChatId[cardMenu.chatId] || 0;
+              const effectiveColor = effectiveGroupColorByChatId[cardMenu.chatId] || "";
+
+              const winW = typeof window !== "undefined" ? window.innerWidth : 1024;
+              const winH = typeof window !== "undefined" ? window.innerHeight : 768;
+              const baseX = Math.min(cardMenu.x, Math.max(8, winW - CARD_MENU_WIDTH - 8));
+              const baseY = Math.min(cardMenu.y, Math.max(8, winH - 200));
+              const subToLeft = baseX + CARD_MENU_WIDTH + CARD_MENU_SUB_WIDTH + 10 > winW;
+              const subX = subToLeft ? baseX - CARD_MENU_SUB_WIDTH - 8 : baseX + CARD_MENU_WIDTH + 8;
+              const subY = Math.min(baseY, Math.max(8, winH - 220));
+
+              return (
+                <div
+                  className="canvas-card-menu-overlay"
+                  onPointerDown={() => closeCardMenu()}
+                  onContextMenu={(e) => e.preventDefault()}
+                >
+                  <div
+                    ref={cardMenuRef}
+                    className="canvas-card-menu"
+                    style={{ left: baseX, top: baseY }}
+                    role="menu"
+                    aria-label="Card menu"
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      className="canvas-card-menu-item"
+                      onClick={() => {
+                        onUpdateNote(cardMenu.chatId, { locked: !locked });
+                        closeCardMenu();
+                      }}
+                    >
+                      {locked ? "Unlock card" : "Lock card"}
+                    </button>
+
+                    {hasChildren ? (
+                      <button
+                        type="button"
+                        className="canvas-card-menu-item"
+                        onClick={() => {
+                          applyUpdateNote(cardMenu.chatId, { collapsed: !collapsed });
+                          closeCardMenu();
+                        }}
+                      >
+                        {collapsed ? "Expand group" : "Collapse group"}
+                      </button>
+                    ) : null}
+
+                    <button
+                      type="button"
+                      className="canvas-card-menu-item"
+                      onClick={() =>
+                        setCardMenu((prev) =>
+                          prev && prev.chatId === cardMenu.chatId
+                            ? {
+                                ...prev,
+                                sub: prev.sub === "colors" ? null : "colors",
+                                confirm: null,
+                              }
+                            : prev
+                        )
+                      }
+                    >
+                      Group color <span className="canvas-card-menu-arrow">▸</span>
+                    </button>
+
+                    {collapsed && stackCount > 0 ? (
+                      <button
+                        type="button"
+                        className={`canvas-card-menu-item canvas-card-menu-item-danger ${
+                          cardMenu.confirm === "deleteGroup" ? "confirm" : ""
+                        }`}
+                        onClick={() => {
+                          if (cardMenu.confirm !== "deleteGroup") {
+                            setCardMenu((prev) =>
+                              prev && prev.chatId === cardMenu.chatId
+                                ? { ...prev, confirm: "deleteGroup", sub: null }
+                                : prev
+                            );
+                            return;
+                          }
+                          onDeleteChatTree(cardMenu.chatId);
+                          closeCardMenu();
+                        }}
+                      >
+                        {cardMenu.confirm === "deleteGroup"
+                          ? "Confirm delete group"
+                          : "Delete group"}
+                      </button>
+                    ) : null}
+                  </div>
+
+                  {cardMenu.sub === "colors" ? (
+                    <div
+                      className="canvas-card-menu-sub"
+                      style={{ left: subX, top: subY }}
+                      role="menu"
+                      aria-label="Group color"
+                      onPointerDown={(e) => e.stopPropagation()}
+                    >
+                      <div className="canvas-card-menu-sub-title">Group color</div>
+                      <div className="canvas-card-color-row">
+                        {GROUP_COLORS.map((c) => {
+                          const selected = effectiveColor === c.value;
+                          return (
+                            <button
+                              key={c.id}
+                              type="button"
+                              className={`canvas-card-color ${selected ? "active" : ""}`}
+                              title={c.label}
+                              aria-label={c.label}
+                              onClick={() => {
+                                onUpdateNote(cardMenu.chatId, { groupColor: c.value });
+                                closeCardMenu();
+                              }}
+                              style={{ backgroundColor: c.value }}
+                            />
+                          );
+                        })}
+                      </div>
+                      <button
+                        type="button"
+                        className="canvas-card-menu-item canvas-card-menu-item-muted"
+                        onClick={() => {
+                          onUpdateNote(cardMenu.chatId, { groupColor: undefined });
+                          closeCardMenu();
+                        }}
+                      >
+                        Clear color
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })(),
+            document.body
+          )
         : null}
     </>
   );
@@ -710,10 +1303,18 @@ function ChatNote({
   scale,
   dpr,
   active,
+  locked,
+  collapsed,
+  stackCount,
+  stackAnim,
+  accentColor,
+  confirmDelete,
   onFocus,
   onOpen,
   onOpenCard,
+  onDelete,
   onUpdate,
+  onContextMenu,
 }: {
   chatId: string;
   title: string;
@@ -726,10 +1327,26 @@ function ChatNote({
   scale: number;
   dpr: number;
   active: boolean;
+  locked: boolean;
+  collapsed: boolean;
+  stackCount: number;
+  stackAnim: null | {
+    active: boolean;
+    mode: "collapse" | "expand";
+    dx: number;
+    dy: number;
+    scale: number;
+    rot: number;
+    z: number;
+  };
+  accentColor: string | null;
+  confirmDelete: boolean;
   onFocus: () => void;
   onOpen: () => void;
   onOpenCard: () => void;
+  onDelete: () => void;
   onUpdate: (patch: Partial<CanvasNote>, opts?: { clampToViewport?: boolean }) => void;
+  onContextMenu: (e: React.MouseEvent) => void;
 }) {
   const dragRef = useRef<{ startX: number; startY: number; startPx: number; startPy: number } | null>(
     null
@@ -782,6 +1399,7 @@ function ChatNote({
   }
 
   function beginDrag(e: React.PointerEvent) {
+    if (locked) return;
     if (e.button !== 0) return;
     const t = e.target as HTMLElement | null;
     if (t && (t.closest("button") || t.closest("input"))) return;
@@ -825,6 +1443,7 @@ function ChatNote({
 
   function beginResize(dir: ResizeDir) {
     return (e: React.PointerEvent) => {
+      if (locked) return;
       if (e.button !== 0) return;
       e.preventDefault();
       e.stopPropagation();
@@ -891,16 +1510,30 @@ function ChatNote({
 
   return (
     <div
-      className={`canvas-note ${active ? "active" : ""}`}
+      className={`canvas-note ${active ? "active" : ""} ${locked ? "locked" : ""} ${
+        collapsed ? "collapsed" : ""
+      } ${stackAnim ? "stack-anim" : ""}`}
       style={{
         transform: `translate(${Math.round(x * scale * dpr) / dpr}px, ${Math.round(
           y * scale * dpr
-        ) / dpr}px)`,
+        ) / dpr}px) translate(${Math.round(((stackAnim?.active ? stackAnim.dx : 0) || 0) * scale * dpr) / dpr}px, ${Math.round(
+          ((stackAnim?.active ? stackAnim.dy : 0) || 0) * scale * dpr
+        ) / dpr}px) scale(${stackAnim?.active ? stackAnim.scale : 1}) rotate(${stackAnim?.active ? stackAnim.rot : 0}deg)`,
         width: `${Math.round(w * scale * dpr) / dpr}px`,
         height: `${Math.round(h * scale * dpr) / dpr}px`,
-        zIndex: z,
+        zIndex: stackAnim && stackAnim.active ? stackAnim.z : z,
+        opacity: stackAnim ? (stackAnim.active ? 0 : 1) : 1,
+        pointerEvents: stackAnim ? "none" : undefined,
+        ...(accentColor
+          ? {
+              ["--card-border" as any]: rgbaFromHex(accentColor, 0.55) ?? accentColor,
+              ["--card-ring" as any]: rgbaFromHex(accentColor, 0.78) ?? accentColor,
+              ["--card-stack" as any]: rgbaFromHex(accentColor, 0.48) ?? accentColor,
+            }
+          : {}),
       }}
       onPointerDown={() => bringToFront()}
+      onContextMenu={onContextMenu}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
@@ -911,6 +1544,13 @@ function ChatNote({
       role="group"
       aria-label={`Card ${title}`}
     >
+      {collapsed && stackCount > 0 ? (
+        <>
+          <div className="canvas-note-stack canvas-note-stack-3" aria-hidden="true" />
+          <div className="canvas-note-stack canvas-note-stack-2" aria-hidden="true" />
+          <div className="canvas-note-stack canvas-note-stack-1" aria-hidden="true" />
+        </>
+      ) : null}
       <div className="canvas-note-inner">
         <div
           className="canvas-note-header"
@@ -942,19 +1582,57 @@ function ChatNote({
               aria-label="Rename card"
             />
           ) : (
-            <div
-              className="canvas-note-title"
-              title={title}
-              aria-label={chatId}
-              onDoubleClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setTitleDraft(title);
-                setIsRenaming(true);
-              }}
-            >
-              {title}
-            </div>
+            <>
+              <div
+                className="canvas-note-title"
+                title={title}
+                aria-label={chatId}
+                onDoubleClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setTitleDraft(title);
+                  setIsRenaming(true);
+                }}
+              >
+                {title}
+              </div>
+              <div className="canvas-note-header-right">
+                {locked ? (
+                  <div className="canvas-note-lock" title="Locked" aria-label="Locked">
+                    🔒
+                  </div>
+                ) : null}
+                {collapsed && stackCount > 0 ? (
+                  <button
+                    type="button"
+                    className="canvas-note-stack-badge"
+                    title={`Expand ${stackCount} hidden card${stackCount === 1 ? "" : "s"}`}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onUpdate({ collapsed: false });
+                    }}
+                  >
+                    +{stackCount}
+                  </button>
+                ) : null}
+                {!collapsed ? (
+                  <button
+                    type="button"
+                    className={`canvas-note-del ${confirmDelete ? "confirm" : ""}`}
+                    title={confirmDelete ? "Click again to confirm delete" : "Delete card"}
+                    aria-label={`Delete card ${title}`}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onDelete();
+                    }}
+                  >
+                    {confirmDelete ? "Del" : "×"}
+                  </button>
+                ) : null}
+              </div>
+            </>
           )}
         </div>
         <div
@@ -970,6 +1648,10 @@ function ChatNote({
             e.preventDefault();
             e.stopPropagation();
             bringToFront();
+            if (collapsed && stackCount > 0) {
+              onUpdate({ collapsed: false });
+              return;
+            }
             onOpenCard();
           }}
           role="button"
@@ -996,14 +1678,50 @@ function ChatNote({
           </div>
         </div>
       </div>
-      <div className="canvas-note-handle canvas-note-handle-n" onPointerDown={beginResize("n")} role="presentation" />
-      <div className="canvas-note-handle canvas-note-handle-s" onPointerDown={beginResize("s")} role="presentation" />
-      <div className="canvas-note-handle canvas-note-handle-e" onPointerDown={beginResize("e")} role="presentation" />
-      <div className="canvas-note-handle canvas-note-handle-w" onPointerDown={beginResize("w")} role="presentation" />
-      <div className="canvas-note-handle canvas-note-handle-ne" onPointerDown={beginResize("ne")} role="presentation" />
-      <div className="canvas-note-handle canvas-note-handle-nw" onPointerDown={beginResize("nw")} role="presentation" />
-      <div className="canvas-note-handle canvas-note-handle-se" onPointerDown={beginResize("se")} role="presentation" />
-      <div className="canvas-note-handle canvas-note-handle-sw" onPointerDown={beginResize("sw")} role="presentation" />
+      {!locked ? (
+        <>
+          <div
+            className="canvas-note-handle canvas-note-handle-n"
+            onPointerDown={beginResize("n")}
+            role="presentation"
+          />
+          <div
+            className="canvas-note-handle canvas-note-handle-s"
+            onPointerDown={beginResize("s")}
+            role="presentation"
+          />
+          <div
+            className="canvas-note-handle canvas-note-handle-e"
+            onPointerDown={beginResize("e")}
+            role="presentation"
+          />
+          <div
+            className="canvas-note-handle canvas-note-handle-w"
+            onPointerDown={beginResize("w")}
+            role="presentation"
+          />
+          <div
+            className="canvas-note-handle canvas-note-handle-ne"
+            onPointerDown={beginResize("ne")}
+            role="presentation"
+          />
+          <div
+            className="canvas-note-handle canvas-note-handle-nw"
+            onPointerDown={beginResize("nw")}
+            role="presentation"
+          />
+          <div
+            className="canvas-note-handle canvas-note-handle-se"
+            onPointerDown={beginResize("se")}
+            role="presentation"
+          />
+          <div
+            className="canvas-note-handle canvas-note-handle-sw"
+            onPointerDown={beginResize("sw")}
+            role="presentation"
+          />
+        </>
+      ) : null}
     </div>
   );
 }

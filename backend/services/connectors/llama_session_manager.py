@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import copy
 import uuid
 import logging
 import re
 import math
+import os
 from pathlib import Path
 from typing import Dict, Optional, List
 
 import atexit
 import json
-import pickle
 import queue
 import threading
 import time
@@ -21,6 +22,11 @@ from llama_cpp import Llama
 from backend.services.storage.sqlite_store import SQLiteMetadataStore
 from backend.services.ipc_events import emit_event
 
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
+
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +36,7 @@ class LlamaSessionManager:
     _PERSIST_DEBOUNCE_SEC = 0.75
     _SNAPSHOT_DEBOUNCE_SEC = 0.35
     _STATE_KIND_COMPACT = "llama_state_compact_v1"
+    _KV_FILE_FORMAT = "raw_llama_state_v1"
     """
     Single-model, multi-session manager using llama_cpp KV snapshots.
 
@@ -242,6 +249,52 @@ class LlamaSessionManager:
         self.sessions[session_id] = session_payload
         self._persist_session(session_id, session_payload)
         return session_id
+
+    def seed_session_messages(
+        self,
+        session_id: str,
+        *,
+        messages: List[Dict[str, str]],
+        system_prompt: Optional[str] = None,
+    ) -> None:
+        """
+        Initialize (or overwrite) a session's clean message history and KV state.
+
+        This is used for "branching" to a new chat/card: we create a new chat_id and
+        seed it with a single selected message (user or assistant) without running
+        any model generation.
+        """
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id is required")
+        if not isinstance(messages, list):
+            raise ValueError("messages must be a list")
+
+        lock = self._locks.setdefault(session_id, threading.RLock())
+        with lock:
+            # Ensure the session exists and has a system message.
+            self.get_or_create_session(session_id, system_prompt=system_prompt)
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise RuntimeError(f"Failed to create session {session_id}")
+
+            # Preserve the current system prompt (first system message) unless the caller
+            # explicitly provided a system message in `messages`.
+            normalized: List[Dict[str, str]] = []
+            if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+                normalized = messages
+            else:
+                base_system: List[Dict[str, str]] = [
+                    m for m in (session.get("messages") or []) if isinstance(m, dict) and m.get("role") == "system"
+                ]
+                normalized = base_system + messages
+
+            # Apply to KV/messages.
+            with self._model_lock:
+                self._ensure_session_loaded(session_id, session)
+                self._commit_messages_to_session(session_id, session, normalized)
+
+            self.sessions[session_id] = session
+            self._persist_session(session_id, session)
 
     def ask_stream(
         self,
@@ -1366,8 +1419,8 @@ class LlamaSessionManager:
         if session is None:
             raise ValueError(f"Unknown session to fork: {session_id}")
         new_session_id = str(uuid.uuid4())
-        # Deep copy state to avoid shared reference
-        state_copy = pickle.loads(pickle.dumps(session["state"]))
+        # Deep copy state to avoid shared reference (do not use pickle).
+        state_copy = copy.deepcopy(session.get("state"))
         fork_payload = {
             "state": state_copy,
             "messages": list(session["messages"]),
@@ -1538,11 +1591,17 @@ class LlamaSessionManager:
         if not self.persist_dir or not self.persist_dir.exists():
             return
         # Load .kv state + .json messages + optional .meta.json.
+        #
+        # Security note: historically we pickled the state object into `.kv`. Pickle is unsafe
+        # to load from disk because it can execute code. We now persist `.kv` as raw
+        # llama_state bytes and keep the small metadata needed to restore it in `.meta.json`.
+        #
+        # For legacy `.kv` files that do not declare the new format, we intentionally avoid
+        # unpickling and instead mark the session dirty so it will rebuild KV from the
+        # stored clean messages on first use.
         for path in self.persist_dir.glob("*.kv"):
             try:
                 session_id = path.stem
-                with path.open("rb") as f:
-                    state = self._coerce_state_compact(pickle.load(f))
                 msg_path = self.persist_dir / f"{session_id}.json"
                 messages: List[Dict[str, str]] = []
                 if msg_path.exists():
@@ -1557,13 +1616,51 @@ class LlamaSessionManager:
                         meta = json.loads(meta_path.read_text()) or {}
                     except Exception:
                         meta = {}
-                session_payload: Dict[str, object] = {"state": state, "messages": messages}
+
+                state_obj: object | None = None
+                is_new_format = False
+                if isinstance(meta, dict):
+                    is_new_format = (
+                        meta.get("kv_format") == self._KV_FILE_FORMAT
+                        and meta.get("state_kind") == self._STATE_KIND_COMPACT
+                    )
+
+                if is_new_format:
+                    llama_state = path.read_bytes()
+                    size = int(meta.get("llama_state_size") or len(llama_state) or 0)
+                    n_tokens = int(meta.get("n_tokens") or 0)
+                    seed = int(meta.get("seed") or 0)
+                    input_ids = meta.get("input_ids")
+                    # Convert list → numpy array when available (matches llama_cpp internals).
+                    if np is not None and isinstance(input_ids, list):
+                        try:
+                            input_ids = np.array(input_ids, dtype=np.int32)  # type: ignore[call-arg]
+                        except Exception:
+                            input_ids = None
+                    state_obj = {
+                        "_kind": self._STATE_KIND_COMPACT,
+                        "llama_state": llama_state[:size],
+                        "llama_state_size": size,
+                        "n_tokens": n_tokens,
+                        "input_ids": input_ids,
+                        "seed": seed,
+                    }
+                else:
+                    # Legacy persisted KV is not loaded; force a rebuild from clean messages later.
+                    state_obj = None
+
+                session_payload: Dict[str, object] = {"state": state_obj, "messages": messages}
                 if isinstance(meta, dict):
                     for k in ("compacted", "kv_mode", "prompt_renderer", "_prompt_tokens", "compaction_tick", "ltm_summary"):
                         if k in meta:
                             session_payload[k] = meta.get(k)
                 if "compacted" not in session_payload:
                     session_payload["compacted"] = False
+                # If we couldn't load a KV snapshot, mark dirty so `_ensure_session_loaded`
+                # rebuilds KV from the clean transcript on first use.
+                if state_obj is None and messages:
+                    session_payload["_state_dirty"] = True
+                    session_payload["_state_dirty_at"] = time.monotonic()
                 self.sessions[session_id] = session_payload
                 self._locks.setdefault(session_id, threading.RLock())
             except Exception:
@@ -1762,12 +1859,34 @@ class LlamaSessionManager:
         meta_path = self.persist_dir / f"{session_id}.meta.json"
 
         # Atomic writes: write temp then replace.
+        state_obj = self._coerce_state_compact(state_obj)
+        state_meta: Dict[str, object] = {}
         try:
-            if state_obj is not None:
-                tmp = kv_path.with_suffix(".kv.tmp")
-                with tmp.open("wb") as f:
-                    pickle.dump(state_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-                tmp.replace(kv_path)
+            if isinstance(state_obj, dict) and state_obj.get("_kind") == self._STATE_KIND_COMPACT:
+                llama_state = state_obj.get("llama_state") or b""
+                size = int(state_obj.get("llama_state_size") or len(llama_state) or 0)
+                if isinstance(llama_state, (bytes, bytearray)) and size > 0:
+                    tmp = kv_path.with_suffix(".kv.tmp")
+                    with tmp.open("wb") as f:
+                        f.write(bytes(llama_state)[:size])
+                    tmp.replace(kv_path)
+                    state_meta = {
+                        "kv_format": self._KV_FILE_FORMAT,
+                        "state_kind": self._STATE_KIND_COMPACT,
+                        "llama_state_size": size,
+                        "n_tokens": int(state_obj.get("n_tokens") or 0),
+                        "seed": int(state_obj.get("seed") or 0),
+                    }
+                    # Store input_ids as JSON-friendly list (restored on load).
+                    input_ids = state_obj.get("input_ids")
+                    if input_ids is not None:
+                        try:
+                            if np is not None and hasattr(input_ids, "tolist"):
+                                input_ids = input_ids.tolist()
+                            if isinstance(input_ids, list):
+                                state_meta["input_ids"] = input_ids
+                        except Exception:
+                            pass
         except Exception as exc:
             logger.warning("Failed to persist KV for %s: %s", session_id, exc)
 
@@ -1779,8 +1898,9 @@ class LlamaSessionManager:
             logger.warning("Failed to persist messages for %s: %s", session_id, exc)
 
         try:
+            merged_meta = {**(meta or {}), **state_meta}
             tmp = meta_path.parent / (meta_path.name + ".tmp")
-            tmp.write_text(json.dumps(meta or {}, ensure_ascii=False))
+            tmp.write_text(json.dumps(merged_meta, ensure_ascii=False))
             tmp.replace(meta_path)
         except Exception as exc:
             logger.warning("Failed to persist metadata for %s: %s", session_id, exc)

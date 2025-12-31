@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import {
   cancelActiveStreamAndWait,
   engineCancel,
@@ -10,16 +9,13 @@ import {
 } from "../api/engine";
 import { engine } from "../api/engine";
 import { ChatMarkdown, ChatMarkdownStream } from "./ChatMarkdown";
-
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  request_id?: string;
-  attachments?: string[];
-  selection?: { text: string; file_id?: string; page?: number };
-  focus_document_id?: string;
-};
+import {
+  beginStreamTurn,
+  cancelStreamTurn,
+  ensureChatUiLoaded,
+  getChatUiSnapshot,
+  subscribeChatUi,
+} from "../state/chatUiStore";
 
 type Props = {
   chatId: string | null;
@@ -50,6 +46,13 @@ type MarkdownStreamState = {
   tail: string;
   inFence: boolean;
   fenceToken?: "```" | "~~~" | null;
+};
+
+type IngestProgressState = {
+  fileIds: string[];
+  total: number;
+  done: number;
+  failed: number;
 };
 
 const MAX_MD_TAIL_CHARS = 1800;
@@ -138,11 +141,25 @@ export function ChatWindow({
   onClearSelection,
   onRequestDocsRefresh,
 }: Props) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatUi, setChatUi] = useState(() => getChatUiSnapshot(chatId));
+  const messages = chatUi.messages;
+  const isStreaming = chatUi.isStreaming;
+  const activeRequestId = chatUi.activeRequestId;
+
   const [input, setInput] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
+  const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [branchTarget, setBranchTarget] = useState<{
+    id: string;
+    role: "user" | "assistant";
+    content: string;
+  } | null>(null);
+  const [branchShareDocs, setBranchShareDocs] = useState(true);
+  const [branchIsWorking, setBranchIsWorking] = useState(false);
+  const [branchError, setBranchError] = useState<string | null>(null);
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
+  const [ingestProgress, setIngestProgress] = useState<IngestProgressState | null>(null);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
   const [localSelection, setLocalSelection] = useState<{ text: string; file_id?: string } | null>(
     null
@@ -152,20 +169,13 @@ export function ChatWindow({
   const [pendingChatSelection, setPendingChatSelection] = useState<{ text: string } | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
-  const pendingTextRef = useRef("");
-  const flushRafRef = useRef<number | null>(null);
-  const activeRequestIdRef = useRef<string | null>(null);
-  const assistantIdRef = useRef<string | null>(null);
-  const mdStreamRef = useRef<Map<string, MarkdownStreamState>>(new Map());
-  const unlistenTokenRef = useRef<UnlistenFn | null>(null);
-  const unlistenDoneRef = useRef<UnlistenFn | null>(null);
-  const unlistenErrorRef = useRef<UnlistenFn | null>(null);
+  const mdStreamRef = useRef<Map<string, { st: MarkdownStreamState; seen: number }>>(new Map());
   const activeChatIdRef = useRef<string | null>(null);
+  const prevRequestIdRef = useRef<string | null>(null);
   const contextReqSeqRef = useRef(0);
   const inputElRef = useRef<HTMLTextAreaElement | null>(null);
   const INPUT_MAX_HEIGHT_PX = 120;
   const chatPopoverTimerRef = useRef<number | null>(null);
-  const unlistenStreamEndRef = useRef<UnlistenFn | null>(null);
 
 
   const effectiveSelection = selection === undefined ? localSelection : selection;
@@ -214,6 +224,10 @@ export function ChatWindow({
     setChatSelectionText("");
     setChatSelectionPos(null);
     setPendingChatSelection(null);
+    setCopiedMessageId(null);
+    setBranchTarget(null);
+    setBranchError(null);
+    setBranchIsWorking(false);
   }, [chatId]);
 
   useEffect(() => {
@@ -229,18 +243,6 @@ export function ChatWindow({
       return new Intl.NumberFormat().format(n);
     } catch {
       return String(n);
-    }
-  }
-
-  function cleanupListeners() {
-    for (const ref of [unlistenTokenRef, unlistenDoneRef, unlistenErrorRef, unlistenStreamEndRef]) {
-      if (!ref.current) continue;
-      try {
-        ref.current();
-      } catch {
-        // ignore
-      }
-      ref.current = null;
     }
   }
 
@@ -340,83 +342,48 @@ export function ChatWindow({
     setChatSelectionPos(null);
   }
 
-  function flushPendingToMessage() {
-    if (flushRafRef.current != null) {
-      cancelAnimationFrame(flushRafRef.current);
-      flushRafRef.current = null;
-    }
-    const pending = pendingTextRef.current;
-    pendingTextRef.current = "";
-    const assistantId = assistantIdRef.current;
-    if (!pending || !assistantId) return;
-    const st =
-      mdStreamRef.current.get(assistantId) ??
-      ({ blocks: [], tail: "", inFence: false } satisfies MarkdownStreamState);
-    _ingestMarkdownChunk(st, pending);
-    mdStreamRef.current.set(assistantId, st);
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === assistantId ? { ...m, content: (m.content || "") + pending } : m
-      )
-    );
-  }
-
   // Load persisted messages when switching chats
   useEffect(() => {
-    // Switching chats should not keep streaming UI/listeners from the previous chat.
-    // A stream may still be finalizing in the background (KV save), but this view should remain responsive.
-    cleanupListeners();
-    pendingTextRef.current = "";
-    assistantIdRef.current = null;
-    activeRequestIdRef.current = null;
     mdStreamRef.current.clear();
-    setIsStreaming(false);
     setError(null);
     setChatSelectionText("");
     setChatSelectionPos(null);
     setPendingChatSelection(null);
+    setIngestProgress(null);
+    setIsSending(false);
 
+    setChatUi(getChatUiSnapshot(chatId));
     if (!chatId) {
       setAttachedPaths([]);
-      setMessages([]);
       setContextStatus(null);
       return;
     }
-    let cancelled = false;
-    async function loadHistory() {
-      try {
-        const res = await invoke<{
-          messages?: {
-            role: string;
-            content: string;
-            attachments?: string[];
-            selection?: { text: string; file_id?: string; page?: number };
-            focus_document_id?: string;
-          }[];
-        }>(
-          "get_session_messages",
-          { chatId }
-        );
-        if (!cancelled && res && (res as any).messages) {
-          const msgs = (res as any).messages.map((m: any, idx: number) => ({
-            id: `${chatId}-${idx}-${m.role}`,
-            role: m.role === "assistant" ? "assistant" : "user",
-            content: m.content ?? "",
-            attachments: Array.isArray(m.attachments) ? m.attachments : undefined,
-            selection: m.selection && typeof m.selection === "object" ? m.selection : undefined,
-            focus_document_id:
-              typeof m.focus_document_id === "string" ? m.focus_document_id : undefined,
-          })) as ChatMessage[];
-          setMessages(msgs);
+
+    void ensureChatUiLoaded(chatId);
+    return subscribeChatUi(chatId, () => {
+      const snap = getChatUiSnapshot(chatId);
+
+      // Update markdown streaming state for the active request, if any.
+      const rid = snap.activeRequestId;
+      if (rid) {
+        const msg = snap.messages.find((m) => m.role === "assistant" && m.request_id === rid);
+        if (msg) {
+          const content = msg.content || "";
+          const entry =
+            mdStreamRef.current.get(rid) ??
+            ({
+              st: { blocks: [], tail: "", inFence: false },
+              seen: 0,
+            } satisfies { st: MarkdownStreamState; seen: number });
+          const delta = content.slice(entry.seen);
+          if (delta) _ingestMarkdownChunk(entry.st, delta);
+          entry.seen = content.length;
+          mdStreamRef.current.set(rid, entry);
         }
-      } catch {
-        // ignore; keep empty
       }
-    }
-    loadHistory();
-    return () => {
-      cancelled = true;
-    };
+
+      setChatUi(snap);
+    });
   }, [chatId]);
 
   async function refreshContextStatus(activeChatId: string) {
@@ -436,6 +403,21 @@ export function ChatWindow({
       setContextStatus(null);
     }
   }
+
+  // After a stream fully finishes (llm-done), refresh the context meter.
+  // Important: wait for llm-done to avoid stdout contention with engine_request.
+  useEffect(() => {
+    if (!chatId) return;
+    const prev = prevRequestIdRef.current;
+    prevRequestIdRef.current = activeRequestId;
+    if (prev && !activeRequestId) {
+      waitForStreamToFinish(prev)
+        .then(() => {
+          if (chatId) refreshContextStatus(chatId).catch(() => {});
+        })
+        .catch(() => {});
+    }
+  }, [chatId, activeRequestId]);
 
   useEffect(() => {
     if (!active) return;
@@ -549,14 +531,14 @@ export function ChatWindow({
 
   async function sendMessage() {
     const trimmed = input.trim();
-    if (!trimmed || isStreaming || !active) return;
+    if (!trimmed || isStreaming || isSending || !active) return;
     if (!chatId) {
       setError("Select or create a chat first.");
       return;
     }
 
     setError(null);
-    cleanupListeners();
+    setIsSending(true);
 
     // If any stream is still active/finalizing, we must wait before starting a new one.
     // Otherwise the old Rust stream reader can still be holding stdout and swallow
@@ -564,7 +546,6 @@ export function ChatWindow({
     const activeStream = getActiveStream();
     if (activeStream) {
       try {
-        setIsStreaming(true);
         if (activeStream.chatId === chatId) {
           // Same chat: likely user pressed Stop. Don't spam cancel; just wait for stream_end.
           await waitForStreamToFinish(activeStream.requestId);
@@ -574,8 +555,6 @@ export function ChatWindow({
         }
       } catch {
         // ignore; we'll still attempt to start this chat
-      } finally {
-        setIsStreaming(false);
       }
     }
 
@@ -601,178 +580,203 @@ export function ChatWindow({
       onRequestDocsRefresh?.();
     }
 
-    const userMsg: ChatMessage = {
-      id: `${Date.now()}-user`,
-      role: "user",
-      content: trimmed,
+    const requestId =
+      (globalThis.crypto && "randomUUID" in globalThis.crypto
+        ? (globalThis.crypto as any).randomUUID()
+        : `${Date.now()}-${Math.random()}`) as string;
+
+    beginStreamTurn({
+      chatId,
+      requestId,
+      userText: trimmed,
       attachments: attachedNames.length ? attachedNames : undefined,
       selection: selectionPayload,
-    };
-    setMessages((prev) => [...prev, userMsg]);
+    });
+
     setInput("");
-    setIsStreaming(true);
     setAttachedPaths([]);
+    setIngestProgress(null);
     // Selection is a one-shot context for this turn; clear the input-bar snippet after send.
     if (selectionPayload) clearSelectionValue();
 
-    const assistantId = `${Date.now()}-assistant`;
-    assistantIdRef.current = assistantId;
-    setMessages((prev) => [
-      ...prev,
-      { id: assistantId, role: "assistant", content: "" },
-    ]);
-    pendingTextRef.current = "";
-    mdStreamRef.current.set(assistantId, { blocks: [], tail: "", inFence: false });
-
     try {
-      const requestId =
-        (globalThis.crypto && "randomUUID" in globalThis.crypto
-          ? (globalThis.crypto as any).randomUUID()
-          : `${Date.now()}-${Math.random()}`) as string;
-      activeRequestIdRef.current = requestId;
-      // Attach the request_id to the placeholder assistant message so out-of-band
-      // events (e.g. citations) can update the correct message even after streaming ends.
-      setMessages((prev) =>
-        prev.map((m) => (m.id === assistantId ? { ...m, request_id: requestId } : m))
-      );
-      const paths = attached;
       // Option A (backend contract): `focus_document_id` biases retrieval but does not hard-filter.
       // Do NOT send `documents` from the UI (it can cause the backend to inline-stitch that doc
       // and skip broader RAG). The backend already scopes retrieval to the chat's files.
-      //
-      // If the user attached new files in this same send, omit focus_document_id so the backend
-      // can default focus to the first ingested doc for this turn.
-      const focusDocForTurn =
-        paths.length > 0
-          ? undefined
-          : (docsVisible ? activeDocumentId : null) || undefined;
-      const docScopeMode = docsVisible ? "focused" : "all";
+      const docPaneOpen = !!docsVisible;
+      let focusDocForTurn: string | undefined = docPaneOpen ? activeDocumentId || undefined : undefined;
 
-      unlistenTokenRef.current = await listen<{ token: string; chat_id?: string; request_id?: string }>(
-        "llm-token",
-        (event) => {
-          const payload = event.payload || {};
-          if (payload.chat_id && payload.chat_id !== chatId) return;
-          if (payload.request_id && payload.request_id !== requestId) return;
-          const token = payload.token || "";
-          if (!token) return;
-          pendingTextRef.current += token;
-          if (flushRafRef.current != null) return;
-          flushRafRef.current = requestAnimationFrame(() => {
-            flushRafRef.current = null;
-            const pending = pendingTextRef.current;
-            if (!pending) return;
-            pendingTextRef.current = "";
-            const st =
-              mdStreamRef.current.get(assistantId) ??
-              ({ blocks: [], tail: "", inFence: false } satisfies MarkdownStreamState);
-            _ingestMarkdownChunk(st, pending);
-            mdStreamRef.current.set(assistantId, st);
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === assistantId
-                  ? { ...m, content: (m.content || "") + pending }
-                  : m
-              )
-            );
-          });
+      // Strict RAG flow: if the user attached files (or if we're in all-doc scope),
+      // we must wait for ingestion/indexing to complete before starting /chat.
+      let docIdsForTurn: string[] = [];
+      let attachmentNamesForTurn: string[] = attachedNames.slice();
+
+      if (attached.length) {
+        const ingestRes = await engine<{ files: { file_id: string; filename: string; job_id: string }[] }>(
+          "/files/ingest_path",
+          { chat_id: chatId, paths: attached },
+          "POST"
+        );
+        if (!ingestRes.ok) {
+          throw new Error(ingestRes.error || `Failed to ingest files (${ingestRes.status})`);
         }
-      );
+        const files = Array.isArray(ingestRes.data?.files) ? ingestRes.data.files : [];
+        docIdsForTurn = files.map((f) => f.file_id).filter((s) => typeof s === "string" && s);
+        const names = files.map((f) => f.filename).filter((s) => typeof s === "string" && s);
+        if (names.length) attachmentNamesForTurn = names;
 
-      unlistenDoneRef.current = await listen<{ request_id?: string; chat_id?: string }>(
-        "llm-done",
-        (event) => {
-          const payload = event.payload || {};
-          if (payload.chat_id && payload.chat_id !== chatId) return;
-          if (payload.request_id && payload.request_id !== requestId) return;
-          flushPendingToMessage();
-          cleanupListeners();
-          activeRequestIdRef.current = null;
-          setIsStreaming(false);
-          mdStreamRef.current.delete(assistantId);
-          if (chatId) {
-            refreshContextStatus(chatId).catch(() => {});
+        // If the docs pane is open, bias this turn to the newly attached file(s).
+        if (docPaneOpen) {
+          focusDocForTurn = (activeDocumentId || docIdsForTurn[docIdsForTurn.length - 1]) || undefined;
+        }
+      }
+
+      async function waitForIngestionIfNeeded() {
+        // Determine which file_ids we must wait for:
+        // - always wait for newly attached docs
+        // - if a selection includes a file_id, wait for that file_id
+        // - else if docs pane is open, wait for the focused doc (if any)
+        // - else (chat pane only), wait for the latest uploaded file in this chat
+        //   (multi-upload turns already wait for the newly attached docs)
+        const start = Date.now();
+        const maxWaitMs = 180_000;
+        const pollMs = 450;
+
+        type FileRow = { file_id: string; status?: string; created_at?: any };
+
+        // Helper to fetch file statuses (IPC; cheap).
+        async function fetchFiles(): Promise<FileRow[]> {
+          const res = await engine<{ files: FileRow[] }>(
+            `/files/chat/${encodeURIComponent(chatId as string)}`,
+            undefined,
+            "GET"
+          );
+          if (!res.ok) return [];
+          const rows = Array.isArray(res.data?.files) ? res.data.files : [];
+          return rows as any;
+        }
+
+        function buildStatusMap(rows: FileRow[]) {
+          const m = new Map<string, string>();
+          for (const r of rows) {
+            const fid = (r as any)?.file_id;
+            if (typeof fid !== "string" || !fid) continue;
+            const st = String((r as any)?.status || "");
+            m.set(fid, st);
+          }
+          return m;
+        }
+
+        function pickLatestFileId(rows: FileRow[]): string | undefined {
+          let last: string | undefined;
+          let best: { fid: string; ts: number } | null = null;
+          for (const r of rows) {
+            const fid = (r as any)?.file_id;
+            if (typeof fid !== "string" || !fid) continue;
+            last = fid;
+            const createdAt = (r as any)?.created_at;
+            const ts = typeof createdAt === "string" ? Date.parse(createdAt) : NaN;
+            if (!Number.isFinite(ts)) continue;
+            if (!best || ts >= best.ts) best = { fid, ts };
+          }
+          return best?.fid || last;
+        }
+
+        const rows0 = await fetchFiles();
+        const statusById = buildStatusMap(rows0);
+        const latestChatId = pickLatestFileId(rows0);
+
+        let waitIds: string[] = [];
+        if (selectionPayload && (selectionPayload as any).file_id) {
+          waitIds = [String((selectionPayload as any).file_id)];
+        } else if (docPaneOpen && focusDocForTurn) {
+          waitIds = [focusDocForTurn];
+        } else if (!docPaneOpen) {
+          if (docIdsForTurn.length > 1) {
+            waitIds = docIdsForTurn.slice();
+          } else if (latestChatId) {
+            waitIds = [latestChatId];
           }
         }
-      );
-	unlistenStreamEndRef.current = await listen<{
-	request_id?: string;
-	chat_id?: string;
-	}>(
-	"llm_stream_end",
-	(event) => {
-		const payload = event.payload || {};
-		if (payload.chat_id && payload.chat_id !== chatId) return;
-		if (payload.request_id && payload.request_id !== requestId) return;
-
-		// Fast UI response when tokens stop
-		setIsStreaming(false);
-		try {
-      unlistenStreamEndRef.current?.();
-    } catch {}
-    unlistenStreamEndRef.current = null;
-  }
-	);
-      unlistenErrorRef.current = await listen<{ request_id?: string; chat_id?: string; error?: string }>(
-        "llm-error",
-        (event) => {
-          const payload = event.payload || {};
-          if (payload.chat_id && payload.chat_id !== chatId) return;
-          if (payload.request_id && payload.request_id !== requestId) return;
-          flushPendingToMessage();
-          cleanupListeners();
-          activeRequestIdRef.current = null;
-          if (payload.error && payload.error !== "cancelled") {
-            setError(payload.error);
-          }
-          setIsStreaming(false);
-          mdStreamRef.current.delete(assistantId);
-          if (chatId) {
-            refreshContextStatus(chatId).catch(() => {});
-          }
+        for (const fid of docIdsForTurn) {
+          if (!waitIds.includes(fid)) waitIds.push(fid);
         }
-      );
+        // Only wait for files that are not completed.
+        waitIds = waitIds.filter((fid) => {
+          const st = statusById.get(fid) || "";
+          return st !== "completed";
+        });
+
+        if (!waitIds.length) return;
+
+        setIngestProgress({ fileIds: waitIds, total: waitIds.length, done: 0, failed: 0 });
+
+        while (true) {
+          // Cancelled (Stop clicked) or superseded by another send.
+          if (getChatUiSnapshot(chatId).activeRequestId !== requestId) return;
+
+          const stRows = await fetchFiles();
+          const stMap = buildStatusMap(stRows);
+          let done = 0;
+          let failed = 0;
+          let pending = 0;
+          for (const fid of waitIds) {
+            const st = stMap.get(fid) || "";
+            if (st === "completed") done += 1;
+            else if (st === "failed") {
+              done += 1;
+              failed += 1;
+            } else pending += 1;
+          }
+          setIngestProgress({ fileIds: waitIds, total: waitIds.length, done, failed });
+          if (pending === 0) break;
+
+          if (Date.now() - start > maxWaitMs) {
+            throw new Error("Timed out waiting for document indexing to complete");
+          }
+          await new Promise((r) => window.setTimeout(r, pollMs));
+        }
+      }
+
+      await waitForIngestionIfNeeded();
+      // If we were cancelled while waiting, do not start the stream.
+      if (getChatUiSnapshot(chatId).activeRequestId !== requestId) return;
+      setIngestProgress(null);
 
       // Starts stream in the background and returns immediately.
       await engineStreamChat({
         chatId,
         query: trimmed,
         requestId,
-        paths,
+        documents: docIdsForTurn,
+        attachments: attachmentNamesForTurn,
         focusDocumentId: focusDocForTurn,
-        docScopeMode,
+        docPaneOpen,
         selection: selectionPayload,
       });
     } catch (err: any) {
       console.error("Chat error", err);
       setError(err?.message ?? String(err));
-      flushPendingToMessage();
-      cleanupListeners();
-      activeRequestIdRef.current = null;
-      setIsStreaming(false);
+      setIngestProgress(null);
+      // Ensure UI returns to Send state even if the stream failed to start.
+      if (chatId && getChatUiSnapshot(chatId).activeRequestId === requestId) {
+        cancelStreamTurn(chatId);
+      }
+    } finally {
+      setIsSending(false);
     }
   }
 
   async function stopStreaming() {
     if (!active) return;
-    const rid = activeRequestIdRef.current;
-    if (!rid) {
-      // Fallback: if another chat started a stream, still allow stop to cancel it.
-      const activeStream = getActiveStream();
-      if (activeStream) {
-        engineCancel(activeStream.requestId).catch(() => {});
-      }
-      return;
-    }
+    if (!chatId) return;
+    const rid = getChatUiSnapshot(chatId).activeRequestId;
+    if (!rid) return;
 
     // Immediate UI stop: ignore further tokens and switch back to "Send".
-    flushPendingToMessage();
-    cleanupListeners();
-    if (assistantIdRef.current) {
-      mdStreamRef.current.delete(assistantIdRef.current);
-    }
-    activeRequestIdRef.current = null;
-    setIsStreaming(false);
+    cancelStreamTurn(chatId);
+    setIngestProgress(null);
+    setIsSending(false);
 
     // Best-effort backend cancel (stops ASGI + llama.cpp compute).
     engineCancel(rid).catch(() => {});
@@ -784,6 +788,76 @@ export function ChatWindow({
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
+    }
+  }
+
+  async function copyMessage(m: { id: string; content: string }) {
+    const text = (m.content || "").trim();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedMessageId(m.id);
+      window.setTimeout(() => {
+        setCopiedMessageId((prev) => (prev === m.id ? null : prev));
+      }, 900);
+    } catch (err) {
+      console.warn("copy failed", err);
+    }
+  }
+
+  async function branchFromMessage() {
+    if (!chatId) return;
+    if (!branchTarget) return;
+    if (branchIsWorking) return;
+
+    function titleFromBranchContent(text: string): string | null {
+      const trimmed = (text || "").trim();
+      if (!trimmed) return null;
+      const firstLine = trimmed.split("\n")[0]?.trim() ?? "";
+      if (!firstLine) return null;
+      const compact = firstLine.replace(/\s+/g, " ");
+      const max = 48;
+      if (compact.length <= max) return compact;
+      return compact.slice(0, max) + "…";
+    }
+
+    setBranchIsWorking(true);
+    setBranchError(null);
+    try {
+      const res = await engine<{
+        ok?: boolean;
+        child_chat_id?: string;
+        parent_chat_id?: string;
+        shared_docs?: boolean;
+        shared_file_ids?: string[];
+      }>("/chat/branch", {
+        parent_chat_id: chatId,
+        message: {
+          role: branchTarget.role,
+          content: branchTarget.content,
+        },
+        share_docs: branchShareDocs,
+      });
+      if (!res.ok) throw new Error((res as any).error || "Branch failed");
+
+      const childId = (res.data as any)?.child_chat_id;
+      if (typeof childId !== "string" || !childId) {
+        throw new Error("Branch failed: missing child_chat_id");
+      }
+
+      const title = titleFromBranchContent(branchTarget.content);
+      window.dispatchEvent(
+        new CustomEvent("insight:open-card", {
+          detail: { chatId: childId, parentChatId: chatId, title },
+        })
+      );
+
+      setBranchTarget(null);
+    } catch (err: any) {
+      console.error("branch failed", err);
+      setBranchError(err?.message ?? String(err));
+    } finally {
+      setBranchIsWorking(false);
     }
   }
 
@@ -807,16 +881,16 @@ export function ChatWindow({
             </div>
             <div className="chat-message-content">
               {m.role === "assistant" ? (
-                isStreaming && m.id === assistantIdRef.current ? (
+                isStreaming && activeRequestId && m.request_id === activeRequestId ? (
                   (() => {
-                    const st = mdStreamRef.current.get(m.id);
+                    const st = mdStreamRef.current.get(activeRequestId);
                     if (!st) return <ChatMarkdown markdown={m.content} />;
                     return (
                       <ChatMarkdownStream
-                        blocks={st.blocks}
-                        tail={st.tail}
-                        inFence={st.inFence}
-                        fenceToken={st.fenceToken ?? null}
+                        blocks={st.st.blocks}
+                        tail={st.st.tail}
+                        inFence={st.st.inFence}
+                        fenceToken={st.st.fenceToken ?? null}
                       />
                     );
                   })()
@@ -843,6 +917,75 @@ export function ChatWindow({
                 ))}
               </div>
             )}
+
+            {m.role === "assistant" ? (
+              <div className="chat-message-actions" aria-label="Message actions">
+                <button
+                  type="button"
+                  className="chat-message-action chat-message-action-icon"
+                  onClick={() => copyMessage(m)}
+                  disabled={!m.content || isStreaming}
+                  aria-label="Copy message"
+                  title={copiedMessageId === m.id ? "Copied" : "Copy"}
+                >
+                  {copiedMessageId === m.id ? "✓" : "⧉"}
+                </button>
+                <button
+                  type="button"
+                  className="chat-message-action chat-message-action-icon"
+                  onClick={() => {
+                    setBranchError(null);
+                    setBranchShareDocs(true);
+                    setBranchTarget({ id: m.id, role: m.role, content: m.content });
+                  }}
+                  disabled={!m.content || isStreaming}
+                  aria-label="Branch to new card"
+                  title="Branch to a new card"
+                >
+                  ↗
+                </button>
+              </div>
+            ) : null}
+
+            {branchTarget?.id === m.id ? (
+              <div
+                className="chat-branch-popover"
+                role="dialog"
+                aria-label="Branch options"
+                onMouseDown={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+              >
+                <div className="chat-branch-title">Branch to new card</div>
+                <label className="chat-branch-row">
+                  <input
+                    type="checkbox"
+                    checked={branchShareDocs}
+                    onChange={(e) => setBranchShareDocs(e.target.checked)}
+                    disabled={branchIsWorking}
+                  />
+                  <span>Share documents</span>
+                </label>
+                {branchError ? <div className="chat-branch-error">{branchError}</div> : null}
+                <div className="chat-branch-buttons">
+                  <button
+                    type="button"
+                    className="chat-branch-btn secondary"
+                    onClick={() => setBranchTarget(null)}
+                    disabled={branchIsWorking}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="chat-branch-btn"
+                    onClick={branchFromMessage}
+                    disabled={branchIsWorking}
+                  >
+                    {branchIsWorking ? "Creating…" : "Create"}
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </div>
         ))}
         {chatSelectionText && chatSelectionPos ? (
@@ -884,6 +1027,26 @@ export function ChatWindow({
           })}
         </div>
       )}
+
+      {ingestProgress ? (
+        <div className="chat-ingest-progress" role="status" aria-label="Indexing documents">
+          <div className="chat-ingest-progress-bar">
+            <div
+              className="chat-ingest-progress-fill"
+              style={{
+                width:
+                  ingestProgress.total > 0
+                    ? `${Math.round((ingestProgress.done / ingestProgress.total) * 100)}%`
+                    : "0%",
+              }}
+            />
+          </div>
+          <div className="chat-ingest-progress-text">
+            Indexing {ingestProgress.done}/{ingestProgress.total}
+            {ingestProgress.failed ? ` · ${ingestProgress.failed} failed` : ""}
+          </div>
+        </div>
+      ) : null}
 
       <div className="chat-input-row">
         <div className="chat-input-shell">
@@ -1023,8 +1186,8 @@ export function ChatWindow({
           onClick={isStreaming ? stopStreaming : sendMessage}
           disabled={
             !active ||
-            (isStreaming && !activeRequestIdRef.current) ||
-            (!isStreaming && !input.trim())
+            (isStreaming && !activeRequestId) ||
+            (!isStreaming && (isSending || !input.trim()))
           }
         >
           {isStreaming ? "Stop" : "Send"}

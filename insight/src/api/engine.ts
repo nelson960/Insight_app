@@ -126,11 +126,12 @@ export async function engineStreamChat(opts: {
   requestId: string;
   paths?: string[];
   documents?: string[];
+  attachments?: string[];
   focusDocumentId?: string | null;
-  docScopeMode?: "focused" | "all" | string;
+  docPaneOpen?: boolean;
   selection?: { text: string; file_id?: string; page?: number } | null;
 }) {
-  const { chatId, query, requestId, paths, documents, focusDocumentId, docScopeMode, selection } = opts;
+  const { chatId, query, requestId, paths, documents, attachments, focusDocumentId, docPaneOpen, selection } = opts;
   await ensureStreamBridge();
   activeStream = { requestId, chatId };
   return invoke("engine_stream_request", {
@@ -139,10 +140,11 @@ export async function engineStreamChat(opts: {
       chat_id: chatId,
       query,
       stream: true,
-      ...(docScopeMode ? { doc_scope_mode: docScopeMode } : {}),
+      ...(typeof docPaneOpen === "boolean" ? { doc_pane_open: docPaneOpen } : {}),
       ...(focusDocumentId ? { focus_document_id: focusDocumentId } : {}),
       ...(selection && selection.text ? { selection } : {}),
       ...(documents && documents.length ? { documents } : {}),
+      ...(attachments && attachments.length ? { attachments } : {}),
       ...(paths && paths.length ? { paths } : {}),
     },
   });

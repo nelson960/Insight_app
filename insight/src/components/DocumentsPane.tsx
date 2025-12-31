@@ -309,11 +309,13 @@ export function DocumentsPane({
   const infoPopoverRef = useRef<HTMLDivElement | null>(null);
   const infoAnchorRef = useRef<HTMLElement | null>(null);
   const [infoPos, setInfoPos] = useState<{ x: number; y: number } | null>(null);
+  const [confirmDeleteFileId, setConfirmDeleteFileId] = useState<string | null>(null);
 
   const isControlled = typeof activeFileId !== "undefined";
   const effectiveActiveFileId = isControlled ? (activeFileId ?? null) : internalActiveFileId;
 
   function setActiveFileId(nextId: string | null) {
+    setConfirmDeleteFileId(null);
     onActiveFileIdChange?.(nextId);
     if (!isControlled) setInternalActiveFileId(nextId);
   }
@@ -1122,6 +1124,67 @@ export function DocumentsPane({
                     }}
                   >
                     i
+                  </button>
+                ) : null}
+                {active ? (
+                  <button
+                    type="button"
+                    className={`docs-tab-delete ${
+                      confirmDeleteFileId === f.file_id ? "confirm" : ""
+                    }`}
+                    aria-label="Delete document"
+                    title={
+                      confirmDeleteFileId === f.file_id
+                        ? "Click again to delete"
+                        : "Delete"
+                    }
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (confirmDeleteFileId !== f.file_id) {
+                        setConfirmDeleteFileId(f.file_id);
+                        return;
+                      }
+                      setConfirmDeleteFileId(null);
+                      setInfoPos(null);
+                      setError(null);
+                      engine(
+                        `/files/chat/${encodeURIComponent(chatId)}/${encodeURIComponent(
+                          f.file_id
+                        )}`,
+                        undefined,
+                        "DELETE"
+                      )
+                        .then(async (res) => {
+                          if (!res.ok) {
+                            setError(res.error || `Failed to delete file (${res.status})`);
+                            return;
+                          }
+                          const prevFiles = files;
+                          const deletedIdx = prevFiles.findIndex((x) => x.file_id === f.file_id);
+                          const next = await reloadFiles();
+                          const currentActive = activeFileIdRef.current;
+                          if (currentActive === f.file_id) {
+                            const pick =
+                              (deletedIdx >= 0 && next[deletedIdx]) ||
+                              (deletedIdx > 0 && next[deletedIdx - 1]) ||
+                              (next.length ? next[0] : null);
+                            setActiveFileId(pick ? pick.file_id : null);
+                            setDoc(null);
+                            setIsEditing(false);
+                            editingFileIdRef.current = null;
+                            docRef.current = null;
+                            setSelectionText("");
+                            setSelectionPos(null);
+                            setPendingSelection(null);
+                          }
+                        })
+                        .catch((err: any) => {
+                          setError(err?.message ?? String(err));
+                        });
+                    }}
+                  >
+                    {confirmDeleteFileId === f.file_id ? "Del" : "×"}
                   </button>
                 ) : null}
               </div>

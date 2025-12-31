@@ -13,7 +13,7 @@ from backend.services.ingestion import IngestionRequest, FilePolicy
 from backend.services.extraction.detector import detect_mime_type
 from backend.services.security import encrypt_bytes
 from backend.services.extraction.service import blocks_from_text
-from backend.services.ipc_events import emit_event
+from backend.services.ipc_events import emit_event, is_ipc_mode
 from backend.services.docs import blocks_to_plain_text, prosemirror_doc_to_blocks
 
 import logging
@@ -56,6 +56,9 @@ async def upload_files(
             stored_path=str(enc_path),
             is_encrypted=True,
             policy={"pii": False},
+            user_id=user_id or "default",
+            chat_id=chat_id,
+            source="upload",
         )
         emit_event(
             "files_changed",
@@ -92,6 +95,11 @@ async def ingest_paths(payload: Dict[str, Any] = Body(...)):
 
     Reads each path locally, encrypts + stores it under workspace uploads, and schedules ingestion.
     """
+    if not is_ipc_mode():
+        # Reading arbitrary local filesystem paths is a desktop-only feature. In HTTP
+        # server mode, callers must upload bytes instead.
+        raise HTTPException(status_code=403, detail="ingest_path is only available in desktop IPC mode")
+
     chat_id = payload.get("chat_id")
     user_id = payload.get("user_id") or "default"
     paths = payload.get("paths")
@@ -201,6 +209,129 @@ async def list_files_for_chat(chat_id: str):
             }
         )
     return {"files": files}
+
+@router.delete("/chat/{chat_id}/{file_id}")
+async def delete_file_from_chat(chat_id: str, file_id: str):
+    """
+    Remove a file from a chat (and delete its chat-scoped index data).
+
+    If this was the last chat referencing the file_id, this also deletes the underlying
+    file record, extracted text, chunks, jobs, and encrypted bytes on disk.
+    """
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id is required")
+    if not file_id:
+        raise HTTPException(status_code=400, detail="file_id is required")
+
+    store, _ = AppDependencies.storage()
+    if not store.chat_has_file(chat_id, file_id):
+        raise HTTPException(status_code=404, detail="file not linked to chat")
+
+    record = store.get_file(file_id) or {}
+    filename = str(record.get("filename") or "")
+    stored_path = str(record.get("stored_path") or "")
+
+    # Cancel any in-flight ingestion for this file in this chat (best-effort).
+    cancelled_jobs = 0
+    try:
+        scheduler = AppDependencies.ingestion_scheduler()
+        cancelled_jobs = int(scheduler.cancel_file(file_id, chat_id=chat_id))
+    except Exception:
+        cancelled_jobs = 0
+
+    # Delete chat-scoped chunks in both SQLite and Qdrant.
+    deleted_sqlite_chunks = 0
+    try:
+        deleted_sqlite_chunks = int(store.delete_chunks_for_chat_file(chat_id, file_id))
+    except Exception:
+        deleted_sqlite_chunks = 0
+
+    try:
+        rag_store = AppDependencies.rag_store()
+        retrieval = getattr(rag_store, "retrieval", None)
+        if retrieval is not None and hasattr(retrieval, "delete_chunks_for_chat_file"):
+            retrieval.delete_chunks_for_chat_file(chat_id, file_id)
+    except Exception:
+        pass
+
+    # Remove the per-chat editor page (edited representation).
+    deleted_doc_page = 0
+    try:
+        deleted_doc_page = int(store.delete_doc_page(chat_id, file_id))
+    except Exception:
+        deleted_doc_page = 0
+
+    # Unlink from this chat.
+    deleted_chat_file_link = 0
+    try:
+        deleted_chat_file_link = int(store.delete_chat_file(chat_id, file_id))
+    except Exception:
+        deleted_chat_file_link = 0
+
+    remaining_chats = store.list_chat_ids_for_file(file_id)
+    fully_deleted = False
+    deleted_file_rows: dict[str, int] | None = None
+    deleted_encrypted_bytes = False
+
+    if not remaining_chats:
+        fully_deleted = True
+        try:
+            deleted_file_rows = store.delete_file_everywhere(file_id)
+        except Exception:
+            deleted_file_rows = None
+        try:
+            rag_store = AppDependencies.rag_store()
+            retrieval = getattr(rag_store, "retrieval", None)
+            if retrieval is not None and hasattr(retrieval, "delete_chunks_for_file"):
+                retrieval.delete_chunks_for_file(file_id)
+        except Exception:
+            pass
+
+        if stored_path:
+            try:
+                p = Path(stored_path).expanduser()
+                if p.exists() and p.is_file():
+                    p.unlink()
+                    deleted_encrypted_bytes = True
+            except Exception as exc:
+                logger.warning("Failed to delete encrypted file bytes for %s: %s", file_id, exc)
+
+    emit_event(
+        "files_changed",
+        chat_id=chat_id,
+        file_id=file_id,
+        filename=filename,
+        status="deleted",
+    )
+
+    return {
+        "ok": True,
+        "chat_id": chat_id,
+        "file_id": file_id,
+        "filename": filename,
+        "cancelled_jobs": cancelled_jobs,
+        "deleted": {
+            "chat_file_link": deleted_chat_file_link,
+            "doc_page": deleted_doc_page,
+            "sqlite_chunks": deleted_sqlite_chunks,
+            "fully_deleted": fully_deleted,
+            "encrypted_bytes": deleted_encrypted_bytes,
+            "sqlite_file_rows": deleted_file_rows,
+        },
+        "remaining_chats": remaining_chats,
+    }
+
+
+@router.get("/progress/{chat_id}")
+async def ingestion_progress(chat_id: str):
+    """
+    Return per-chat ingestion progress (desktop UI helper).
+
+    This is intentionally cheap and deterministic: it reflects SQLite file/job rows,
+    not transient in-memory state.
+    """
+    store, _ = AppDependencies.storage()
+    return store.chat_ingestion_progress(chat_id)
 
 @router.get("/extracted/{file_id}")
 async def get_extracted_view(file_id: str):

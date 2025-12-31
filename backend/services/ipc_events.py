@@ -16,6 +16,16 @@ def set_ipc_emitter(fn: Optional[Callable[[Dict[str, Any]], None]]) -> None:
     _emit = fn
 
 
+def is_ipc_mode() -> bool:
+    """
+    Return True when the backend is running under the desktop IPC engine.
+
+    In HTTP server mode, `backend/engine.py` is not used and we intentionally keep the
+    emitter unset so other modules can treat IPC-only features as disabled.
+    """
+    return _emit is not None
+
+
 def emit_event(name: str, **payload: Any) -> None:
     """
     Best-effort event emission. Never raises.
@@ -32,4 +42,3 @@ def emit_event(name: str, **payload: Any) -> None:
     except Exception:
         # Never let event emission break core flows.
         return
-

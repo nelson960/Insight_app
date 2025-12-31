@@ -105,8 +105,10 @@ fn list_sessions() -> Result<Value, String> {
 
             // Also include chats that have files/documents attached even if they have no messages yet.
             // This ensures cards persist when the user only uploads/edits documents without chatting.
+            //
+            // IMPORTANT: use `chat_files` mapping (multi-chat sharing) rather than legacy `files.chat_id`.
             if let Ok(mut stmt) = conn.prepare(
-                "SELECT chat_id, MAX(created_at) AS last_ts FROM files WHERE chat_id IS NOT NULL AND chat_id != '' GROUP BY chat_id ORDER BY last_ts DESC",
+                "SELECT chat_id, MAX(created_at) AS last_ts FROM chat_files GROUP BY chat_id ORDER BY last_ts DESC",
             ) {
                 let rows = stmt.query_map([], |row| {
                     let chat_id: String = row.get(0)?;
@@ -131,7 +133,7 @@ fn list_sessions() -> Result<Value, String> {
                         }
                         if title.is_none() {
                             if let Ok(mut fstmt) = conn.prepare(
-                                "SELECT filename FROM files WHERE chat_id=? ORDER BY created_at ASC LIMIT 1",
+                                "SELECT f.filename FROM chat_files cf JOIN files f ON f.id = cf.file_id WHERE cf.chat_id=? ORDER BY cf.created_at ASC LIMIT 1",
                             ) {
                                 if let Ok(mut frows) = fstmt.query([chat_id.clone()]) {
                                     if let Ok(Some(r)) = frows.next() {
