@@ -920,7 +920,20 @@ class LlamaSessionManager:
             return context_pack
 
         margin = 128
-        ephemeral_cap = 2400  # hard cap to keep "context pack" bounded even on empty chats
+        # Hard cap to keep the "context pack" bounded even on empty chats.
+        #
+        # For large-context models (e.g. 32k), we want enough headroom to include
+        # multi-file RAG evidence (scope=all) without truncating away entire files.
+        #
+        # The orchestrator already budgets evidence; this is the final safety net.
+        try:
+            ctx_size = int(self.ctx_size)
+        except Exception:
+            ctx_size = 0
+        dynamic_cap = int(ctx_size * 0.35) if ctx_size > 0 else 2400
+        # Keep some headroom above the orchestrator's doc-evidence cap so scope headers,
+        # LTM snippets, and formatting don't force a trim that drops an entire file.
+        ephemeral_cap = max(2400, min(12_000, dynamic_cap))
 
         # Compact if the clean session is already near full.
         self._maybe_compact(session_id, session, force=False)

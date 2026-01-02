@@ -19,8 +19,13 @@ from backend.services.storage.sqlite_store import SQLiteMetadataStore
 logger = logging.getLogger(__name__)
 
 # RAG budgeting defaults (backend-owned; no config system yet).
-RAG_CONTEXT_FRACTION = 0.30
-RAG_CONTEXT_MAX_TOKENS = 2400
+#
+# Keep this conservative: the session manager has a hard safety net that will
+# clamp the final "context pack" to the remaining context window. These values
+# primarily control how much *document evidence* we try to retrieve/pack.
+RAG_CONTEXT_FRACTION = 0.35
+RAG_CONTEXT_MAX_TOKENS_SINGLE = 3000
+RAG_CONTEXT_MAX_TOKENS_MULTI = 10_000
 
 # Retrieval policy (UI-driven focus/scope).
 RAG_PRIMARY_K = 12
@@ -324,6 +329,54 @@ class InsightOrchestrator:
         est = int(target_words * OUTPUT_TOKENS_PER_WORD) + int(OUTPUT_TOKENS_BUFFER)
         return max(int(OUTPUT_MIN_TOKENS), min(int(OUTPUT_MAX_TOKENS), int(est)))
 
+    def _compute_rag_budget_tokens(
+        self,
+        chat_id: str,
+        *,
+        files_in_scope: int,
+        reserved_output_tokens: int,
+    ) -> int:
+        """
+        Compute a doc-evidence token budget for this turn.
+
+        This is used to size multi-file windows (scope=all) and to trim the final
+        RAG hits, while still leaving room for:
+        - clean session history (already in KV)
+        - the user's turn
+        - LTM / scope headers
+        - model output (reserved_output_tokens)
+
+        The session manager enforces the real hard limit; this is a best-effort
+        allocator that tries to keep multi-file answers coherent (enough text per file).
+        """
+        try:
+            files_in_scope = int(files_in_scope)
+        except Exception:
+            files_in_scope = 0
+        if files_in_scope <= 0:
+            return 0
+
+        # Ensure session exists so context status is meaningful.
+        self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
+        try:
+            status = self.session_mgr.get_context_status(chat_id)
+            used = int(status.get("used_tokens") or 0)
+            capacity = int(status.get("capacity_tokens") or 0)
+        except Exception:
+            used = 0
+            capacity = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
+
+        margin = 256
+        remaining = max(0, capacity - used - int(reserved_output_tokens) - margin)
+        if remaining <= 0:
+            return 0
+
+        cap = RAG_CONTEXT_MAX_TOKENS_SINGLE if files_in_scope <= 1 else RAG_CONTEXT_MAX_TOKENS_MULTI
+        # Keep a stable fraction of remaining capacity for doc evidence; leave the rest for
+        # the rest of the prompt (LTM, scope lines, tool-safe instructions, etc).
+        budget = min(int(remaining * RAG_CONTEXT_FRACTION), int(cap))
+        return max(0, int(budget))
+
     @staticmethod
     def _is_summary_request(user_message: str) -> bool:
         q = (user_message or "").strip().lower()
@@ -508,21 +561,33 @@ class InsightOrchestrator:
         return out
 
     def _apply_rag_budget(self, chat_id: str, rag_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return self._apply_rag_budget_with_tokens(chat_id, rag_hits, budget_tokens=None)
+
+    def _apply_rag_budget_with_tokens(
+        self,
+        chat_id: str,
+        rag_hits: List[Dict[str, Any]],
+        *,
+        budget_tokens: Optional[int],
+    ) -> List[Dict[str, Any]]:
         if not rag_hits:
             return []
 
-        # Use the same context status mechanism as inline docs budgeting.
-        self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
-        try:
-            status = self.session_mgr.get_context_status(chat_id)
-            used = int(status.get("used_tokens") or 0)
-            capacity = int(status.get("capacity_tokens") or 0)
-        except Exception:
-            used = 0
-            capacity = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
+        if budget_tokens is None:
+            # Infer doc count from hits and compute a budget without assuming scope mode.
+            doc_ids = {h.get("doc_id") for h in rag_hits if isinstance(h.get("doc_id"), str) and h.get("doc_id")}
+            inferred_files = max(1, len(doc_ids))
+            # Use a moderate default output reserve when called outside the main turn path.
+            budget_tokens = self._compute_rag_budget_tokens(
+                chat_id,
+                files_in_scope=inferred_files,
+                reserved_output_tokens=OUTPUT_MAX_TOKENS,
+            )
 
-        remaining = max(0, capacity - used)
-        budget_tokens = min(int(remaining * RAG_CONTEXT_FRACTION), RAG_CONTEXT_MAX_TOKENS)
+        try:
+            budget_tokens = int(budget_tokens)
+        except Exception:
+            budget_tokens = 0
         if budget_tokens <= 0:
             return []
 
@@ -558,6 +623,7 @@ class InsightOrchestrator:
         rag_hits: List[Dict[str, Any]],
         *,
         file_order: Optional[List[str]] = None,
+        budget_tokens: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Apply the RAG budget but ensure multiple files contribute evidence.
@@ -568,18 +634,19 @@ class InsightOrchestrator:
         if not rag_hits:
             return []
 
-        # Use the same budget computation as the sequential variant.
-        self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
+        if budget_tokens is None:
+            # Compute from inferred doc count.
+            doc_ids = {h.get("doc_id") for h in rag_hits if isinstance(h.get("doc_id"), str) and h.get("doc_id")}
+            inferred_files = max(1, len(doc_ids))
+            budget_tokens = self._compute_rag_budget_tokens(
+                chat_id,
+                files_in_scope=inferred_files,
+                reserved_output_tokens=OUTPUT_MAX_TOKENS,
+            )
         try:
-            status = self.session_mgr.get_context_status(chat_id)
-            used = int(status.get("used_tokens") or 0)
-            capacity = int(status.get("capacity_tokens") or 0)
+            budget_tokens = int(budget_tokens)
         except Exception:
-            used = 0
-            capacity = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
-
-        remaining = max(0, capacity - used)
-        budget_tokens = min(int(remaining * RAG_CONTEXT_FRACTION), RAG_CONTEXT_MAX_TOKENS)
+            budget_tokens = 0
         if budget_tokens <= 0:
             return []
 
@@ -608,8 +675,6 @@ class InsightOrchestrator:
             return self._apply_rag_budget(chat_id, rag_hits)
 
         per_file_budget = max(256, budget_chars // max(1, len(file_ids)))
-        # Hard cap per-hit excerpt so one chunk cannot consume an entire file's allocation.
-        per_hit_cap = min(2400, per_file_budget)
 
         buckets: Dict[str, List[Dict[str, Any]]] = {fid: [] for fid in file_ids}
         unknown: List[Dict[str, Any]] = []
@@ -630,7 +695,7 @@ class InsightOrchestrator:
                 text = hit.get("text") or ""
                 if not isinstance(text, str) or not text.strip():
                     continue
-                take = min(len(text), remaining_chars, per_hit_cap)
+                take = min(len(text), remaining_chars)
                 trimmed.append({**hit, "text": text[:take]})
                 used_chars_total += take
                 remaining_chars -= take
@@ -643,7 +708,7 @@ class InsightOrchestrator:
             text = hit.get("text") or ""
             if not isinstance(text, str) or not text.strip():
                 continue
-            take = min(len(text), remaining_pool, 2400)
+            take = min(len(text), remaining_pool)
             trimmed.append({**hit, "text": text[:take]})
             remaining_pool -= take
 
@@ -855,12 +920,19 @@ class InsightOrchestrator:
         if scope_mode == "all" and scope_doc_ids:
             doc_ids_in_scope = self._uniq_file_ids(scope_doc_ids)
             if doc_ids_in_scope:
+                rag_budget_tokens = self._compute_rag_budget_tokens(
+                    chat_id,
+                    files_in_scope=len(doc_ids_in_scope),
+                    reserved_output_tokens=max_tokens,
+                )
+                # Keep per-file retrieval stable (fair) by scaling total_k with file count.
+                total_k = max(RAG_ALL_K_TOTAL, 7 * len(doc_ids_in_scope))
                 cfg = MultiFileAgentConfig(
-                    total_k=RAG_ALL_K_TOTAL,
+                    total_k=total_k,
                     dense_k=16,
                     sparse_k=16,
                     radius=2,
-                    max_tokens_total=RAG_CONTEXT_MAX_TOKENS,
+                    max_tokens_total=max(600, rag_budget_tokens),
                     max_tokens_per_file_floor=600,
                     repair_on_empty=True,
                     max_repairs=2000,
@@ -886,6 +958,11 @@ class InsightOrchestrator:
                     scope_files = None
         elif effective_focus:
             # Focused mode: primary evidence from focused file, plus a small secondary budget.
+            rag_budget_tokens = self._compute_rag_budget_tokens(
+                chat_id,
+                files_in_scope=1,
+                reserved_output_tokens=max_tokens,
+            )
             focus_anchors = self.agent_tools.hybrid_search(
                 user_message,
                 file_id=effective_focus,
@@ -897,7 +974,7 @@ class InsightOrchestrator:
             focus_windows_map = self.agent_tools.windows_from_anchors(
                 focus_anchors,
                 radius=2,
-                max_tokens_per_file=RAG_CONTEXT_MAX_TOKENS,
+                max_tokens_per_file=max(600, rag_budget_tokens),
             )
             for w in focus_windows_map.get(effective_focus, []):
                 if not w.text:
@@ -955,6 +1032,11 @@ class InsightOrchestrator:
         elif documents:
             doc_ids = self._uniq_file_ids(documents)
             if doc_ids:
+                rag_budget_tokens = self._compute_rag_budget_tokens(
+                    chat_id,
+                    files_in_scope=len(doc_ids),
+                    reserved_output_tokens=max_tokens,
+                )
                 anchors: List[ChunkAnchor] = []
                 for fid in doc_ids:
                     anchors.extend(
@@ -970,7 +1052,7 @@ class InsightOrchestrator:
                 windows_map = self.agent_tools.windows_from_anchors(
                     anchors,
                     radius=2,
-                    max_tokens_per_file=max(600, int(RAG_CONTEXT_MAX_TOKENS // max(1, len(doc_ids)))),
+                    max_tokens_per_file=max(600, int(max(600, rag_budget_tokens) // max(1, len(doc_ids)))),
                 )
                 for fid in doc_ids:
                     for w in windows_map.get(fid, []):
@@ -994,10 +1076,28 @@ class InsightOrchestrator:
         selected_rag = self._dedup_rag(rag_hits_raw)
 
         if scope_mode == "all" and scope_doc_ids:
-            selected_rag = self._rebalance_hits_by_file(selected_rag, max_hits=RAG_ALL_K_TOTAL)
-            selected_rag = self._apply_rag_budget_balanced(chat_id, selected_rag, file_order=scope_doc_ids)
+            doc_ids_in_scope = self._uniq_file_ids(scope_doc_ids)
+            rag_budget_tokens = self._compute_rag_budget_tokens(
+                chat_id,
+                files_in_scope=max(1, len(doc_ids_in_scope)),
+                reserved_output_tokens=max_tokens,
+            )
+            total_k = max(RAG_ALL_K_TOTAL, 7 * max(1, len(doc_ids_in_scope)))
+            selected_rag = self._rebalance_hits_by_file(selected_rag, max_hits=total_k)
+            selected_rag = self._apply_rag_budget_balanced(
+                chat_id,
+                selected_rag,
+                file_order=scope_doc_ids,
+                budget_tokens=rag_budget_tokens,
+            )
         else:
-            selected_rag = self._apply_rag_budget(chat_id, selected_rag)
+            inferred_files = len({h.get("doc_id") for h in selected_rag if isinstance(h.get("doc_id"), str) and h.get("doc_id")})
+            rag_budget_tokens = self._compute_rag_budget_tokens(
+                chat_id,
+                files_in_scope=max(1, inferred_files),
+                reserved_output_tokens=max_tokens,
+            )
+            selected_rag = self._apply_rag_budget_with_tokens(chat_id, selected_rag, budget_tokens=rag_budget_tokens)
 
         # Debug: show how many hits per file made it through budgeting (backend logs only).
         try:
