@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, Body, HTTPException
 
 from backend.api.deps import AppDependencies
+from backend.services.retrieval.index_maintenance import validate_file_index, repair_file_index
 
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
@@ -291,6 +292,57 @@ def reset_storage(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
         return {"ok": True, "restart_required": True}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+@router.get("/index/validate/{file_id}")
+def validate_index(file_id: str) -> Dict[str, Any]:
+    """
+    Validate Qdrant↔SQLite consistency for a single file_id.
+
+    This is a diagnostic endpoint to detect missing/orphan chunk vectors.
+    """
+    store, vector_index = AppDependencies.storage()
+    res = validate_file_index(
+        sqlite_store=store,
+        qdrant_client=vector_index.client,
+        collection_name=vector_index.collection_name,
+        file_id=file_id,
+    )
+    return {"ok": True, "validation": res.to_dict()}
+
+
+@router.post("/index/repair")
+def repair_index(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    """
+    Best-effort index repair for a single file_id (rare corruption/partial writes).
+
+    This re-embeds missing chunks from SQLite and upserts them into Qdrant.
+    """
+    _require_idle("repair index")
+    file_id = payload.get("file_id") if isinstance(payload, dict) else None
+    if not isinstance(file_id, str) or not file_id.strip():
+        return {"ok": False, "error": "file_id is required"}
+
+    embedder = AppDependencies.query_embedder()
+    if embedder is None:
+        return {"ok": False, "error": "embedder not available"}
+
+    store, vector_index = AppDependencies.storage()
+    dry_run = _ensure_bool(payload.get("dry_run") if isinstance(payload, dict) else False, False)
+    delete_orphans = _ensure_bool(payload.get("delete_orphans") if isinstance(payload, dict) else False, False)
+    max_repairs = _safe_int(payload.get("max_repairs") if isinstance(payload, dict) else None, 5000)
+
+    result = repair_file_index(
+        sqlite_store=store,
+        qdrant_client=vector_index.client,
+        collection_name=vector_index.collection_name,
+        file_id=file_id.strip(),
+        embedder=embedder,
+        max_repairs=max_repairs,
+        delete_orphans=delete_orphans,
+        dry_run=dry_run,
+    )
+    return result
 
 
 __all__ = ["router"]

@@ -31,6 +31,8 @@ def _required_file_ids_for_turn(payload: dict) -> list[str]:
     """
     docs_payload = payload.get("documents") or payload.get("document_ids") or []
     _attachments = payload.get("attachments") or []
+    doc_scope_mode = payload.get("doc_scope_mode")
+    doc_scope_mode = doc_scope_mode.strip().lower() if isinstance(doc_scope_mode, str) else ""
 
     # Selection hard-focuses a single file.
     selection = payload.get("selection")
@@ -52,6 +54,33 @@ def _required_file_ids_for_turn(payload: dict) -> list[str]:
         for d in docs_payload:
             if isinstance(d, str) and d.strip():
                 turn_doc_ids.append(d.strip())
+
+    # Explicit "all docs" mode (UI hint): require all files in the chat.
+    # This prevents low-quality answers when a compare-style turn is requested
+    # before ingestion completes for all relevant files.
+    if doc_scope_mode == "all":
+        chat_id = payload.get("chat_id")
+        if isinstance(chat_id, str) and chat_id:
+            try:
+                store, _ = AppDependencies.storage()
+                all_ids = store.list_file_ids_for_chat(chat_id)
+                out_all = []
+                for fid in (all_ids or []):
+                    if isinstance(fid, str) and fid.strip():
+                        out_all.append(fid.strip())
+                # Ensure newly attached docs for this turn are also included.
+                out_all.extend(turn_doc_ids)
+                seen = set()
+                uniq: list[str] = []
+                for fid in out_all:
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
+                    uniq.append(fid)
+                return uniq
+            except Exception:
+                # Fall through to default logic.
+                pass
     if (not doc_pane_open_bool) and len(turn_doc_ids) > 1:
         # De-dup while preserving order.
         seen = set()

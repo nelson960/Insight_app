@@ -100,11 +100,15 @@ class RagStore:
         doc_ids: Optional[List[str]] = None,
         top_k: int = 5,
     ) -> List[Dict[str, Any]]:
-        if not vector:
+        if vector is None:
+            return []
+        # Defensive: avoid ambiguous truthiness for numpy arrays / sequences.
+        vec_list = list(vector)
+        if not vec_list:
             return []
         ctx = RetrievalContext(user_id=None, chat_id=chat_id, file_ids=doc_ids or [])
         results = self.retrieval.search(
-            RetrievalQuery(vector=list(vector), limit=top_k, with_chunks=True, with_metadata=True),
+            RetrievalQuery(vector=vec_list, limit=top_k, with_chunks=True, with_metadata=True),
             context=ctx,
         )
         return self._results_to_hits(results)

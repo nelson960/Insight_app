@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -217,6 +218,86 @@ class SQLiteMetadataStore:
         except Exception:
             # Best effort; older/broken DBs should still boot.
             pass
+
+        # Best-effort FTS index for chunks so the backend can do fast keyword search
+        # without loading full documents (used for hybrid retrieval and agent loops).
+        self._ensure_chunks_fts()
+
+    def _ensure_chunks_fts(self) -> None:
+        """
+        Ensure an FTS5 index exists for chunk text.
+
+        This is best-effort: if the local SQLite build lacks FTS5, the app should
+        still run (dense retrieval continues to work).
+        """
+        conn = self._connection
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
+                USING fts5(
+                    chunk_id UNINDEXED,
+                    file_id UNINDEXED,
+                    text
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunks_fts_ai
+                AFTER INSERT ON chunks
+                BEGIN
+                    INSERT INTO chunks_fts(chunk_id, file_id, text)
+                    VALUES (new.id, new.file_id, COALESCE(new.text, ''));
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunks_fts_ad
+                AFTER DELETE ON chunks
+                BEGIN
+                    DELETE FROM chunks_fts WHERE chunk_id = old.id;
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunks_fts_au
+                AFTER UPDATE OF text, file_id ON chunks
+                BEGIN
+                    DELETE FROM chunks_fts WHERE chunk_id = old.id;
+                    INSERT INTO chunks_fts(chunk_id, file_id, text)
+                    VALUES (new.id, new.file_id, COALESCE(new.text, ''));
+                END
+                """
+            )
+
+            # One-time backfill (or repair) if the FTS index is behind.
+            try:
+                (fts_cnt,) = conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()
+            except Exception:
+                fts_cnt = 0
+            try:
+                (chunks_cnt,) = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+            except Exception:
+                chunks_cnt = 0
+
+            if int(fts_cnt or 0) < int(chunks_cnt or 0):
+                conn.execute("DELETE FROM chunks_fts")
+                conn.execute(
+                    """
+                    INSERT INTO chunks_fts(chunk_id, file_id, text)
+                    SELECT id, file_id, COALESCE(text, '')
+                    FROM chunks
+                    """
+                )
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            # SQLite build likely lacks FTS5.
+            logger.info("FTS disabled (chunks_fts unavailable): %s", exc)
+        except Exception as exc:
+            logger.warning("Failed to initialize chunks_fts: %s", exc)
 
     # ------------------------------------------------------------------ #
     # App settings (simple key/value JSON)
@@ -696,6 +777,26 @@ class SQLiteMetadataStore:
         (count,) = cursor.fetchone()
         return int(count or 0)
 
+    def list_chunk_ids_for_file(self, file_id: str) -> list[str]:
+        """
+        Return all chunk ids for a file, ordered by seq ASC.
+
+        Used for index validation/repair (SQLite ↔ Qdrant consistency).
+        """
+        fid = (file_id or "").strip()
+        if not fid:
+            return []
+        cursor = self._connection.execute(
+            "SELECT id FROM chunks WHERE file_id=? ORDER BY seq ASC",
+            (fid,),
+        )
+        out: list[str] = []
+        for row in cursor.fetchall():
+            cid = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+            if isinstance(cid, str) and cid:
+                out.append(cid)
+        return out
+
     # ------------------------------------------------------------------ #
     # Retrieval helpers
     # ------------------------------------------------------------------ #
@@ -742,6 +843,133 @@ class SQLiteMetadataStore:
                 }
             )
         return results
+
+    def fetch_chunks_by_seq_range(
+        self,
+        file_id: str,
+        *,
+        seq_start: int,
+        seq_end: int,
+    ) -> list[dict[str, object]]:
+        """
+        Fetch chunk rows for a file, ordered by seq ASC, within an inclusive range.
+        """
+        fid = (file_id or "").strip()
+        if not fid:
+            return []
+        seq_start_i = max(0, int(seq_start))
+        seq_end_i = max(seq_start_i, int(seq_end))
+        cursor = self._connection.execute(
+            """
+            SELECT
+                c.id,
+                c.file_id,
+                c.seq,
+                c.text,
+                c.metadata,
+                f.filename
+            FROM chunks c
+            LEFT JOIN files f ON f.id = c.file_id
+            WHERE c.file_id = ? AND c.seq BETWEEN ? AND ?
+            ORDER BY c.seq ASC
+            """,
+            (fid, seq_start_i, seq_end_i),
+        )
+        rows = cursor.fetchall()
+        out: list[dict[str, object]] = []
+        for row in rows:
+            meta = {}
+            try:
+                meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            except Exception:
+                meta = {}
+            out.append(
+                {
+                    "id": row["id"],
+                    "file_id": row["file_id"],
+                    "seq": row["seq"],
+                    "text": row["text"],
+                    "metadata": meta,
+                    "filename": row["filename"],
+                }
+            )
+        return out
+
+    @staticmethod
+    def _to_fts_query(query: str, *, max_terms: int = 8) -> str:
+        """
+        Convert a user query into a conservative FTS5 MATCH expression.
+
+        This avoids common syntax errors from raw user input (quotes/operators).
+        """
+        q = (query or "").strip()
+        if not q:
+            return ""
+        terms = []
+        for tok in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{1,80}", q):
+            t = tok.strip()
+            if not t:
+                continue
+            terms.append(t)
+            if len(terms) >= max_terms:
+                break
+        if not terms:
+            return ""
+        # Quote each token to treat punctuation literally (best effort).
+        return " AND ".join(f"\"{t}\"" for t in terms)
+
+    def fts_search_chunks(
+        self,
+        query: str,
+        *,
+        file_id: Optional[str] = None,
+        top_k: int = 50,
+    ) -> list[dict[str, object]]:
+        """
+        Keyword search over chunk text using SQLite FTS5.
+
+        Returns lightweight hit records containing chunk_id + file_id + score.
+        """
+        q = (query or "").strip()
+        if not q:
+            return []
+        match = self._to_fts_query(q)
+        if not match:
+            return []
+        limit = max(1, min(int(top_k or 50), 500))
+
+        sql = """
+            SELECT chunk_id, file_id, bm25(chunks_fts) AS score
+            FROM chunks_fts
+            WHERE chunks_fts MATCH ?
+        """
+        params: list[object] = [match]
+        if isinstance(file_id, str) and file_id.strip():
+            sql += " AND file_id = ?"
+            params.append(file_id.strip())
+        sql += " ORDER BY score ASC LIMIT ?"
+        params.append(limit)
+
+        try:
+            cursor = self._connection.execute(sql, tuple(params))
+            rows = cursor.fetchall()
+        except Exception:
+            return []
+
+        out: list[dict[str, object]] = []
+        for row in rows:
+            cid = row["chunk_id"]
+            fid = row["file_id"]
+            if not isinstance(cid, str) or not cid:
+                continue
+            if not isinstance(fid, str) or not fid:
+                continue
+            try:
+                score = float(row["score"])
+            except Exception:
+                score = 0.0
+            out.append({"chunk_id": cid, "file_id": fid, "score": score})
+        return out
 
     def fetch_chunks_for_files(self, file_ids: Sequence[str], *, limit_per_file: int = 8) -> dict[str, list[dict[str, object]]]:
         if not file_ids:

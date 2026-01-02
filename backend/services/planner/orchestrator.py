@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from backend.services.connectors.llama_session_manager import LlamaSessionManager
+from backend.services.planner.agent_loop import MultiFileAgentConfig, MultiFileAgentLoop
+from backend.services.planner.agent_tools import AgentToolbox, ChunkAnchor
 from backend.services.retrieval.rag_store import RagStore
 from backend.services.memory.ltm_store import LongTermMemoryStore, MemoryHit
 from backend.services.ipc_events import emit_event
@@ -296,6 +298,8 @@ class InsightOrchestrator:
         self.rag_store = rag_store
         self.ltm_store = ltm_store
         self.metadata_store = metadata_store
+        self.agent_tools = AgentToolbox(rag_store=rag_store, metadata_store=metadata_store)
+        self.agent_loop = MultiFileAgentLoop(tools=self.agent_tools, embedder=getattr(rag_store, "embedder", None))
         self.system_hint = system_hint
         self._last_compaction_tick: Dict[str, int] = {}
 
@@ -835,32 +839,40 @@ class InsightOrchestrator:
 
         rag_hits_raw: List[Dict[str, Any]] = []
         scope_files: Optional[List[str]] = None
+        query_vector: Any = None
+
+        # Stop re-embedding the same query per file: compute query embedding once per turn
+        # and re-use it across dense retrieval calls (focused + secondary docs).
+        #
+        # Note: scope=all uses the MultiFileAgentLoop, which computes its own embedding once.
+        if scope_mode != "all":
+            try:
+                if (effective_focus or documents) and getattr(self.rag_store, "embedder", None):
+                    query_vector = self.rag_store.embed(user_message)
+            except Exception:
+                query_vector = None
 
         if scope_mode == "all" and scope_doc_ids:
             doc_ids_in_scope = self._uniq_file_ids(scope_doc_ids)
-            total_k = RAG_ALL_K_TOTAL
             if doc_ids_in_scope:
-                q_vec = self.rag_store.embed(user_message)
-                per_doc_k = max(1, (total_k + len(doc_ids_in_scope) - 1) // max(1, len(doc_ids_in_scope)))
-                for fid in doc_ids_in_scope:
-                    if q_vec is not None:
-                        rag_hits_raw.extend(
-                            self.rag_store.retrieve_with_vector(
-                                q_vec,
-                                chat_id=None,
-                                doc_ids=[fid],
-                                top_k=per_doc_k,
-                            )
-                        )
-                    else:
-                        rag_hits_raw.extend(
-                            self.rag_store.retrieve(
-                                user_message,
-                                chat_id=None,
-                                doc_ids=[fid],
-                                top_k=per_doc_k,
-                            )
-                        )
+                cfg = MultiFileAgentConfig(
+                    total_k=RAG_ALL_K_TOTAL,
+                    dense_k=16,
+                    sparse_k=16,
+                    radius=2,
+                    max_tokens_total=RAG_CONTEXT_MAX_TOKENS,
+                    max_tokens_per_file_floor=600,
+                    repair_on_empty=True,
+                    max_repairs=2000,
+                )
+                windows_map = self.agent_loop.build_evidence_windows(
+                    user_message,
+                    file_ids=doc_ids_in_scope,
+                    config=cfg,
+                    request_id=request_id,
+                )
+                rag_hits_raw.extend(self.agent_loop.windows_to_rag_hits(windows_map))
+
                 scope_files = []
                 for fid in doc_ids_in_scope:
                     try:
@@ -873,36 +885,114 @@ class InsightOrchestrator:
                 if not scope_files:
                     scope_files = None
         elif effective_focus:
-            rag_hits_raw.extend(
-                self.rag_store.retrieve(
-                    user_message,
-                    chat_id=None,
-                    doc_ids=[effective_focus],
-                    top_k=primary_k,
-                )
+            # Focused mode: primary evidence from focused file, plus a small secondary budget.
+            focus_anchors = self.agent_tools.hybrid_search(
+                user_message,
+                file_id=effective_focus,
+                top_k=primary_k,
+                query_vector=query_vector,
+                dense_k=max(primary_k, 10),
+                sparse_k=max(primary_k, 10),
             )
+            focus_windows_map = self.agent_tools.windows_from_anchors(
+                focus_anchors,
+                radius=2,
+                max_tokens_per_file=RAG_CONTEXT_MAX_TOKENS,
+            )
+            for w in focus_windows_map.get(effective_focus, []):
+                if not w.text:
+                    continue
+                rag_hits_raw.append(
+                    {
+                        "doc_id": effective_focus,
+                        "text": w.text,
+                        "filename": w.filename,
+                        "page": w.page_start,
+                        "page_start": w.page_start,
+                        "page_end": w.page_end,
+                        "chunk_id": f"seq_window:{w.seq_start}-{w.seq_end}",
+                        "score": 1.0,
+                    }
+                )
+
             if secondary_doc_ids and RAG_SECONDARY_K_TOTAL > 0:
-                rag_hits_raw.extend(
-                    self.rag_store.retrieve(
-                        user_message,
-                        chat_id=None,
-                        doc_ids=[fid for fid in secondary_doc_ids if isinstance(fid, str) and fid],
-                        top_k=RAG_SECONDARY_K_TOTAL,
+                other_ids = [fid for fid in secondary_doc_ids if isinstance(fid, str) and fid]
+                if other_ids:
+                    per_other_k = max(1, (RAG_SECONDARY_K_TOTAL + len(other_ids) - 1) // max(1, len(other_ids)))
+                    other_anchors: List[ChunkAnchor] = []
+                    for fid in other_ids:
+                        other_anchors.extend(
+                            self.agent_tools.hybrid_search(
+                                user_message,
+                                file_id=fid,
+                                top_k=per_other_k,
+                                query_vector=query_vector,
+                                dense_k=max(per_other_k, 6),
+                                sparse_k=max(per_other_k, 6),
+                            )
+                        )
+                    other_windows_map = self.agent_tools.windows_from_anchors(
+                        other_anchors,
+                        radius=1,
+                        max_tokens_per_file=600,
                     )
-                )
+                    for fid in other_ids:
+                        for w in other_windows_map.get(fid, []):
+                            if not w.text:
+                                continue
+                            rag_hits_raw.append(
+                                {
+                                    "doc_id": fid,
+                                    "text": w.text,
+                                    "filename": w.filename,
+                                    "page": w.page_start,
+                                    "page_start": w.page_start,
+                                    "page_end": w.page_end,
+                                    "chunk_id": f"seq_window:{w.seq_start}-{w.seq_end}",
+                                    "score": 1.0,
+                                }
+                            )
         elif documents:
-            rag_hits_raw.extend(
-                self.rag_store.retrieve(
-                    user_message,
-                    chat_id=None,
-                    doc_ids=self._uniq_file_ids(documents),
-                    top_k=primary_k,
+            doc_ids = self._uniq_file_ids(documents)
+            if doc_ids:
+                anchors: List[ChunkAnchor] = []
+                for fid in doc_ids:
+                    anchors.extend(
+                        self.agent_tools.hybrid_search(
+                            user_message,
+                            file_id=fid,
+                            top_k=max(1, primary_k // max(1, len(doc_ids))),
+                            query_vector=query_vector,
+                            dense_k=8,
+                            sparse_k=8,
+                        )
+                    )
+                windows_map = self.agent_tools.windows_from_anchors(
+                    anchors,
+                    radius=2,
+                    max_tokens_per_file=max(600, int(RAG_CONTEXT_MAX_TOKENS // max(1, len(doc_ids)))),
                 )
-            )
+                for fid in doc_ids:
+                    for w in windows_map.get(fid, []):
+                        if not w.text:
+                            continue
+                        rag_hits_raw.append(
+                            {
+                                "doc_id": fid,
+                                "text": w.text,
+                                "filename": w.filename,
+                                "page": w.page_start,
+                                "page_start": w.page_start,
+                                "page_end": w.page_end,
+                                "chunk_id": f"seq_window:{w.seq_start}-{w.seq_end}",
+                                "score": 1.0,
+                            }
+                        )
         else:
             rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k))
 
         selected_rag = self._dedup_rag(rag_hits_raw)
+
         if scope_mode == "all" and scope_doc_ids:
             selected_rag = self._rebalance_hits_by_file(selected_rag, max_hits=RAG_ALL_K_TOTAL)
             selected_rag = self._apply_rag_budget_balanced(chat_id, selected_rag, file_order=scope_doc_ids)

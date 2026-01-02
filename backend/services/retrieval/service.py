@@ -27,6 +27,14 @@ class RetrievalService:
         self._collection = collection_name
         self._metadata_store = metadata_store
 
+    @property
+    def qdrant_client(self) -> QdrantClient:
+        return self._qdrant
+
+    @property
+    def collection_name(self) -> str:
+        return self._collection
+
     def search(self, query: RetrievalQuery, *, context: Optional[RetrievalContext] = None) -> List[RetrievalResult]:
         logger.debug(
             "Searching Qdrant collection %s (limit=%s)",
