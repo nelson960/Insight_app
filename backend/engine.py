@@ -74,6 +74,63 @@ logger = logging.getLogger(__name__)
 
 APP = create_app()
 
+_IPC_ALLOWED_ENDPOINTS: Dict[str, List[str]] = {
+    "GET": [
+        "/settings",
+        "/settings/llm/info",
+        "/settings/busy",
+        "/settings/storage",
+        "/settings/index/validate/",
+        "/chat/sessions",
+        "/chat/context/",
+        "/files/chat/",
+        "/files/progress/",
+        "/files/extracted/",
+        "/docs/page/",
+        "/search/doc/",
+    ],
+    "POST": [
+        "/chat",
+        "/chat/summarize_text",
+        "/chat/branch",
+        "/files/upload",
+        "/files/ingest_path",
+        "/settings",
+        "/settings/model/validate",
+        "/settings/llm/apply",
+        "/settings/storage/clean_cache",
+        "/settings/storage/reset",
+        "/settings/index/repair",
+    ],
+    "PUT": [
+        "/docs/page/",
+    ],
+    "DELETE": [
+        "/chat/sessions/",
+        "/files/chat/",
+    ],
+}
+
+
+def _is_allowed_ipc_endpoint(method: str, endpoint: str) -> bool:
+    parsed = urlparse(endpoint)
+    path = parsed.path or ""
+    if not path.startswith("/"):
+        return False
+    # Basic traversal hardening even though these are IPC-only paths.
+    if ".." in path:
+        return False
+
+    patterns = _IPC_ALLOWED_ENDPOINTS.get(method.upper(), [])
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            if path.startswith(pattern):
+                return True
+        else:
+            if path == pattern:
+                return True
+    return False
+
 
 # -----------------------------------------------------------------------------
 # Output (stdout) helpers
@@ -102,6 +159,10 @@ def _build_headers(headers: Dict[str, Any]) -> List[Tuple[bytes, bytes]]:
     # Ensure JSON body is treated correctly unless caller overrides
     if not any(str(k).lower() == "content-type" for k in headers.keys()):
         out.append((b"content-type", b"application/json"))
+
+    # Mark requests as IPC-internal so the FastAPI app can reject external HTTP.
+    if not any(str(k).lower() == "x-insight-ipc" for k in headers.keys()):
+        out.append((b"x-insight-ipc", b"1"))
 
     for k, v in headers.items():
         out.append((str(k).lower().encode("utf-8"), str(v).encode("utf-8")))
@@ -451,6 +512,18 @@ class RequestManager:
                     "ok": False,
                     "status": 400,
                     "error": "Invalid or missing endpoint (must start with '/')",
+                }
+            )
+            return
+
+        if not _is_allowed_ipc_endpoint(method, endpoint):
+            logger.warning("IPC rejected endpoint=%s method=%s request_id=%s", endpoint, method, request_id)
+            self.writer.emit(
+                {
+                    "request_id": request_id,
+                    "ok": False,
+                    "status": 403,
+                    "error": "endpoint_not_allowed",
                 }
             )
             return

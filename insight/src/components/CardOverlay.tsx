@@ -204,7 +204,7 @@ export function CardOverlay({
                 setCardsOpen((v) => !v);
               }}
             >
-              ▦
+              ⋯
             </button>
             {cardsOpen ? (
               <div className="card-overlay-cards-menu" ref={cardsMenuRef}>

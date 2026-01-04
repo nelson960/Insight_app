@@ -35,7 +35,6 @@ from .pipeline import (
     MetadataStore,
 )
 from .retry import RetryPolicy
-from .worker import IngestionJob, IngestionWorker, JobQueue
 
 
 def create_ingestion_pipeline(
@@ -110,9 +109,6 @@ __all__ = [
     "FileNormalizer",
     "MetadataStore",
     "RetryPolicy",
-    "IngestionWorker",
-    "IngestionJob",
-    "JobQueue",
     "create_ingestion_pipeline",
     "FileExtractionService",
 ]

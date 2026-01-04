@@ -107,17 +107,27 @@ class AppDependencies:
         if cls._session_manager is None:
             sqlite_store, _ = cls.storage()
 
-            # Default local model path; can be overridden via app settings.
-            default_model_path = Path(__file__).resolve().parents[2] / "models" / "Llama-3.1-8B-Instruct-q4_k_m.gguf"
-            model_path_raw = sqlite_store.get_setting("llm_model_path", str(default_model_path))
-            model_path = Path(str(model_path_raw)).expanduser()
+            model_path_raw = sqlite_store.get_setting("llm_model_path", "")
+            model_path_raw = model_path_raw if isinstance(model_path_raw, str) else ""
+            if not model_path_raw.strip():
+                raise FileNotFoundError(
+                    "No GGUF model configured. Update Settings → Model to select a valid .gguf file."
+                )
+
+            model_path = Path(model_path_raw).expanduser()
             if not model_path.exists():
                 raise FileNotFoundError(
                     f"Model not found at {model_path}. Update Settings → Model to select a valid .gguf file."
                 )
 
-            # Context length is intentionally fixed (not user-configurable).
-            ctx_size = 32768
+            # Context length can be configured via Settings (8k/32k).
+            ctx_raw = sqlite_store.get_setting("llm_ctx_size", 32768)
+            try:
+                ctx_size = int(ctx_raw)
+            except Exception:
+                ctx_size = 32768
+            if ctx_size not in (8192, 32768):
+                ctx_size = 32768
 
             gpu_layers_raw = sqlite_store.get_setting("llm_gpu_layers", 99)
             try:
@@ -239,11 +249,23 @@ class AppDependencies:
         while background work is running (ingestion, streaming, KV snapshot/persist).
         """
         store, _ = cls.storage()
-        active_jobs = 0
+        active_jobs_db = 0
         try:
-            active_jobs = int(store.count_jobs_with_status(("queued", "running")))
+            active_jobs_db = int(store.count_jobs_with_status(("queued", "running")))
         except Exception:
-            active_jobs = 0
+            active_jobs_db = 0
+
+        ingestion_state: dict[str, int] | None = None
+        active_jobs_mem = 0
+        if cls._ingestion_scheduler is not None:
+            try:
+                ingestion_state = cls._ingestion_scheduler.busy_state()
+                active_jobs_mem = int(ingestion_state.get("queued", 0)) + int(ingestion_state.get("running", 0))
+            except Exception:
+                ingestion_state = None
+                active_jobs_mem = 0
+
+        active_jobs = max(active_jobs_db, active_jobs_mem)
 
         llm_state: dict[str, object] | None = None
         llm_busy = False
@@ -266,6 +288,7 @@ class AppDependencies:
             "busy": busy,
             "reasons": reasons,
             "active_jobs": active_jobs,
+            "ingestion": ingestion_state or {"queued": 0, "running": 0, "timed_out": 0},
             "llm": llm_state or {"busy": False},
         }
 

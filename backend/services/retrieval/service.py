@@ -113,41 +113,30 @@ class RetrievalService:
 
     def fetch_chunks_for_files(self, file_ids: Sequence[str], *, limit_per_file: int = 8) -> dict[str, list[dict[str, object]]]:
         """
-        Fetch chunk texts for given file_ids directly from Qdrant payloads, ordered by seq if present.
+        Fetch chunk texts for given file_ids ordered by seq.
+
+        Note: this uses SQLite as the source of truth (stable ordering + avoids dummy vectors).
         """
         if not file_ids:
             return {}
-        out: Dict[str, list[dict[str, object]]] = {fid: [] for fid in file_ids}
+        out: Dict[str, list[dict[str, object]]] = {}
+        try:
+            out = self._metadata_store.fetch_chunks_for_files(file_ids, limit_per_file=limit_per_file)
+        except Exception:
+            out = {fid: [] for fid in file_ids}
+
+        # Enrich with filename (best-effort) for UI/debug consumers.
         for fid in file_ids:
+            chunks = out.get(fid) or []
             try:
-                points = self._qdrant.search(
-                    collection_name=self._collection,
-                    query_vector=[0.0] * 4,  # dummy vector; relies on filter
-                    limit=limit_per_file,
-                    with_payload=True,
-                    with_vectors=False,
-                    query_filter={
-                        "must": [
-                            {"key": "file_id", "match": {"value": fid}},
-                        ]
-                    },
-                )
-                sorted_points = sorted(points, key=lambda p: (p.payload or {}).get("seq", 0))
-                for p in sorted_points:
-                    payload = p.payload or {}
-                    text = payload.get("text")
-                    if not text:
-                        continue
-                    out[fid].append(
-                        {
-                            "text": text,
-                            "seq": payload.get("seq", 0),
-                            "filename": payload.get("filename"),
-                            "file_id": fid,
-                        }
-                    )
+                file_row = self._metadata_store.get_file(fid) or {}
+                filename = file_row.get("filename")
             except Exception:
-                out[fid] = []
+                filename = None
+            if filename:
+                for c in chunks:
+                    if isinstance(c, dict) and "filename" not in c:
+                        c["filename"] = filename
         return out
 
     def delete_chunks_for_chat(self, chat_id: str) -> None:

@@ -8,6 +8,30 @@ type SettingsState = {
   theme_mode: ThemeMode;
   llm_model_path: string;
   llm_gpu_layers: number;
+  llm_ctx_size: number;
+};
+
+type LlmModelInfo = {
+  path?: string;
+  architecture?: string;
+  name?: string;
+  size_label?: string;
+  file_type?: number | null;
+  quantization_version?: number | null;
+  ctx_train?: number | null;
+  ctx_runtime?: number | null;
+  chat_template_kind?: string;
+  chat_format?: string;
+  prompt_renderer?: string;
+  tokenizer_model?: string;
+  add_bos_token?: string;
+  bos_token_id?: number | null;
+  eos_token_id?: number | null;
+};
+
+type SettingsResponse = {
+  settings?: SettingsState;
+  llm?: { loaded?: boolean; model_info?: LlmModelInfo | null };
 };
 
 type StorageUsage = {
@@ -47,14 +71,18 @@ export function SettingsModal(props: {
     theme_mode: themeMode,
     llm_model_path: "",
     llm_gpu_layers: 99,
+    llm_ctx_size: 32768,
   });
   const [storage, setStorage] = useState<StorageUsage | null>(null);
   const [restartRequired, setRestartRequired] = useState(false);
   const [modelValidation, setModelValidation] = useState<{ ok: boolean; msg: string } | null>(null);
   const [cleanResult, setCleanResult] = useState<string | null>(null);
   const [resetArmed, setResetArmed] = useState(false);
+  const [llmApplyArmed, setLlmApplyArmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [engineBusy, setEngineBusy] = useState<BusyState | null>(null);
+  const [llmLoaded, setLlmLoaded] = useState(false);
+  const [llmInfo, setLlmInfo] = useState<LlmModelInfo | null>(null);
 
   function getErrorText(res: { error?: string; data?: any }, fallback: string) {
     return (
@@ -69,20 +97,30 @@ export function SettingsModal(props: {
   useEffect(() => {
     if (!open) return;
     setResetArmed(false);
+    setLlmApplyArmed(false);
     setCleanResult(null);
     setModelValidation(null);
     setRestartRequired(false);
     setBusy(true);
     (async () => {
-      const res = await engine<{ settings: SettingsState }>(
+      const res = await engine<SettingsResponse>(
         "/settings",
         undefined,
         "GET"
       );
-      if (res.ok && res.data?.settings) {
-        setSettings((prev) => ({ ...prev, ...res.data.settings }));
-        const mode = res.data.settings.theme_mode;
+      if (res.ok && (res.data as any)?.settings) {
+        const next = (res.data as any).settings as SettingsState;
+        setSettings((prev) => ({ ...prev, ...next }));
+        const mode = next.theme_mode;
         if (mode) onThemeModeChange(mode);
+      }
+      if (res.ok) {
+        const loaded = Boolean((res.data as any)?.llm?.loaded);
+        setLlmLoaded(loaded);
+        setLlmInfo(((res.data as any)?.llm?.model_info as any) || null);
+      } else {
+        setLlmLoaded(false);
+        setLlmInfo(null);
       }
       const st = await engine<StorageUsage>("/settings/storage", undefined, "GET");
       if (st.ok) setStorage(st.data as any);
@@ -152,10 +190,53 @@ export function SettingsModal(props: {
       if (!path) return;
       const ok = await validateModel(path);
       if (!ok) return;
-      await saveSettingsPatch({ llm_model_path: path });
+      setSettings((p) => ({ ...p, llm_model_path: path }));
+      setLlmApplyArmed(false);
     } catch (e: any) {
       setModelValidation({ ok: false, msg: e?.message || String(e) });
     }
+  }
+
+  async function applyLlmSettings() {
+    if (engineBusy?.busy) {
+      setCleanResult("Background work is running. Wait for it to finish before applying model settings.");
+      return;
+    }
+    if (!llmApplyArmed) {
+      setLlmApplyArmed(true);
+      setCleanResult("Click again to confirm. This will delete all chats, files, indexes, and KV sessions.");
+      return;
+    }
+
+    const ok = await validateModel(settings.llm_model_path);
+    if (!ok) {
+      setLlmApplyArmed(false);
+      return;
+    }
+
+    setBusy(true);
+    const res = await engine<any>(
+      "/settings/llm/apply",
+      {
+        confirm: true,
+        settings: {
+          llm_model_path: settings.llm_model_path,
+          llm_ctx_size: settings.llm_ctx_size,
+        },
+      },
+      "POST"
+    );
+    setBusy(false);
+    setLlmApplyArmed(false);
+
+    if (!res.ok) {
+      setCleanResult(getErrorText(res, "Failed to apply model settings"));
+      return;
+    }
+
+    setRestartRequired(true);
+    await refreshStorage();
+    setCleanResult("Model settings applied and workspace cleared. Restart the app/engine to reload the model.");
   }
 
   async function cleanCache(trimLogs: boolean) {
@@ -283,7 +364,7 @@ export function SettingsModal(props: {
                   onBlur={async () => {
                     if (!settings.llm_model_path) return;
                     const ok = await validateModel(settings.llm_model_path);
-                    if (ok) await saveSettingsPatch({ llm_model_path: settings.llm_model_path });
+                    if (ok) setLlmApplyArmed(false);
                   }}
                 />
                 <button className="settings-btn" type="button" onClick={browseModel}>
@@ -295,8 +376,69 @@ export function SettingsModal(props: {
                   {modelValidation.msg}
                 </div>
               ) : null}
+              <div className="settings-hint">
+                {llmLoaded && llmInfo ? (
+                  <div>
+                    Loaded: <code>{llmInfo.name || "Unknown model"}</code>{" "}
+                    {llmInfo.architecture ? <span>({llmInfo.architecture})</span> : null}
+                    <div className="settings-muted">
+                      ctx runtime{" "}
+                      <code>{String(llmInfo.ctx_runtime ?? "")}</code>{" "}
+                      {llmInfo.ctx_train ? (
+                        <>
+                          • ctx train <code>{String(llmInfo.ctx_train)}</code>
+                        </>
+                      ) : null}
+                      {typeof llmInfo.file_type === "number" ? (
+                        <>
+                          {" "}
+                          • file_type <code>{String(llmInfo.file_type)}</code>
+                        </>
+                      ) : null}
+                      {llmInfo.chat_template_kind ? (
+                        <>
+                          {" "}
+                          • template <code>{llmInfo.chat_template_kind}</code>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="settings-muted">
+                    Model info appears after the engine loads the model (start a chat or restart after applying settings).
+                  </div>
+                )}
+              </div>
             </div>
 
+            <div className="settings-row settings-col">
+              <label className="settings-label">Context length</label>
+              <div className="settings-inline">
+                <select
+                  className="settings-select"
+                  value={String(settings.llm_ctx_size || 32768)}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setSettings((p) => ({ ...p, llm_ctx_size: v }));
+                    setLlmApplyArmed(false);
+                  }}
+                >
+                  <option value="8192">8k</option>
+                  <option value="32768">32k</option>
+                </select>
+                <button
+                  className={`settings-btn danger ${llmApplyArmed ? "confirm" : ""}`}
+                  type="button"
+                  disabled={busy || !!engineBusy?.busy}
+                  onClick={applyLlmSettings}
+                >
+                  {llmApplyArmed ? "Click again to confirm" : "Apply (resets all data)"}
+                </button>
+              </div>
+              <div className="settings-hint">
+                Changing model/context clears chats, files, indexes, and KV sessions.
+              </div>
+            </div>
           </section>
 
           <section className="settings-section">

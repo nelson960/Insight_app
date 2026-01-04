@@ -178,6 +178,7 @@ export function ChatWindow({
   const [branchShareDocs, setBranchShareDocs] = useState(true);
   const [branchIsWorking, setBranchIsWorking] = useState(false);
   const [branchError, setBranchError] = useState<string | null>(null);
+  const branchPopoverRef = useRef<HTMLDivElement | null>(null);
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
   const [ingestProgress, setIngestProgress] = useState<IngestProgressState | null>(null);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
@@ -252,6 +253,13 @@ export function ChatWindow({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    if (!branchTarget) return;
+    requestAnimationFrame(() => {
+      branchPopoverRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  }, [branchTarget?.id]);
 
   useEffect(() => {
     if (chatPopoverTimerRef.current != null) {
@@ -1107,6 +1115,7 @@ export function ChatWindow({
                 className="chat-branch-popover"
                 role="dialog"
                 aria-label="Branch options"
+                ref={branchPopoverRef}
                 onMouseDown={(e) => e.stopPropagation()}
                 onPointerDown={(e) => e.stopPropagation()}
               >

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import os
+from datetime import datetime, timezone
 from queue import Queue, Empty
 from uuid import uuid4
 from typing import Dict, Set
@@ -27,9 +28,94 @@ class IngestionScheduler:
         self._lock = threading.Lock()
         self._known_jobs: Dict[str, IngestionRequest] = {}
         self._cancelled: Set[str] = set()
+        self._timed_out: Set[str] = set()
         self._running_cancel: Dict[str, threading.Event] = {}
+        self._watchdog_interval_seconds = self._safe_env_int("INSIGHT_INGEST_WATCHDOG_SEC", 15)
+        self._max_running_age_seconds = self._safe_env_int("INSIGHT_INGEST_MAX_RUNNING_SEC", 20 * 60)
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
+        self._watchdog_thread = threading.Thread(target=self._watchdog, daemon=True)
+        self._watchdog_thread.start()
+
+    @staticmethod
+    def _safe_env_int(key: str, default: int) -> int:
+        raw = os.getenv(key)
+        if raw is None:
+            return int(default)
+        try:
+            return int(str(raw).strip())
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _parse_created_at(value: object) -> datetime | None:
+        if not isinstance(value, str) or not value:
+            return None
+        # SQLite datetime('now') returns "YYYY-MM-DD HH:MM:SS" (UTC).
+        try:
+            dt = datetime.fromisoformat(value)
+        except Exception:
+            return None
+        if dt.tzinfo is None:
+            # Treat naive SQLite timestamps as UTC.
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def _watchdog(self) -> None:
+        """
+        Periodically mark long-running jobs as failed to avoid "busy forever" states.
+
+        This is best-effort: it cannot forcibly kill a hung Python thread, but it can:
+        - request cancellation via the pipeline's cancel_check
+        - mark the job/file failed in SQLite so the UI can recover and offer retry.
+        """
+        while not self._stop_event.is_set():
+            self._stop_event.wait(timeout=max(1, self._watchdog_interval_seconds))
+            if self._stop_event.is_set():
+                return
+            if self._max_running_age_seconds <= 0:
+                continue
+            try:
+                running = self._metadata_store.list_jobs_with_status(("running",), limit=1000)
+            except Exception:
+                continue
+            if not running:
+                continue
+
+            now = datetime.now(timezone.utc)
+            for job in running:
+                job_id = str(job.get("id") or "")
+                file_id = str(job.get("file_id") or "")
+                created_at = self._parse_created_at(job.get("created_at"))
+                if not job_id or created_at is None:
+                    continue
+                age = (now - created_at).total_seconds()
+                if age < float(self._max_running_age_seconds):
+                    continue
+
+                with self._lock:
+                    if job_id in self._timed_out:
+                        continue
+                    self._timed_out.add(job_id)
+                    ev = self._running_cancel.get(job_id)
+                    if ev is not None:
+                        ev.set()
+
+                logger.warning(
+                    "Ingestion watchdog timing out job %s (file=%s age=%.1fs)",
+                    job_id,
+                    file_id,
+                    age,
+                )
+                try:
+                    self._metadata_store.update_job_status(job_id, "failed", error="watchdog timeout")
+                except Exception:
+                    pass
+                if file_id:
+                    try:
+                        self._metadata_store.mark_file_status(file_id, FileIngestionStatus.FAILED)
+                    except Exception:
+                        pass
 
     def _reconcile_stale_jobs(self) -> None:
         """
@@ -141,6 +227,23 @@ class IngestionScheduler:
             logger.info("Cancelled %d ingestion jobs for file_id=%s", cancelled, file_id)
         return cancelled
 
+    def busy_state(self) -> dict[str, int]:
+        """
+        Return a cheap snapshot of in-memory ingestion activity.
+
+        Note: SQLite job rows can become stale when the process is restarted or a job
+        is force-failed by the watchdog. The UI and settings safety checks should
+        consider both SQLite and in-memory activity.
+        """
+        try:
+            queued = int(self._queue.qsize())
+        except Exception:
+            queued = 0
+        with self._lock:
+            running = len(self._running_cancel)
+            timed_out = len(self._timed_out)
+        return {"queued": queued, "running": running, "timed_out": timed_out}
+
     def _worker(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -163,7 +266,12 @@ class IngestionScheduler:
                 self._metadata_store.update_job_status(job_id, "completed")
             except IngestionCancelled:
                 logger.info("Async ingestion cancelled for job %s", job_id)
-                self._metadata_store.update_job_status(job_id, "cancelled")
+                with self._lock:
+                    timed_out = job_id in self._timed_out
+                if timed_out:
+                    self._metadata_store.update_job_status(job_id, "failed", error="watchdog timeout")
+                else:
+                    self._metadata_store.update_job_status(job_id, "cancelled")
             except Exception as exc:
                 logger.exception("Async ingestion failed for job %s", job_id)
                 self._metadata_store.update_job_status(job_id, "failed", error=str(exc))
@@ -184,3 +292,4 @@ class IngestionScheduler:
     def shutdown(self) -> None:
         self._stop_event.set()
         self._thread.join(timeout=2)
+        self._watchdog_thread.join(timeout=2)

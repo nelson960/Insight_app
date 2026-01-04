@@ -32,7 +32,9 @@ logger = logging.getLogger(__name__)
 
 
 class LlamaSessionManager:
-    _PROMPT_RENDERER_ID = "llama3_manual_v2"
+    _PROMPT_RENDERER_LLAMA3 = "llama3_manual_v2"
+    _PROMPT_RENDERER_CHATML = "chatml_manual_v1"
+    _PROMPT_RENDERER_ID = _PROMPT_RENDERER_LLAMA3
     _PERSIST_DEBOUNCE_SEC = 0.75
     _SNAPSHOT_DEBOUNCE_SEC = 0.35
     _STATE_KIND_COMPACT = "llama_state_compact_v1"
@@ -61,6 +63,8 @@ class LlamaSessionManager:
         if not model_path.exists():
             raise FileNotFoundError(f"Model not found at {model_path}")
 
+        self.model_path = model_path
+        self.chat_format = chat_format
         self.llm = Llama(
             model_path=str(model_path),
             n_ctx=ctx_size,
@@ -80,6 +84,26 @@ class LlamaSessionManager:
         self.ctx_size = actual_ctx
         try:
             logger.info("LlamaSessionManager model ready n_ctx=%d n_batch=%d", self.ctx_size, int(self.llm.n_batch))
+        except Exception:
+            pass
+
+        # Select the prompt renderer based on GGUF metadata markers.
+        # This must happen after model load (so `llm.metadata` exists) and before
+        # we compute model_info() (which surfaces the selected renderer).
+        self._PROMPT_RENDERER_ID = self._detect_prompt_renderer_id()
+
+        self._model_info = self._build_model_info()
+        try:
+            info = self._model_info
+            logger.info(
+                "LLM loaded name=%s arch=%s ctx_train=%s ctx_runtime=%s file_type=%s renderer=%s",
+                info.get("name") or "?",
+                info.get("architecture") or "?",
+                info.get("ctx_train") or "?",
+                info.get("ctx_runtime") or "?",
+                info.get("file_type") or "?",
+                info.get("prompt_renderer") or "?",
+            )
         except Exception:
             pass
 
@@ -138,6 +162,122 @@ class LlamaSessionManager:
     # -------------------------------------------------------------------------
     # Public session API
     # -------------------------------------------------------------------------
+
+    def model_info(self) -> Dict[str, object]:
+        """
+        Return a small, UI-safe snapshot of the currently loaded LLM capabilities.
+
+        This is intentionally *not* the full GGUF metadata (which can be huge).
+        """
+        try:
+            return dict(self._model_info)
+        except Exception:
+            return {}
+
+    def _build_model_info(self) -> Dict[str, object]:
+        """
+        Extract a compact set of model properties for Settings/UI.
+
+        NOTE: llama-cpp-python exposes GGUF metadata on the Llama instance as `llm.metadata`,
+        but it is printed to stderr only when verbose=True. We keep our own filtered copy.
+        """
+
+        def _meta_str(key: str) -> str:
+            try:
+                v = (getattr(self.llm, "metadata", {}) or {}).get(key)
+            except Exception:
+                v = None
+            if v is None:
+                return ""
+            try:
+                return str(v)
+            except Exception:
+                return ""
+
+        def _meta_int(key: str) -> Optional[int]:
+            v = _meta_str(key)
+            if not v:
+                return None
+            try:
+                return int(v)
+            except Exception:
+                return None
+
+        meta_arch = _meta_str("general.architecture")
+        meta_name = _meta_str("general.name")
+        meta_size = _meta_str("general.size_label")
+        meta_file_type = _meta_int("general.file_type")
+        meta_quant_ver = _meta_int("general.quantization_version")
+
+        ctx_train: Optional[int] = None
+        try:
+            ctx_train = int(self.llm._model.n_ctx_train())  # type: ignore[attr-defined]
+        except Exception:
+            ctx_train = None
+        if ctx_train is None:
+            ctx_train = _meta_int("llama.context_length") or _meta_int("qwen2.context_length")
+
+        # Chat template kind is inferred from GGUF `tokenizer.chat_template` markers.
+        template = _meta_str("tokenizer.chat_template")
+        if "<|start_header_id|>" in template and "<|eot_id|>" in template:
+            template_kind = "llama3"
+        elif "<|im_start|>" in template and "<|im_end|>" in template:
+            template_kind = "chatml"
+        else:
+            template_kind = "unknown"
+
+        # Tokenizer hints
+        tok_model = _meta_str("tokenizer.ggml.model") or _meta_str("tokenizer.ggml.pre")
+        add_bos = _meta_str("tokenizer.ggml.add_bos_token")
+        bos_id = _meta_int("tokenizer.ggml.bos_token_id")
+        eos_id = _meta_int("tokenizer.ggml.eos_token_id")
+
+        return {
+            "path": str(self.model_path),
+            "architecture": meta_arch,
+            "name": meta_name,
+            "size_label": meta_size,
+            "file_type": meta_file_type,
+            "quantization_version": meta_quant_ver,
+            "ctx_train": ctx_train,
+            "ctx_runtime": int(self.ctx_size) if self.ctx_size else None,
+            "chat_template_kind": template_kind,
+            "chat_format": str(getattr(self, "chat_format", "") or ""),
+            "prompt_renderer": str(getattr(self, "_PROMPT_RENDERER_ID", "") or ""),
+            "tokenizer_model": tok_model,
+            "add_bos_token": add_bos,
+            "bos_token_id": bos_id,
+            "eos_token_id": eos_id,
+        }
+
+    def _detect_prompt_renderer_id(self) -> str:
+        """
+        Infer which prompt renderer to use for the loaded model.
+
+        We avoid llama-cpp-python "apply_chat_template" APIs (not available in our pinned
+        version) and instead render prompts ourselves. To keep correctness across models,
+        we detect common chat templates from GGUF metadata:
+        - Llama-3 style: <|start_header_id|> ... <|eot_id|>
+        - ChatML (Qwen/Qwen2.5): <|im_start|> ... <|im_end|>
+        """
+        try:
+            meta = getattr(self.llm, "metadata", {}) or {}
+        except Exception:
+            meta = {}
+        try:
+            arch = str(meta.get("general.architecture") or "")
+        except Exception:
+            arch = ""
+        try:
+            template = str(meta.get("tokenizer.chat_template") or "")
+        except Exception:
+            template = ""
+
+        if "<|im_start|>" in template and "<|im_end|>" in template:
+            return self._PROMPT_RENDERER_CHATML
+        if arch.lower().startswith("qwen"):
+            return self._PROMPT_RENDERER_CHATML
+        return self._PROMPT_RENDERER_LLAMA3
 
     def cancel_request(self, request_id: str) -> bool:
         """
@@ -209,7 +349,7 @@ class LlamaSessionManager:
             # Ensure session KV matches our rendered prompt format (system wrapper included).
             self._prefill_chat_messages(messages)
             state_obj = self._save_state_compact()
-            prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
+            prompt = self._render_prompt(messages, add_generation_prompt=False)
             prompt_tokens = self._tokenize_prompt(prompt)
         session_payload = {
             "state": state_obj,
@@ -237,7 +377,7 @@ class LlamaSessionManager:
                 messages.append({"role": "system", "content": system_prompt})
             self._prefill_chat_messages(messages)
             state_obj = self._save_state_compact()
-            prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
+            prompt = self._render_prompt(messages, add_generation_prompt=False)
             prompt_tokens = self._tokenize_prompt(prompt)
         session_payload = {
             "state": state_obj,
@@ -330,7 +470,7 @@ class LlamaSessionManager:
                         self.llm.reset()
                         self._prefill_chat_messages(system_messages)
                         fresh_state = self._save_state_compact()
-                        prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                        prompt = self._render_prompt(system_messages, add_generation_prompt=False)
                         prompt_tokens = self._tokenize_prompt(prompt)
                     session = {
                         "state": fresh_state,
@@ -366,13 +506,13 @@ class LlamaSessionManager:
                 clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
                 clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
                 if not clean_tokens:
-                    clean_prompt = self._render_llama3_prompt(clean_messages, add_generation_prompt=False)
+                    clean_prompt = self._render_prompt(clean_messages, add_generation_prompt=False)
                     clean_tokens = self._tokenize_prompt(clean_prompt)
                 run_messages: List[Dict[str, str]] = list(clean_messages)
                 run_messages.append({"role": "user", "content": message})
 
                 # Avoid llama.cpp hard failures when prompt_tokens + max_tokens > ctx_size.
-                run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
+                run_prompt = self._render_prompt(run_messages, add_generation_prompt=True)
                 run_tokens = self._tokenize_prompt(run_prompt)
                 if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
                     delta = run_tokens[len(clean_tokens) :]
@@ -402,7 +542,7 @@ class LlamaSessionManager:
                         max_tokens=max_tokens,
                         temperature=temperature,
                         stream=True,
-                        stop=["<|eot_id|>", "<|end_of_text|>"],
+                        stop=self._stop_markers(),
                     )
 
                     for chunk in stream:
@@ -513,7 +653,7 @@ class LlamaSessionManager:
                         self.llm.reset()
                         self._prefill_chat_messages(system_messages)
                         fresh_state = self._save_state_compact()
-                        prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                        prompt = self._render_prompt(system_messages, add_generation_prompt=False)
                         prompt_tokens = self._tokenize_prompt(prompt)
                     session = {
                         "state": fresh_state,
@@ -554,7 +694,7 @@ class LlamaSessionManager:
                 clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
                 clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
                 if not clean_tokens:
-                    clean_prompt = self._render_llama3_prompt(clean_messages, add_generation_prompt=False)
+                    clean_prompt = self._render_prompt(clean_messages, add_generation_prompt=False)
                     clean_tokens = self._tokenize_prompt(clean_prompt)
 
                 run_messages: List[Dict[str, str]] = list(clean_messages)
@@ -562,7 +702,7 @@ class LlamaSessionManager:
                     run_messages.append({"role": "system", "content": self._format_context_pack(context_pack)})
                 run_messages.append({"role": "user", "content": run_user})
 
-                run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
+                run_prompt = self._render_prompt(run_messages, add_generation_prompt=True)
                 run_tokens = self._tokenize_prompt(run_prompt)
                 if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
                     delta = run_tokens[len(clean_tokens) :]
@@ -600,7 +740,7 @@ class LlamaSessionManager:
                     max_tokens=int(hard_total),
                     temperature=temperature,
                     stream=False,
-                    stop=["<|eot_id|>", "<|end_of_text|>"],
+                    stop=self._stop_markers(),
                 )
                 reply = (out.get("choices") or [{}])[0].get("text") or ""
 
@@ -667,7 +807,7 @@ class LlamaSessionManager:
                         self.llm.reset()
                         self._prefill_chat_messages(system_messages)
                         fresh_state = self._save_state_compact()
-                        prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                        prompt = self._render_prompt(system_messages, add_generation_prompt=False)
                         prompt_tokens = self._tokenize_prompt(prompt)
                     session = {
                         "state": fresh_state,
@@ -709,7 +849,7 @@ class LlamaSessionManager:
                 clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
                 clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
                 if not clean_tokens:
-                    clean_prompt = self._render_llama3_prompt(clean_messages, add_generation_prompt=False)
+                    clean_prompt = self._render_prompt(clean_messages, add_generation_prompt=False)
                     clean_tokens = self._tokenize_prompt(clean_prompt)
 
                 run_messages: List[Dict[str, str]] = list(clean_messages)
@@ -717,7 +857,7 @@ class LlamaSessionManager:
                     run_messages.append({"role": "system", "content": self._format_context_pack(context_pack)})
                 run_messages.append({"role": "user", "content": run_user})
 
-                run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
+                run_prompt = self._render_prompt(run_messages, add_generation_prompt=True)
                 run_tokens = self._tokenize_prompt(run_prompt)
                 if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
                     delta = run_tokens[len(clean_tokens) :]
@@ -764,7 +904,7 @@ class LlamaSessionManager:
                         max_tokens=int(hard_total),
                         temperature=temperature,
                         stream=True,
-                        stop=["<|eot_id|>", "<|end_of_text|>"],
+                        stop=self._stop_markers(),
                     )
 
                     # Measure decode speed excluding KV persistence and prompt build work.
@@ -991,10 +1131,10 @@ class LlamaSessionManager:
         prev_messages: List[Dict[str, str]] = list(session.get("messages", []))
         prev_tokens = session.get("_prompt_tokens")
         if not isinstance(prev_tokens, list):
-            prev_prompt = self._render_llama3_prompt(prev_messages, add_generation_prompt=False)
+            prev_prompt = self._render_prompt(prev_messages, add_generation_prompt=False)
             prev_tokens = self._tokenize_prompt(prev_prompt)
 
-        next_prompt = self._render_llama3_prompt(commit_messages, add_generation_prompt=False)
+        next_prompt = self._render_prompt(commit_messages, add_generation_prompt=False)
         next_tokens = self._tokenize_prompt(next_prompt)
 
         if prev_tokens and next_tokens[: len(prev_tokens)] == prev_tokens:
@@ -1150,13 +1290,61 @@ class LlamaSessionManager:
         Prefill the model KV for a full chat transcript without generating new tokens.
 
         This codebase targets llama_cpp versions without a public chat-template renderer,
-        so we pre-render a stable Llama-3 prompt and prefill via `eval()` only.
+        so we pre-render a stable prompt (renderer selected per-model) and prefill via
+        `eval()` only.
         """
-        prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
+        prompt = self._render_prompt(messages, add_generation_prompt=False)
         tokens = self._tokenize_prompt(prompt)
         if self.ctx_size and len(tokens) > int(self.ctx_size):
             raise ValueError(f"Requested tokens ({len(tokens)}) exceed context window of {self.ctx_size}")
         self._eval_tokens(tokens)
+
+    def _render_prompt(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool) -> str:
+        renderer = str(getattr(self, "_PROMPT_RENDERER_ID", "") or self._PROMPT_RENDERER_LLAMA3)
+        if renderer == self._PROMPT_RENDERER_CHATML:
+            return self._render_chatml_prompt(messages, add_generation_prompt=add_generation_prompt)
+        return self._render_llama3_prompt(messages, add_generation_prompt=add_generation_prompt)
+
+    def _stop_markers(self) -> List[str]:
+        """
+        Stop markers for the current prompt renderer.
+
+        NOTE: `_create_completion_from_state()` also always stops on the model EOS token id.
+        """
+        renderer = str(getattr(self, "_PROMPT_RENDERER_ID", "") or self._PROMPT_RENDERER_LLAMA3)
+        if renderer == self._PROMPT_RENDERER_CHATML:
+            # ChatML/Qwen-style turns end with <|im_end|>. Some models also use <|endoftext|>.
+            return ["<|im_end|>", "<|endoftext|>"]
+        return ["<|eot_id|>", "<|end_of_text|>"]
+
+    def _render_chatml_prompt(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool) -> str:
+        """
+        Minimal ChatML prompt renderer (Qwen/Qwen2.5 instruct).
+
+        Matches GGUF chat templates of the form:
+          <|im_start|>{role}\n{content}<|im_end|>\n
+        """
+        system_message = ""
+        rest = list(messages or [])
+        if rest and rest[0].get("role") == "system":
+            system_message = rest[0].get("content") or ""
+            rest = rest[1:]
+
+        out: List[str] = []
+        # Always include a system block for stability (even if empty).
+        out.append("<|im_start|>system\n")
+        out.append(system_message)
+        out.append("<|im_end|>\n")
+
+        for msg in rest:
+            role = (msg.get("role") or "user").strip()
+            content = msg.get("content") or ""
+            out.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+
+        if add_generation_prompt:
+            out.append("<|im_start|>assistant\n")
+
+        return "".join(out)
 
     def _render_llama3_prompt(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool) -> str:
         """
@@ -1224,7 +1412,7 @@ class LlamaSessionManager:
         if session.get("prompt_renderer") == self._PROMPT_RENDERER_ID:
             if not isinstance(session.get("_prompt_tokens"), list):
                 with self._model_lock:
-                    prompt = self._render_llama3_prompt(list(session.get("messages", [])), add_generation_prompt=False)
+                    prompt = self._render_prompt(list(session.get("messages", [])), add_generation_prompt=False)
                     session["_prompt_tokens"] = self._tokenize_prompt(prompt)
             return
 
@@ -1235,7 +1423,7 @@ class LlamaSessionManager:
             self._prefill_chat_messages(messages)
             session["state"] = self._save_state_compact()
             self._active_session_id = session_id
-            prompt = self._render_llama3_prompt(messages, add_generation_prompt=False)
+            prompt = self._render_prompt(messages, add_generation_prompt=False)
             session["_prompt_tokens"] = self._tokenize_prompt(prompt)
 
         session["prompt_renderer"] = self._PROMPT_RENDERER_ID
@@ -1279,7 +1467,7 @@ class LlamaSessionManager:
                 pass
             session["state"] = self._save_state_compact()
             self._active_session_id = session_id
-            prompt = self._render_llama3_prompt(new_msgs, add_generation_prompt=False)
+            prompt = self._render_prompt(new_msgs, add_generation_prompt=False)
             session["_prompt_tokens"] = self._tokenize_prompt(prompt)
             session["prompt_renderer"] = self._PROMPT_RENDERER_ID
 
@@ -1316,7 +1504,7 @@ class LlamaSessionManager:
                         self.llm.reset()
                         self._prefill_chat_messages(system_messages)
                         fresh_state = self._save_state_compact()
-                        prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                        prompt = self._render_prompt(system_messages, add_generation_prompt=False)
                         prompt_tokens = self._tokenize_prompt(prompt)
                     session = {
                         "state": fresh_state,
@@ -1347,13 +1535,13 @@ class LlamaSessionManager:
                     clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
                     clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
                     if not clean_tokens:
-                        clean_prompt = self._render_llama3_prompt(clean_messages, add_generation_prompt=False)
+                        clean_prompt = self._render_prompt(clean_messages, add_generation_prompt=False)
                         clean_tokens = self._tokenize_prompt(clean_prompt)
                     run_messages: List[Dict[str, str]] = list(clean_messages)
                     run_messages.append({"role": "user", "content": message})
 
                     # Avoid llama.cpp hard failures when prompt_tokens + max_tokens > ctx_size.
-                    run_prompt = self._render_llama3_prompt(run_messages, add_generation_prompt=True)
+                    run_prompt = self._render_prompt(run_messages, add_generation_prompt=True)
                     run_tokens = self._tokenize_prompt(run_prompt)
                     if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
                         delta = run_tokens[len(clean_tokens) :]
@@ -1371,7 +1559,7 @@ class LlamaSessionManager:
                         max_tokens=max_tokens,
                         temperature=temperature,
                         stream=False,
-                        stop=["<|eot_id|>", "<|end_of_text|>"],
+                        stop=self._stop_markers(),
                     )
                     reply = (out.get("choices") or [{}])[0].get("text") or ""
 
@@ -1458,7 +1646,7 @@ class LlamaSessionManager:
                 session["state"] = self._save_state_compact()
                 # If we just reset this session, it's now the active one
                 self._active_session_id = session_id
-                prompt = self._render_llama3_prompt(system_messages, add_generation_prompt=False)
+                prompt = self._render_prompt(system_messages, add_generation_prompt=False)
                 session["_prompt_tokens"] = self._tokenize_prompt(prompt)
                 session["prompt_renderer"] = self._PROMPT_RENDERER_ID
             session["messages"] = system_messages
@@ -1558,7 +1746,7 @@ class LlamaSessionManager:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ]
-                prompt = self._render_llama3_prompt(messages, add_generation_prompt=True)
+                prompt = self._render_prompt(messages, add_generation_prompt=True)
                 out = self.llm(
                     prompt,
                     max_tokens=max_tokens,
@@ -2124,7 +2312,7 @@ class LlamaSessionManager:
         Must be called while holding `_model_lock`.
         """
         try:
-            prompt = self._render_llama3_prompt(messages, add_generation_prompt=add_generation_prompt)
+            prompt = self._render_prompt(messages, add_generation_prompt=add_generation_prompt)
             return len(self._tokenize_prompt(prompt))
         except Exception:
             # Fallback MUST NOT call `_estimate_tokens()` here because this method is
@@ -2415,7 +2603,7 @@ class LlamaSessionManager:
                 except Exception:
                     pass
                 new_state = self._save_state_compact()
-                prompt = self._render_llama3_prompt(new_msgs, add_generation_prompt=False)
+                prompt = self._render_prompt(new_msgs, add_generation_prompt=False)
                 session["_prompt_tokens"] = self._tokenize_prompt(prompt)
                 session["prompt_renderer"] = self._PROMPT_RENDERER_ID
             session["state"] = new_state
@@ -2456,7 +2644,7 @@ class LlamaSessionManager:
                 # If feeding fails, fall back to empty state
                 pass
             new_state = self._save_state_compact()
-            prompt = self._render_llama3_prompt(new_msgs, add_generation_prompt=False)
+            prompt = self._render_prompt(new_msgs, add_generation_prompt=False)
             session["_prompt_tokens"] = self._tokenize_prompt(prompt)
             session["prompt_renderer"] = self._PROMPT_RENDERER_ID
 

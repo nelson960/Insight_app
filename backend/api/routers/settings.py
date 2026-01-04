@@ -8,10 +8,14 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, Body, HTTPException
 
 from backend.api.deps import AppDependencies
+from backend.core.workspace import get_workspace
 from backend.services.retrieval.index_maintenance import validate_file_index, repair_file_index
+from backend.services.storage import SQLiteConfig, create_sqlite_store
 
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
+
+ALLOWED_CTX_SIZES = {8192, 32768}
 
 
 def _ensure_bool(v: Any, default: bool = False) -> bool:
@@ -26,6 +30,14 @@ def _safe_int(v: Any, default: int) -> int:
         return x
     except Exception:
         return default
+
+
+def _normalize_ctx_size(v: Any, default: int = 32768) -> int:
+    try:
+        x = int(v)
+    except Exception:
+        return default
+    return x if x in ALLOWED_CTX_SIZES else default
 
 
 def _is_gguf(path: Path) -> bool:
@@ -82,15 +94,15 @@ def get_settings() -> Dict[str, Any]:
     # Provide stable defaults even if unset.
     model_path = settings.get("llm_model_path")
     gpu_layers = settings.get("llm_gpu_layers")
+    ctx_size = settings.get("llm_ctx_size")
     theme_mode = settings.get("theme_mode")
 
-    defaults_root = Path(__file__).resolve().parents[3]
-    default_model_path = str(defaults_root / "models" / "Llama-3.1-8B-Instruct-q4_k_m.gguf")
-
     if not isinstance(model_path, str) or not model_path:
-        model_path = default_model_path
+        model_path = ""
     if not isinstance(gpu_layers, int):
         gpu_layers = 99
+    if not isinstance(ctx_size, int) or ctx_size not in ALLOWED_CTX_SIZES:
+        ctx_size = 32768
     if theme_mode not in ("system", "dark", "light"):
         theme_mode = "system"
 
@@ -99,11 +111,28 @@ def get_settings() -> Dict[str, Any]:
     embed_model_path = embed_base / "onnx" / "model.onnx"
     embed_ok = bool((embed_base / "tokenizer.json").exists() and embed_model_path.exists())
 
+    llm_loaded = False
+    llm_model_info: Optional[Dict[str, Any]] = None
+    try:
+        mgr = getattr(AppDependencies, "_session_manager", None)
+        if mgr is not None:
+            llm_loaded = True
+            llm_model_info = mgr.model_info()
+    except Exception:
+        llm_loaded = False
+        llm_model_info = None
+
     return {
         "settings": {
             "theme_mode": theme_mode,
             "llm_model_path": model_path,
             "llm_gpu_layers": gpu_layers,
+            "llm_ctx_size": ctx_size,
+        },
+        "llm": {
+            "ctx_sizes": sorted(list(ALLOWED_CTX_SIZES)),
+            "loaded": llm_loaded,
+            "model_info": llm_model_info,
         },
         "embedding": {
             "fixed": True,
@@ -113,6 +142,22 @@ def get_settings() -> Dict[str, Any]:
             "auto_download": True,
         },
     }
+
+
+@router.get("/llm/info")
+def llm_info() -> Dict[str, Any]:
+    """
+    Return details about the currently loaded LLM (if any).
+
+    This endpoint does NOT force model load; it only reports info once the LLM is already initialized.
+    """
+    mgr = getattr(AppDependencies, "_session_manager", None)
+    if mgr is None:
+        return {"loaded": False, "model_info": None}
+    try:
+        return {"loaded": True, "model_info": mgr.model_info()}
+    except Exception as exc:
+        return {"loaded": True, "model_info": None, "error": str(exc)}
 
 
 @router.get("/busy")
@@ -140,12 +185,13 @@ def set_settings(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         else:
             return {"ok": False, "error": "invalid theme_mode"}
 
-    if "llm_model_path" in settings:
-        mp = settings.get("llm_model_path")
-        if not isinstance(mp, str) or not mp:
-            return {"ok": False, "error": "invalid llm_model_path"}
-        store.set_setting("llm_model_path", mp)
-        restart_required = True
+    # LLM settings (model path / ctx size) are applied via /settings/llm/apply because they
+    # require clearing user data (KV sessions + DB + Qdrant) to avoid inconsistent state.
+    if "llm_model_path" in settings or "llm_ctx_size" in settings:
+        return {
+            "ok": False,
+            "error": "Use POST /settings/llm/apply to change model or context length (requires reset).",
+        }
 
     if "llm_gpu_layers" in settings:
         gl = _safe_int(settings.get("llm_gpu_layers"), 99)
@@ -178,6 +224,74 @@ def validate_model(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "model_path": str(p),
         "size_bytes": int(size),
         "note": "Model path looks valid. Full compatibility is verified when the engine loads the model.",
+    }
+
+
+@router.post("/llm/apply")
+def apply_llm_settings(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    """
+    Apply model/context settings and clear user data.
+
+    This is destructive by design:
+    - deletes DB (messages/files/doc_pages/chunks/jobs), Qdrant vectors, KV sessions, uploads, cache, logs, keys, config
+    - preserves the updated app settings so the engine can restart/reload cleanly
+    """
+    confirm = payload.get("confirm") if isinstance(payload, dict) else None
+    if confirm is not True:
+        return {"ok": False, "error": "confirm=true required"}
+
+    _require_idle("apply model settings")
+
+    settings = payload.get("settings") if isinstance(payload, dict) else None
+    if not isinstance(settings, dict):
+        return {"ok": False, "error": "settings object is required"}
+
+    store, _ = AppDependencies.storage()
+    merged = dict(store.list_settings())
+
+    if "llm_ctx_size" in settings:
+        merged["llm_ctx_size"] = _normalize_ctx_size(settings.get("llm_ctx_size"), 32768)
+
+    if "llm_gpu_layers" in settings:
+        merged["llm_gpu_layers"] = _safe_int(settings.get("llm_gpu_layers"), 99)
+
+    if "llm_model_path" in settings:
+        mp = settings.get("llm_model_path")
+        if not isinstance(mp, str) or not mp:
+            return {"ok": False, "error": "invalid llm_model_path"}
+        p = Path(mp).expanduser()
+        if not p.exists():
+            return {"ok": False, "error": f"Model file not found: {p}"}
+        if not p.is_file():
+            return {"ok": False, "error": f"Not a file: {p}"}
+        if p.suffix.lower() != ".gguf":
+            return {"ok": False, "error": "Model must be a .gguf file"}
+        if not _is_gguf(p):
+            return {"ok": False, "error": "File does not look like a valid GGUF model"}
+        merged["llm_model_path"] = str(p)
+
+    # Remember workspace base (reset_all clears the workspace singleton).
+    ws_base = Path(AppDependencies.workspace().base)
+
+    # Reset all user data (closes Qdrant/SQLite first).
+    AppDependencies.reset_all(confirm=True)
+
+    # Recreate a fresh DB and restore only app settings. Do not open local Qdrant here
+    # (it is expensive and can hold locks until the engine restarts).
+    ws = get_workspace(base_dir=ws_base)
+    restored = create_sqlite_store(ws.db, config=SQLiteConfig())
+    for k, v in merged.items():
+        restored.set_setting(k, v)
+    restored.close()
+
+    return {
+        "ok": True,
+        "reset_done": True,
+        "settings": {
+            "llm_model_path": merged.get("llm_model_path"),
+            "llm_gpu_layers": merged.get("llm_gpu_layers"),
+            "llm_ctx_size": merged.get("llm_ctx_size"),
+        },
     }
 
 
