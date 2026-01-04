@@ -34,6 +34,7 @@ type ChatUiState = ChatUiSnapshot & {
 
 type StreamIndexEntry = {
   chatId: string;
+  userMessageId?: string;
   messageId: string;
   cancelled?: boolean;
 };
@@ -178,7 +179,7 @@ export function beginStreamTurn(opts: {
   s.messages = [...s.messages, userMsg, assistantMsg];
   s.isStreaming = true;
   s.activeRequestId = requestId;
-  streamIndex.set(requestId, { chatId, messageId: assistantMsgId });
+  streamIndex.set(requestId, { chatId, userMessageId: userMsg.id, messageId: assistantMsgId });
   emit(chatId);
 }
 
@@ -191,6 +192,23 @@ export function cancelStreamTurn(chatId: string) {
   if (entry) entry.cancelled = true;
   s.isStreaming = false;
   s.activeRequestId = null;
+  emit(chatId);
+}
+
+export function rollbackStreamTurn(chatId: string, requestId: string) {
+  if (!chatId || !requestId) return;
+  const s = ensureState(chatId);
+  const entry = streamIndex.get(requestId);
+  if (!entry || entry.chatId !== chatId) return;
+  const ids = new Set<string>();
+  if (entry.messageId) ids.add(entry.messageId);
+  if (entry.userMessageId) ids.add(entry.userMessageId);
+  if (ids.size) {
+    s.messages = s.messages.filter((m) => !ids.has(m.id));
+  }
+  if (s.activeRequestId === requestId) s.activeRequestId = null;
+  s.isStreaming = false;
+  streamIndex.delete(requestId);
   emit(chatId);
 }
 
@@ -274,4 +292,3 @@ async function ensureBridge() {
   })();
   return bridgeInit;
 }
-

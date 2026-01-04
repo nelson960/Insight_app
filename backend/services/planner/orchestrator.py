@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from backend.services.connectors.llama_session_manager import LlamaSessionManager
 from backend.services.planner.agent_loop import MultiFileAgentConfig, MultiFileAgentLoop
 from backend.services.planner.agent_tools import AgentToolbox, ChunkAnchor
+from backend.services.planner.raw_large_loop import RawLargeAgentLoop
 from backend.services.retrieval.rag_store import RagStore
 from backend.services.memory.ltm_store import LongTermMemoryStore, MemoryHit
 from backend.services.ipc_events import emit_event
@@ -32,7 +33,9 @@ RAG_PRIMARY_K = 12
 RAG_PRIMARY_K_SELECTION = 6
 RAG_PRIMARY_K_SUMMARY = 16
 RAG_ALL_K_TOTAL = 14
-RAG_SECONDARY_K_TOTAL = 3
+# Focused mode should hard-scope retrieval to the focused file only.
+# Cross-file mixing is allowed only in scope=all.
+RAG_SECONDARY_K_TOTAL = 0
 # Output budgeting (dynamic; avoids hard-coded long generations).
 #
 # NOTE: The previous defaults (120 words → ~244 tokens) were frequently too small and
@@ -305,6 +308,7 @@ class InsightOrchestrator:
         self.metadata_store = metadata_store
         self.agent_tools = AgentToolbox(rag_store=rag_store, metadata_store=metadata_store)
         self.agent_loop = MultiFileAgentLoop(tools=self.agent_tools, embedder=getattr(rag_store, "embedder", None))
+        self.raw_large_loop = RawLargeAgentLoop(metadata_store=metadata_store)
         self.system_hint = system_hint
         self._last_compaction_tick: Dict[str, int] = {}
 
@@ -388,6 +392,25 @@ class InsightOrchestrator:
         return any(k in q for k in ("summarize", "summary", "tl;dr", "tldr"))
 
     @staticmethod
+    def _is_compare_request(user_message: str) -> bool:
+        """
+        Detect short compare prompts ("compare", "compare docs", etc.).
+
+        These turns typically need:
+        - broader, balanced evidence windows across files
+        - slightly larger output budget
+        """
+        q = (user_message or "").strip().lower()
+        if not q:
+            return False
+        q = re.sub(r"\s+", " ", q).strip().strip(".!?;:")
+        if q in {"compare", "comparison", "diff"}:
+            return True
+        if q.startswith("compare ") and len(q.split()) <= 3:
+            return True
+        return False
+
+    @staticmethod
     def _uniq_file_ids(values: List[Any]) -> List[str]:
         out: List[str] = []
         seen = set()
@@ -416,7 +439,7 @@ class InsightOrchestrator:
         Rules (high level):
         - Selection from docs (selection.file_id): hard-focus that file only.
         - Chat pane only + multi-upload in this turn: scope=all across uploaded docs (equal priority).
-        - Otherwise: scope=focused with a primary focus file, plus a small secondary budget across other files.
+        - Otherwise: scope=focused with a primary focus file.
         """
         turn_doc_ids = self._uniq_file_ids(documents or [])
 
@@ -525,6 +548,30 @@ class InsightOrchestrator:
             if isinstance(fid, str) and fid:
                 out.append(fid)
         return self._uniq_file_ids(out)
+
+    def _raw_large_file_id(self, file_ids: List[str]) -> Optional[str]:
+        """
+        Return the first file_id marked as policy.raw_large=True (Plan B).
+
+        By policy, a chat may contain at most one raw_large file.
+        """
+        for fid in file_ids or []:
+            if not isinstance(fid, str) or not fid:
+                continue
+            try:
+                rec = self.metadata_store.get_file(fid) or {}
+                policy_raw = rec.get("policy_json")
+                policy: Dict[str, Any] = {}
+                if isinstance(policy_raw, str) and policy_raw.strip():
+                    try:
+                        policy = json.loads(policy_raw) or {}
+                    except Exception:
+                        policy = {}
+                if bool(policy.get("raw_large")):
+                    return fid
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def _rebalance_hits_by_file(rag_hits: List[Dict[str, Any]], *, max_hits: int) -> List[Dict[str, Any]]:
@@ -831,6 +878,7 @@ class InsightOrchestrator:
         analysis = self._analyze_query(user_message, has_docs=bool(documents))
         max_tokens = self._compute_output_max_tokens(analysis)
         summary_request = self._is_summary_request(user_message)
+        compare_request = self._is_compare_request(user_message)
 
         # Ensure deterministic session per chat_id (required even when no docs are attached).
         self.session_mgr.get_or_create_session(chat_id, system_prompt=self.system_hint)
@@ -906,115 +954,142 @@ class InsightOrchestrator:
         scope_files: Optional[List[str]] = None
         query_vector: Any = None
 
-        # Stop re-embedding the same query per file: compute query embedding once per turn
-        # and re-use it across dense retrieval calls (focused + secondary docs).
-        #
-        # Note: scope=all uses the MultiFileAgentLoop, which computes its own embedding once.
-        if scope_mode != "all":
+        # Plan B ("raw_large"): skip ingestion/RAG, use rg_search + read_raw_window evidence.
+        raw_large_fid = self._raw_large_file_id(chat_doc_ids)
+        if raw_large_fid:
+            scope_mode = "raw_large"
+            effective_focus = raw_large_fid
+            scope_doc_ids = []
+            secondary_doc_ids = []
             try:
-                if (effective_focus or documents) and getattr(self.rag_store, "embedder", None):
-                    query_vector = self.rag_store.embed(user_message)
+                rec = self.metadata_store.get_file(raw_large_fid) or {}
+                name = rec.get("filename") if isinstance(rec, dict) else None
+                if isinstance(name, str) and name.strip():
+                    effective_focus_name = name.strip()
             except Exception:
-                query_vector = None
+                effective_focus_name = None
+            scope_files = [effective_focus_name] if effective_focus_name else None
 
-        if scope_mode == "all" and scope_doc_ids:
-            doc_ids_in_scope = self._uniq_file_ids(scope_doc_ids)
-            if doc_ids_in_scope:
-                rag_budget_tokens = self._compute_rag_budget_tokens(
-                    chat_id,
-                    files_in_scope=len(doc_ids_in_scope),
-                    reserved_output_tokens=max_tokens,
-                )
-                # Keep per-file retrieval stable (fair) by scaling total_k with file count.
-                total_k = max(RAG_ALL_K_TOTAL, 7 * len(doc_ids_in_scope))
-                cfg = MultiFileAgentConfig(
-                    total_k=total_k,
-                    dense_k=16,
-                    sparse_k=16,
-                    radius=2,
-                    max_tokens_total=max(600, rag_budget_tokens),
-                    max_tokens_per_file_floor=600,
-                    repair_on_empty=True,
-                    max_repairs=2000,
-                )
-                windows_map = self.agent_loop.build_evidence_windows(
+            rag_hits_raw.extend(
+                self.raw_large_loop.build_evidence_hits(
                     user_message,
-                    file_ids=doc_ids_in_scope,
-                    config=cfg,
+                    file_id=raw_large_fid,
                     request_id=request_id,
                 )
-                rag_hits_raw.extend(self.agent_loop.windows_to_rag_hits(windows_map))
+            )
+        else:
+            # Stop re-embedding the same query per file: compute query embedding once per turn
+            # and re-use it across dense retrieval calls (focused + secondary docs).
+            #
+            # Note: scope=all uses the MultiFileAgentLoop, which computes its own embedding once.
+            if scope_mode != "all":
+                try:
+                    if (effective_focus or documents) and getattr(self.rag_store, "embedder", None):
+                        query_vector = self.rag_store.embed(user_message)
+                except Exception:
+                    query_vector = None
 
-                scope_files = []
-                for fid in doc_ids_in_scope:
-                    try:
-                        rec = self.metadata_store.get_file(fid)
-                        name = rec.get("filename") if isinstance(rec, dict) else None
-                        if isinstance(name, str) and name.strip():
-                            scope_files.append(name.strip())
-                    except Exception:
-                        continue
-                if not scope_files:
-                    scope_files = None
-        elif effective_focus:
-            # Focused mode: primary evidence from focused file, plus a small secondary budget.
-            rag_budget_tokens = self._compute_rag_budget_tokens(
-                chat_id,
-                files_in_scope=1,
-                reserved_output_tokens=max_tokens,
-            )
-            focus_anchors = self.agent_tools.hybrid_search(
-                user_message,
-                file_id=effective_focus,
-                top_k=primary_k,
-                query_vector=query_vector,
-                dense_k=max(primary_k, 10),
-                sparse_k=max(primary_k, 10),
-            )
-            focus_windows_map = self.agent_tools.windows_from_anchors(
-                focus_anchors,
-                radius=2,
-                max_tokens_per_file=max(600, rag_budget_tokens),
-            )
-            for w in focus_windows_map.get(effective_focus, []):
-                if not w.text:
-                    continue
-                rag_hits_raw.append(
-                    {
-                        "doc_id": effective_focus,
-                        "text": w.text,
-                        "filename": w.filename,
-                        "page": w.page_start,
-                        "page_start": w.page_start,
-                        "page_end": w.page_end,
-                        "chunk_id": f"seq_window:{w.seq_start}-{w.seq_end}",
-                        "score": 1.0,
-                    }
+            if scope_mode == "all" and scope_doc_ids:
+                doc_ids_in_scope = self._uniq_file_ids(scope_doc_ids)
+                if doc_ids_in_scope:
+                    rag_budget_tokens = self._compute_rag_budget_tokens(
+                        chat_id,
+                        files_in_scope=len(doc_ids_in_scope),
+                        reserved_output_tokens=max_tokens,
+                    )
+                    # Keep per-file retrieval stable (fair) by scaling total_k with file count.
+                    total_k = max(RAG_ALL_K_TOTAL, 7 * len(doc_ids_in_scope))
+                    cfg = MultiFileAgentConfig(
+                        total_k=total_k,
+                        dense_k=16,
+                        sparse_k=16,
+                        radius=2,
+                        max_tokens_total=max(600, rag_budget_tokens),
+                        max_tokens_per_file_floor=600,
+                        repair_on_empty=True,
+                        max_repairs=2000,
+                    )
+                    windows_map = self.agent_loop.build_evidence_windows(
+                        user_message,
+                        file_ids=doc_ids_in_scope,
+                        config=cfg,
+                        request_id=request_id,
+                    )
+                    rag_hits_raw.extend(self.agent_loop.windows_to_rag_hits(windows_map))
+
+                    scope_files = []
+                    for fid in doc_ids_in_scope:
+                        try:
+                            rec = self.metadata_store.get_file(fid)
+                            name = rec.get("filename") if isinstance(rec, dict) else None
+                            if isinstance(name, str) and name.strip():
+                                scope_files.append(name.strip())
+                        except Exception:
+                            continue
+                    if not scope_files:
+                        scope_files = None
+            elif effective_focus:
+                # Focused mode: hard-scope evidence to the focused file only.
+                rag_budget_tokens = self._compute_rag_budget_tokens(
+                    chat_id,
+                    files_in_scope=1,
+                    reserved_output_tokens=max_tokens,
                 )
-
-            if secondary_doc_ids and RAG_SECONDARY_K_TOTAL > 0:
-                other_ids = [fid for fid in secondary_doc_ids if isinstance(fid, str) and fid]
-                if other_ids:
-                    per_other_k = max(1, (RAG_SECONDARY_K_TOTAL + len(other_ids) - 1) // max(1, len(other_ids)))
-                    other_anchors: List[ChunkAnchor] = []
-                    for fid in other_ids:
-                        other_anchors.extend(
+                focus_anchors = self.agent_tools.hybrid_search(
+                    user_message,
+                    file_id=effective_focus,
+                    top_k=primary_k,
+                    query_vector=query_vector,
+                    dense_k=max(primary_k, 10),
+                    sparse_k=max(primary_k, 10),
+                )
+                focus_windows_map = self.agent_tools.windows_from_anchors(
+                    focus_anchors,
+                    radius=2,
+                    max_tokens_per_file=max(600, rag_budget_tokens),
+                )
+                for w in focus_windows_map.get(effective_focus, []):
+                    if not w.text:
+                        continue
+                    rag_hits_raw.append(
+                        {
+                            "doc_id": effective_focus,
+                            "text": w.text,
+                            "filename": w.filename,
+                            "page": w.page_start,
+                            "page_start": w.page_start,
+                            "page_end": w.page_end,
+                            "chunk_id": f"seq_window:{w.seq_start}-{w.seq_end}",
+                            "score": 1.0,
+                        }
+                    )
+            elif documents:
+                doc_ids = self._uniq_file_ids(documents)
+                if doc_ids:
+                    rag_budget_tokens = self._compute_rag_budget_tokens(
+                        chat_id,
+                        files_in_scope=len(doc_ids),
+                        reserved_output_tokens=max_tokens,
+                    )
+                    anchors: List[ChunkAnchor] = []
+                    for fid in doc_ids:
+                        anchors.extend(
                             self.agent_tools.hybrid_search(
                                 user_message,
                                 file_id=fid,
-                                top_k=per_other_k,
+                                top_k=max(1, primary_k // max(1, len(doc_ids))),
                                 query_vector=query_vector,
-                                dense_k=max(per_other_k, 6),
-                                sparse_k=max(per_other_k, 6),
+                                dense_k=8,
+                                sparse_k=8,
                             )
                         )
-                    other_windows_map = self.agent_tools.windows_from_anchors(
-                        other_anchors,
-                        radius=1,
-                        max_tokens_per_file=600,
+                    windows_map = self.agent_tools.windows_from_anchors(
+                        anchors,
+                        radius=2,
+                        max_tokens_per_file=max(600, int(max(600, rag_budget_tokens) // max(1, len(doc_ids)))),
                     )
-                    for fid in other_ids:
-                        for w in other_windows_map.get(fid, []):
+                    for fid in doc_ids:
+                        for w in windows_map.get(fid, []):
                             if not w.text:
                                 continue
                             rag_hits_raw.append(
@@ -1029,49 +1104,8 @@ class InsightOrchestrator:
                                     "score": 1.0,
                                 }
                             )
-        elif documents:
-            doc_ids = self._uniq_file_ids(documents)
-            if doc_ids:
-                rag_budget_tokens = self._compute_rag_budget_tokens(
-                    chat_id,
-                    files_in_scope=len(doc_ids),
-                    reserved_output_tokens=max_tokens,
-                )
-                anchors: List[ChunkAnchor] = []
-                for fid in doc_ids:
-                    anchors.extend(
-                        self.agent_tools.hybrid_search(
-                            user_message,
-                            file_id=fid,
-                            top_k=max(1, primary_k // max(1, len(doc_ids))),
-                            query_vector=query_vector,
-                            dense_k=8,
-                            sparse_k=8,
-                        )
-                    )
-                windows_map = self.agent_tools.windows_from_anchors(
-                    anchors,
-                    radius=2,
-                    max_tokens_per_file=max(600, int(max(600, rag_budget_tokens) // max(1, len(doc_ids)))),
-                )
-                for fid in doc_ids:
-                    for w in windows_map.get(fid, []):
-                        if not w.text:
-                            continue
-                        rag_hits_raw.append(
-                            {
-                                "doc_id": fid,
-                                "text": w.text,
-                                "filename": w.filename,
-                                "page": w.page_start,
-                                "page_start": w.page_start,
-                                "page_end": w.page_end,
-                                "chunk_id": f"seq_window:{w.seq_start}-{w.seq_end}",
-                                "score": 1.0,
-                            }
-                        )
-        else:
-            rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k))
+            else:
+                rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k))
 
         selected_rag = self._dedup_rag(rag_hits_raw)
 
@@ -1123,6 +1157,17 @@ class InsightOrchestrator:
             scope_files=scope_files,
             include_selection_excerpt=not has_selection_text,
         )
+        if compare_request and scope_mode == "all":
+            # Keep this short to avoid burning budget; its role is to enforce balanced
+            # coverage when the user prompt is underspecified ("compare").
+            task_hint = (
+                "TASK:\n"
+                "Compare the documents in SCOPE.\n"
+                "- Write a short summary for each document.\n"
+                "- Then list similarities and differences.\n"
+                "- Use only the EVIDENCE; do not invent details.\n"
+            )
+            context_pack = (task_hint + "\n" + (context_pack or "")).strip()
 
         def generator():
             tokens: List[str] = []
@@ -1214,7 +1259,7 @@ class InsightOrchestrator:
         # Default target length for a "normal" chat answer.
         target_words = 180
         m = re.search(r"(\\d+)\\s*words", q)
-        if m:	
+        if m:
             try:
                 target_words = int(m.group(1))
             except Exception:
@@ -1224,6 +1269,10 @@ class InsightOrchestrator:
             target_words = 350
         elif any(k in q for k in ["short", "brief", "summary"]):
             target_words = 100
+
+        if has_docs and self._is_compare_request(query):
+            target_words = max(target_words, 260)
+
         hint_doc = has_docs or any(k in q for k in ["document", "file", "pdf", "upload"])
         return {
             "target_words": target_words,

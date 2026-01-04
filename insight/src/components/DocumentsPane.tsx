@@ -55,6 +55,32 @@ function formatBytes(n: number) {
   return `${v.toFixed(digits)} ${units[i]}`;
 }
 
+function formatIngestFailure(res: { status: number; data: any; error?: string }) {
+  const status = Number(res?.status || 0);
+  const payload = res?.data;
+  const detail =
+    payload && typeof payload === "object" && "detail" in payload ? (payload as any).detail : payload;
+  if (detail && typeof detail === "object") {
+    const code = String((detail as any).error || "");
+    const filename = String((detail as any).filename || "");
+    const sizeBytes = Number((detail as any).size_bytes || 0);
+    const maxBytes = Number((detail as any).max_bytes || 0);
+    const msg = String((detail as any).message || "");
+
+    if (code === "file_too_large") {
+      const filePart = filename ? `: ${filename}` : "";
+      const sizePart = sizeBytes ? ` (${formatBytes(sizeBytes)})` : "";
+      const maxPart = maxBytes ? ` Max ${formatBytes(maxBytes)}.` : "";
+      return `File too large${filePart}${sizePart}.${maxPart}`;
+    }
+    if (msg) return msg;
+    if (code) return `Upload rejected (${code})`;
+  }
+  if (typeof detail === "string" && detail.trim()) return detail.trim();
+  if (res?.error) return res.error;
+  return `Failed to ingest files (${status || "error"})`;
+}
+
 function formatTimestamp(ts: string | null | undefined) {
   if (!ts) return "";
   const d = new Date(ts);
@@ -385,6 +411,19 @@ export function DocumentsPane({
     return () => window.removeEventListener("insight:docs-pending", onPending as any);
   }, [chatId]);
 
+  useEffect(() => {
+    function onSelect(e: Event) {
+      const ce = e as CustomEvent;
+      const targetChatId = ce?.detail?.chatId;
+      if (typeof targetChatId !== "string" || targetChatId !== chatId) return;
+      const fid = typeof ce?.detail?.fileId === "string" ? ce.detail.fileId : "";
+      if (!fid) return;
+      setActiveFileId(fid);
+    }
+    window.addEventListener("insight:docs-select", onSelect as any);
+    return () => window.removeEventListener("insight:docs-select", onSelect as any);
+  }, [chatId]);
+
   async function flushDocSaveNow() {
     const fileId = editingFileIdRef.current;
     if (!fileId) return;
@@ -569,7 +608,8 @@ export function DocumentsPane({
         "POST"
       );
       if (!res.ok) {
-        setError(res.error || `Failed to ingest files (${res.status})`);
+        setError(formatIngestFailure(res as any));
+        setPendingUploads([]);
         return;
       }
       const next = await reloadFiles();

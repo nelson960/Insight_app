@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -22,6 +23,130 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/files", tags=["Files"])
 
+def _max_multi_file_bytes() -> int:
+    # Default matches the desktop picker guardrail; backend must still enforce it.
+    raw = os.environ.get("INSIGHT_MAX_MULTI_FILE_BYTES", str(5 * 1024 * 1024))
+    try:
+        val = int(raw)
+    except ValueError:
+        val = 5 * 1024 * 1024
+    return max(0, val)
+
+
+def _max_single_large_file_bytes() -> int:
+    # Absolute safety cap for the current upload pipeline which reads files into memory.
+    raw = os.environ.get("INSIGHT_MAX_SINGLE_LARGE_FILE_BYTES", str(50 * 1024 * 1024))
+    try:
+        val = int(raw)
+    except ValueError:
+        val = 50 * 1024 * 1024
+    return max(0, val)
+
+def _is_large_for_chat(size_bytes: int) -> bool:
+    return int(size_bytes) > _max_multi_file_bytes()
+
+
+def _upload_size_bytes(upload: UploadFile) -> int:
+    try:
+        f = upload.file
+        f.seek(0, os.SEEK_END)
+        size = int(f.tell())
+        f.seek(0)
+        return max(0, size)
+    except Exception:
+        return 0
+
+
+def _guess_mime_from_suffix(filename: str) -> str:
+    suf = Path(filename or "").suffix.lower()
+    if suf in {".txt", ".log", ".md", ".json", ".csv", ".tsv", ".yaml", ".yml"}:
+        return "text/plain"
+    return "application/octet-stream"
+
+
+def _enforce_chat_upload_size_policy(
+    *,
+    store: Any,
+    chat_id: str,
+    incoming: list[tuple[str, int]],
+) -> None:
+    """
+    Enforce a strict upload policy:
+      - "Large" file uploads (> max_multi_file_bytes) are only allowed in a brand-new chat with no files.
+      - A chat that contains a large file is locked (no further uploads of any size).
+      - A chat that contains any file(s) cannot accept a large file later.
+      - "Large" file mode only supports raw text inputs (txt/log/json) because it uses rg_search.
+      - Always reject files above the absolute safety cap.
+    """
+    max_multi = _max_multi_file_bytes()
+    max_large = _max_single_large_file_bytes()
+    allowed_large_suffixes = {".txt", ".log", ".json"}
+
+    for filename, size_bytes in incoming:
+        if int(size_bytes) > max_large:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "error": "file_too_large",
+                    "filename": filename,
+                    "size_bytes": int(size_bytes),
+                    "max_bytes": max_large,
+                },
+            )
+        if int(size_bytes) > max_multi:
+            suffix = Path(str(filename or "")).suffix.lower()
+            if suffix not in allowed_large_suffixes:
+                raise HTTPException(
+                    status_code=415,
+                    detail={
+                        "error": "large_file_type_not_supported",
+                        "message": "Large files are supported only for raw text formats (.txt, .log, .json).",
+                        "filename": filename,
+                        "suffix": suffix,
+                        "allowed_suffixes": sorted(allowed_large_suffixes),
+                        "size_bytes": int(size_bytes),
+                        "max_multi_file_bytes": max_multi,
+                        "max_single_large_file_bytes": max_large,
+                    },
+                )
+
+    existing = store.list_files_status_for_chat(chat_id)
+    existing_sizes = [int(r.get("size_bytes") or 0) for r in (existing or [])]
+
+    if any(size > max_multi for size in existing_sizes):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "large_file_chat_locked",
+                "message": "This chat already contains a large file and does not allow additional uploads.",
+                "chat_id": chat_id,
+                "max_multi_file_bytes": max_multi,
+            },
+        )
+
+    if existing_sizes and any(int(size) > max_multi for _, size in incoming):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "large_file_requires_new_chat",
+                "message": "Large files can only be uploaded into a new chat with no existing files.",
+                "chat_id": chat_id,
+                "max_multi_file_bytes": max_multi,
+            },
+        )
+
+    large_incoming = [(f, int(s)) for f, s in incoming if int(s) > max_multi]
+    if not existing_sizes and large_incoming and len(incoming) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "large_file_must_be_alone",
+                "message": "When uploading a large file, upload exactly one file into a new chat.",
+                "chat_id": chat_id,
+                "max_multi_file_bytes": max_multi,
+            },
+        )
+
 
 @router.post("/upload")
 async def upload_files(
@@ -32,6 +157,11 @@ async def upload_files(
     workspace = AppDependencies.workspace()
     scheduler = AppDependencies.ingestion_scheduler()
     key = AppDependencies.key_manager().get_key()
+    metadata_store, _ = AppDependencies.storage()
+
+    incoming_sizes = [(str(f.filename or "upload"), _upload_size_bytes(f)) for f in files]
+    _enforce_chat_upload_size_policy(store=metadata_store, chat_id=chat_id, incoming=incoming_sizes)
+
     stored_files = []
     for upload in files:
         suffix = Path(upload.filename).suffix
@@ -41,11 +171,21 @@ async def upload_files(
         enc_path = workspace.uploads / f"{file_id}.enc"
         logger.info("Encrypting upload %s as %s", upload.filename, enc_path.name)
         enc_path.write_bytes(encrypt_bytes(key, content))
-        temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
-        temp_path.write_bytes(content)
         size_bytes = len(content)
-        mime = detect_mime_type(temp_path)
-        metadata_store, _ = AppDependencies.storage()
+        is_large = _is_large_for_chat(size_bytes)
+        if is_large:
+            mime = (upload.content_type or "").strip() or _guess_mime_from_suffix(upload.filename)
+            # Path B ("raw_large") needs a plaintext file on disk for rg_search + window reads.
+            # Store a cache copy keyed by file_id so it can be cleaned up with the rest of cache.
+            try:
+                cache_path = workspace.cache / f"{file_id}{suffix or '.txt'}"
+                cache_path.write_bytes(content)
+            except Exception:
+                pass
+        else:
+            temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
+            temp_path.write_bytes(content)
+            mime = detect_mime_type(temp_path)
         logger.info("Registering file %s (%s)", file_id, upload.filename)
         metadata_store.register_file(
             file_id=file_id,
@@ -55,10 +195,10 @@ async def upload_files(
             hash_value=hash_value,
             stored_path=str(enc_path),
             is_encrypted=True,
-            policy={"pii": False},
+            policy={"pii": False, "raw_large": bool(is_large), "ingest": not bool(is_large)},
             user_id=user_id or "default",
             chat_id=chat_id,
-            source="upload",
+            source="upload_raw_large" if is_large else "upload",
         )
         emit_event(
             "files_changed",
@@ -67,6 +207,17 @@ async def upload_files(
             filename=upload.filename,
             status="registered",
         )
+        if is_large:
+            # Path B ("raw_large") — do not run extraction/chunking/embedding. Mark completed
+            # so UI doesn't wait on ingestion progress.
+            try:
+                metadata_store.mark_file_status(file_id, "completed")
+            except Exception:
+                pass
+            stored_files.append({"file_id": file_id, "filename": upload.filename, "job_id": "raw_large"})
+            continue
+
+        temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
         request = IngestionRequest(
             file_id=file_id,
             source_path=str(temp_path),
@@ -115,12 +266,27 @@ async def ingest_paths(payload: Dict[str, Any] = Body(...)):
 
     stored_files: list[dict[str, str]] = []
 
+    validated: list[Path] = []
+    incoming_sizes: list[tuple[str, int]] = []
     for raw in paths:
         if not isinstance(raw, str) or not raw:
             continue
         src_path = Path(raw).expanduser()
         if not src_path.exists() or not src_path.is_file():
             raise HTTPException(status_code=400, detail=f"Invalid file path: {raw}")
+        try:
+            size_bytes = int(src_path.stat().st_size)
+        except OSError:
+            size_bytes = 0
+        validated.append(src_path)
+        incoming_sizes.append((src_path.name, size_bytes))
+
+    if not validated:
+        raise HTTPException(status_code=400, detail="No valid paths provided")
+
+    _enforce_chat_upload_size_policy(store=metadata_store, chat_id=chat_id, incoming=incoming_sizes)
+
+    for src_path in validated:
 
         filename = src_path.name
         suffix = src_path.suffix
@@ -131,12 +297,20 @@ async def ingest_paths(payload: Dict[str, Any] = Body(...)):
 
         enc_path = workspace.uploads / f"{file_id}.enc"
         await asyncio.to_thread(enc_path.write_bytes, encrypt_bytes(key, content))
-
-        # Copy plaintext to cache for extraction/indexing; scheduler cleans it up.
-        temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
-        await asyncio.to_thread(temp_path.write_bytes, content)
         size_bytes = len(content)
-        mime = await asyncio.to_thread(detect_mime_type, temp_path)
+        is_large = _is_large_for_chat(size_bytes)
+        if is_large:
+            mime = await asyncio.to_thread(detect_mime_type, src_path)
+            try:
+                cache_path = workspace.cache / f"{file_id}{suffix or '.txt'}"
+                await asyncio.to_thread(cache_path.write_bytes, content)
+            except Exception:
+                pass
+        else:
+            # Copy plaintext to cache for extraction/indexing; scheduler cleans it up.
+            temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
+            await asyncio.to_thread(temp_path.write_bytes, content)
+            mime = await asyncio.to_thread(detect_mime_type, temp_path)
 
         metadata_store.register_file(
             file_id=file_id,
@@ -146,10 +320,10 @@ async def ingest_paths(payload: Dict[str, Any] = Body(...)):
             hash_value=hash_value,
             stored_path=str(enc_path),
             is_encrypted=True,
-            policy={"pii": False},
+            policy={"pii": False, "raw_large": bool(is_large), "ingest": not bool(is_large)},
             user_id=user_id,
             chat_id=chat_id,
-            source="desktop_path",
+            source="desktop_path_raw_large" if is_large else "desktop_path",
         )
         emit_event(
             "files_changed",
@@ -159,6 +333,15 @@ async def ingest_paths(payload: Dict[str, Any] = Body(...)):
             status="registered",
         )
 
+        if is_large:
+            try:
+                metadata_store.mark_file_status(file_id, "completed")
+            except Exception:
+                pass
+            stored_files.append({"file_id": file_id, "filename": filename, "job_id": "raw_large"})
+            continue
+
+        temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
         request = IngestionRequest(
             file_id=file_id,
             source_path=str(temp_path),

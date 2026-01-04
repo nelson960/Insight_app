@@ -307,7 +307,11 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
 
 #[tauri::command]
 fn pick_files() -> Result<Value, String> {
-    const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB (frontend pre-check; backend also enforces)
+    // UI picker guardrail:
+    // - Backend decides Plan A vs Plan B at 5 MiB (INSIGHT_MAX_MULTI_FILE_BYTES).
+    // - Backend hard-caps single-file size at 50 MiB (INSIGHT_MAX_SINGLE_LARGE_FILE_BYTES).
+    // Keep the picker aligned with the backend hard cap so "raw_large" files can be selected.
+    const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
     let files = rfd::FileDialog::new().pick_files().unwrap_or_default();
     let out: Vec<Value> = files
         .into_iter()

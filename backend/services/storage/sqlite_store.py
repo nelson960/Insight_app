@@ -797,6 +797,52 @@ class SQLiteMetadataStore:
                 out.append(cid)
         return out
 
+    def chunk_seq_stats_for_file(self, file_id: str) -> dict[str, int]:
+        """
+        Return basic seq stats for a file's chunks.
+
+        This is used for deterministic "walk-by-seq" sampling (e.g., compare/overview
+        turns) without loading large portions of text into memory.
+        """
+        fid = (file_id or "").strip()
+        if not fid:
+            return {"count": 0, "min_seq": 0, "max_seq": 0}
+        cursor = self._connection.execute(
+            "SELECT COUNT(*) AS cnt, MIN(seq) AS min_seq, MAX(seq) AS max_seq FROM chunks WHERE file_id=?",
+            (fid,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {"count": 0, "min_seq": 0, "max_seq": 0}
+
+        if isinstance(row, sqlite3.Row):
+            cnt = row["cnt"]
+            min_seq = row["min_seq"]
+            max_seq = row["max_seq"]
+        else:
+            cnt, min_seq, max_seq = row
+
+        try:
+            count_i = int(cnt or 0)
+        except Exception:
+            count_i = 0
+        try:
+            min_i = int(min_seq or 0)
+        except Exception:
+            min_i = 0
+        try:
+            max_i = int(max_seq or 0)
+        except Exception:
+            max_i = 0
+
+        if count_i <= 0:
+            return {"count": 0, "min_seq": 0, "max_seq": 0}
+        if max_i < min_i:
+            max_i = min_i
+        if min_i < 0:
+            min_i = 0
+        return {"count": count_i, "min_seq": min_i, "max_seq": max_i}
+
     # ------------------------------------------------------------------ #
     # Retrieval helpers
     # ------------------------------------------------------------------ #

@@ -2855,6 +2855,7 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  position: relative;
 }
 
 .chat-root.chat-root-embedded {
@@ -3129,6 +3130,23 @@ html[data-theme="light"] .chat-branch-popover {
   margin-top: 6px;
   color: #f87171;
   font-size: 12px;
+}
+
+.chat-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 86px;
+  transform: translateX(-50%);
+  max-width: min(720px, calc(100% - 32px));
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(15, 23, 42, 0.98);
+  color: #f9fafb;
+  font-size: 13px;
+  line-height: 1.35;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.35);
+  z-index: 50;
 }
 
 .chat-attachments {

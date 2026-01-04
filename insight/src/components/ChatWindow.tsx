@@ -14,6 +14,7 @@ import {
   cancelStreamTurn,
   ensureChatUiLoaded,
   getChatUiSnapshot,
+  rollbackStreamTurn,
   subscribeChatUi,
 } from "../state/chatUiStore";
 
@@ -149,6 +150,7 @@ export function ChatWindow({
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [branchTarget, setBranchTarget] = useState<{
     id: string;
@@ -176,6 +178,7 @@ export function ChatWindow({
   const inputElRef = useRef<HTMLTextAreaElement | null>(null);
   const INPUT_MAX_HEIGHT_PX = 120;
   const chatPopoverTimerRef = useRef<number | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
 
 
   const effectiveSelection = selection === undefined ? localSelection : selection;
@@ -189,6 +192,22 @@ export function ChatWindow({
     if (selection === undefined) setLocalSelection(null);
     onClearSelection?.();
   }
+
+  function showToast(message: string) {
+    if (!message) return;
+    setToast(message);
+    if (toastTimerRef.current != null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => {
+      toastTimerRef.current = null;
+      setToast(null);
+    }, 4200);
+  }
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current != null) window.clearTimeout(toastTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     function onFocusChat(e: Event) {
@@ -473,12 +492,41 @@ export function ChatWindow({
     return `${v.toFixed(digits)} ${units[i]}`;
   }
 
+  function formatIngestFailure(res: { status: number; data: any; error?: string }) {
+    const status = Number(res?.status || 0);
+    const payload = res?.data;
+    const detail =
+      payload && typeof payload === "object" && "detail" in payload ? (payload as any).detail : payload;
+    if (detail && typeof detail === "object") {
+      const code = String((detail as any).error || "");
+      const filename = String((detail as any).filename || "");
+      const sizeBytes = Number((detail as any).size_bytes || 0);
+      const maxBytes = Number((detail as any).max_bytes || 0);
+      const msg = String((detail as any).message || "");
+
+      if (code === "file_too_large") {
+        const filePart = filename ? `: ${filename}` : "";
+        const sizePart = sizeBytes ? ` (${formatBytes(sizeBytes)})` : "";
+        const maxPart = maxBytes ? ` Max ${formatBytes(maxBytes)}.` : "";
+        return `File too large${filePart}${sizePart}.${maxPart}`;
+      }
+      if (msg) return msg;
+      if (code) return `Upload rejected (${code})`;
+    }
+    if (typeof detail === "string" && detail.trim()) return detail.trim();
+    if (res?.error) return res.error;
+    return `Failed to ingest files (${status || "error"})`;
+  }
+
   async function pickAttachments() {
     if (!chatId) {
       setError("Select or create a chat first.");
       return;
     }
     if (isStreaming || !active) return;
+
+    const LARGE_MODE_THRESHOLD_BYTES = 5 * 1024 * 1024; // keep aligned with backend default (INSIGHT_MAX_MULTI_FILE_BYTES)
+    const LARGE_MODE_ALLOWED_SUFFIXES = new Set([".txt", ".log", ".json"]);
 
     setError(null);
     try {
@@ -490,6 +538,8 @@ export function ChatWindow({
 
       const accepted: string[] = [];
       const rejected: { name: string; size: number; max: number }[] = [];
+      const largeSelected: { path: string; name: string; size: number; suffix: string }[] = [];
+      const largeTypeRejected: { name: string; suffix: string }[] = [];
 
       for (const f of files) {
         const p = (f as any)?.path as string;
@@ -497,11 +547,32 @@ export function ChatWindow({
         const name = (f as any)?.name || filenameFromPath(p);
         const size = Number((f as any)?.size_bytes ?? 0);
         const max = Number((f as any)?.max_bytes ?? 0);
+        const suffix = (() => {
+          const n = String(name || "");
+          const dot = n.lastIndexOf(".");
+          return dot >= 0 ? n.slice(dot).toLowerCase() : "";
+        })();
         if (max > 0 && size > max) {
           rejected.push({ name, size, max });
           continue;
         }
+        if (size > LARGE_MODE_THRESHOLD_BYTES) {
+          if (!LARGE_MODE_ALLOWED_SUFFIXES.has(suffix)) {
+            largeTypeRejected.push({ name, suffix });
+            continue;
+          }
+          largeSelected.push({ path: p, name, size, suffix });
+        }
         accepted.push(p);
+      }
+
+      if (largeTypeRejected.length) {
+        const first = largeTypeRejected[0];
+        const extra = largeTypeRejected.length > 1 ? ` (+${largeTypeRejected.length - 1} more)` : "";
+        setError(
+          `Large file mode supports only .txt/.log/.json. Unsupported: ${first.name}${first.suffix ? ` (${first.suffix})` : ""
+          }.${extra}`
+        );
       }
 
       if (rejected.length) {
@@ -513,6 +584,29 @@ export function ChatWindow({
       }
 
       if (!accepted.length) return;
+
+      // Large-file ("raw_large") policy: one file only, and only into a new chat with no existing files.
+      // Backend enforces this; we precheck to avoid a confusing 409 after the user types a message.
+      if (largeSelected.length) {
+        if (largeSelected.length > 1 || accepted.length > 1 || attachedPaths.length) {
+          setError("Large file mode supports uploading exactly one file into a new card (no other attachments).");
+          return;
+        }
+        try {
+          const listRes = await engine<{ files?: { file_id: string }[] }>(
+            `/files/chat/${encodeURIComponent(chatId)}`,
+            undefined,
+            "GET"
+          );
+          const existing = Array.isArray((listRes as any)?.data?.files) ? (listRes as any).data.files : [];
+          if (existing.length) {
+            setError("Large files can only be uploaded into a new card with no existing files.");
+            return;
+          }
+        } catch {
+          // If the precheck fails, fall back to backend enforcement.
+        }
+      }
 
       // Only attach; actual ingestion happens when user clicks Send (with query).
       setAttachedPaths((prev) => {
@@ -536,6 +630,12 @@ export function ChatWindow({
       setError("Select or create a chat first.");
       return;
     }
+
+    const inputBeforeSend = input;
+    const attachedBeforeSend = attachedPaths.slice();
+    const selectionBeforeSend = effectiveSelection
+      ? { text: effectiveSelection.text, file_id: effectiveSelection.file_id }
+      : null;
 
     setError(null);
     setIsSending(true);
@@ -565,20 +665,6 @@ export function ChatWindow({
         ? { text: effectiveSelection.text, file_id: effectiveSelection.file_id }
         : { text: effectiveSelection.text }
       : undefined;
-
-    if (attachedNames.length) {
-      try {
-        window.dispatchEvent(
-          new CustomEvent("insight:docs-pending", {
-            detail: { chatId, names: attachedNames },
-          })
-        );
-      } catch {
-        // ignore
-      }
-      // Nudge the Documents pane to refresh its file list immediately.
-      onRequestDocsRefresh?.();
-    }
 
     const requestId =
       (globalThis.crypto && "randomUUID" in globalThis.crypto
@@ -618,16 +704,50 @@ export function ChatWindow({
           "POST"
         );
         if (!ingestRes.ok) {
-          throw new Error(ingestRes.error || `Failed to ingest files (${ingestRes.status})`);
+          const msg = formatIngestFailure(ingestRes as any);
+          showToast(msg);
+          setError(msg);
+          rollbackStreamTurn(chatId, requestId);
+          setInput(inputBeforeSend);
+          setAttachedPaths(attachedBeforeSend);
+          if (selectionBeforeSend) setSelectionValue(selectionBeforeSend);
+          return;
         }
         const files = Array.isArray(ingestRes.data?.files) ? ingestRes.data.files : [];
         docIdsForTurn = files.map((f) => f.file_id).filter((s) => typeof s === "string" && s);
         const names = files.map((f) => f.filename).filter((s) => typeof s === "string" && s);
         if (names.length) attachmentNamesForTurn = names;
 
+        if (attachmentNamesForTurn.length) {
+          try {
+            window.dispatchEvent(
+              new CustomEvent("insight:docs-pending", {
+                detail: { chatId, names: attachmentNamesForTurn },
+              })
+            );
+          } catch {
+            // ignore
+          }
+          // Nudge the Documents pane to refresh its file list immediately.
+          onRequestDocsRefresh?.();
+        }
+
         // If the docs pane is open, bias this turn to the newly attached file(s).
-        if (docPaneOpen) {
-          focusDocForTurn = (activeDocumentId || docIdsForTurn[docIdsForTurn.length - 1]) || undefined;
+        // Important: prefer the new upload over any stale `activeDocumentId`.
+        if (docPaneOpen && docIdsForTurn.length) {
+          const newest = docIdsForTurn[docIdsForTurn.length - 1];
+          focusDocForTurn = newest || activeDocumentId || undefined;
+          if (newest) {
+            try {
+              window.dispatchEvent(
+                new CustomEvent("insight:docs-select", {
+                  detail: { chatId, fileId: newest },
+                })
+              );
+            } catch {
+              // ignore
+            }
+          }
         }
       }
 
@@ -756,7 +876,9 @@ export function ChatWindow({
       });
     } catch (err: any) {
       console.error("Chat error", err);
-      setError(err?.message ?? String(err));
+      const msg = err?.message ?? String(err);
+      showToast(msg);
+      setError(msg);
       setIngestProgress(null);
       // Ensure UI returns to Send state even if the stream failed to start.
       if (chatId && getChatUiSnapshot(chatId).activeRequestId === requestId) {
@@ -1003,6 +1125,18 @@ export function ChatWindow({
         ) : null}
         <div ref={bottomRef} />
       </div>
+
+      {toast ? (
+        <div
+          className="chat-toast"
+          role="status"
+          aria-live="polite"
+          onClick={() => setToast(null)}
+          title="Click to dismiss"
+        >
+          {toast}
+        </div>
+      ) : null}
 
       {error && <div className="chat-error">{error}</div>}
 
