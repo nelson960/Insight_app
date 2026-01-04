@@ -252,6 +252,112 @@ def build_context_pack(
     return "\n\n".join(p.strip() for p in parts if p and p.strip()).strip()
 
 
+def build_ui_sources_from_rag_hits(rag_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Build UI-only "sources" from RAG hits.
+
+    IMPORTANT:
+    - This must NEVER be injected into the model prompt (avoid KV/prompt pollution).
+    - This must NEVER include internal identifiers (file_id/doc_id/chunk_id/score).
+    - Only user-facing data is allowed: filename + page/page ranges.
+    """
+
+    # Group by doc_id internally (to avoid mixing), but do not expose ids to UI.
+    per_doc: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+
+    for hit in rag_hits or []:
+        doc_id = hit.get("doc_id")
+        if not isinstance(doc_id, str) or not doc_id:
+            continue
+
+        filename = hit.get("filename")
+        if isinstance(filename, str):
+            filename = filename.strip()
+        if not filename:
+            filename = "Document"
+
+        ps = hit.get("page_start")
+        pe = hit.get("page_end")
+        if not isinstance(ps, int):
+            ps = None
+        if not isinstance(pe, int):
+            pe = None
+        if ps is None:
+            p = hit.get("page")
+            ps = p if isinstance(p, int) else None
+        if pe is None:
+            pe = ps
+
+        rec = per_doc.get(doc_id)
+        if not rec:
+            rec = {"filename": filename, "ranges": []}
+            per_doc[doc_id] = rec
+            order.append(doc_id)
+        else:
+            # Prefer a non-placeholder filename if possible.
+            if rec.get("filename") in {"", "Document"} and filename not in {"", "Document"}:
+                rec["filename"] = filename
+
+        if ps is not None and pe is not None:
+            try:
+                a = int(ps)
+                b = int(pe)
+            except Exception:
+                a = None
+                b = None
+            if a is not None and b is not None:
+                start = min(a, b)
+                end = max(a, b)
+                rec["ranges"].append((start, end))
+
+    if not order:
+        return []
+
+    # Disambiguate duplicate filenames without exposing ids.
+    counts: Dict[str, int] = {}
+    for doc_id in order:
+        base = str(per_doc.get(doc_id, {}).get("filename") or "Document")
+        counts[base] = counts.get(base, 0) + 1
+    seen: Dict[str, int] = {}
+    display: Dict[str, str] = {}
+    for doc_id in order:
+        base = str(per_doc.get(doc_id, {}).get("filename") or "Document")
+        if counts.get(base, 0) <= 1:
+            display[doc_id] = base
+            continue
+        seen[base] = seen.get(base, 0) + 1
+        display[doc_id] = f"{base} ({seen[base]})"
+
+    def merge_ranges(raw: List[tuple[int, int]]) -> List[List[int]]:
+        if not raw:
+            return []
+        ranges = sorted(raw, key=lambda x: (x[0], x[1]))
+        merged: List[List[int]] = []
+        cur_s, cur_e = ranges[0]
+        for s, e in ranges[1:]:
+            if s <= cur_e + 1:
+                cur_e = max(cur_e, e)
+                continue
+            merged.append([cur_s, cur_e])
+            cur_s, cur_e = s, e
+        merged.append([cur_s, cur_e])
+        return merged
+
+    out: List[Dict[str, Any]] = []
+    for doc_id in order:
+        rec = per_doc.get(doc_id) or {}
+        ranges_raw = rec.get("ranges") or []
+        merged = merge_ranges([r for r in ranges_raw if isinstance(r, tuple) and len(r) == 2])
+        out.append(
+            {
+                "filename": display.get(doc_id) or str(rec.get("filename") or "Document"),
+                "page_ranges": merged,
+            }
+        )
+    return out
+
+
 def build_dirty_user_turn(user_message: str, *, selection: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
     Build a "dirty" user turn that strongly weights a selected excerpt.
@@ -779,6 +885,7 @@ class InsightOrchestrator:
         attachments: Optional[List[str]] = None,
         focus_document_id: Optional[str] = None,
         selection: Optional[Dict[str, Any]] = None,
+        sources: Optional[List[Dict[str, Any]]] = None,
         mode: str = "chat",
         model: str = "llama_cpp",
     ) -> None:
@@ -797,6 +904,12 @@ class InsightOrchestrator:
             payload["selection"] = sel
         message_id = f"msg_{uuid.uuid4().hex}"
         created_at = datetime.now(timezone.utc).isoformat()
+        citations_json: Optional[str] = None
+        if sources and isinstance(sources, list):
+            try:
+                citations_json = json.dumps(sources, ensure_ascii=False)
+            except Exception:
+                citations_json = None
         self.metadata_store.insert_message(
             message_id=message_id,
             chat_id=chat_id,
@@ -805,7 +918,7 @@ class InsightOrchestrator:
             model=model,
             mode=mode,
             planner_payload_json=None,
-            citations_json=None,
+            citations_json=citations_json,
             created_at=created_at,
         )
 
@@ -1169,6 +1282,17 @@ class InsightOrchestrator:
             )
             context_pack = (task_hint + "\n" + (context_pack or "")).strip()
 
+        # UI-only sources (never model-visible). Only show for true multi-file scope=all.
+        ui_sources: List[Dict[str, Any]] = []
+        if scope_mode == "all":
+            try:
+                ui_sources = build_ui_sources_from_rag_hits(selected_rag)
+                # Only show sources when at least 2 distinct docs contributed evidence.
+                if len(ui_sources) < 2:
+                    ui_sources = []
+            except Exception:
+                ui_sources = []
+
         def generator():
             tokens: List[str] = []
             # Persist clean UI user message immediately so history is instant.
@@ -1202,7 +1326,19 @@ class InsightOrchestrator:
             reply = "".join(tokens)
             try:
                 if reply.strip():
-                    self._persist_ui_message(chat_id=chat_id, role="assistant", text=reply)
+                    self._persist_ui_message(
+                        chat_id=chat_id,
+                        role="assistant",
+                        text=reply,
+                        sources=ui_sources or None,
+                    )
+                    if ui_sources and request_id:
+                        emit_event(
+                            "chat_sources",
+                            chat_id=chat_id,
+                            request_id=request_id,
+                            sources=ui_sources,
+                        )
             except Exception:
                 logger.exception("Failed to persist UI assistant message chat=%s", chat_id)
 

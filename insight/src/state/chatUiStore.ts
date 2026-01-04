@@ -9,6 +9,7 @@ export type ChatMessage = {
   attachments?: string[];
   selection?: { text: string; file_id?: string; page?: number };
   focus_document_id?: string;
+  sources?: any[];
 };
 
 type PersistedMessage = {
@@ -17,6 +18,7 @@ type PersistedMessage = {
   attachments?: string[];
   selection?: { text: string; file_id?: string; page?: number };
   focus_document_id?: string;
+  sources?: any[];
 };
 
 export type ChatUiSnapshot = {
@@ -135,6 +137,7 @@ export async function ensureChatUiLoaded(chatId: string) {
             m.selection && typeof m.selection === "object" ? (m.selection as any) : undefined,
           focus_document_id:
             typeof m.focus_document_id === "string" ? m.focus_document_id : undefined,
+          sources: Array.isArray((m as any).sources) ? ((m as any).sources as any[]) : undefined,
         }));
       }
     } catch {
@@ -235,6 +238,17 @@ function endStreamInternal(chatId: string, requestId: string) {
   emit(chatId);
 }
 
+function attachSourcesInternal(chatId: string, requestId: string, sources: any[]) {
+  if (!chatId || !requestId || !Array.isArray(sources) || sources.length === 0) return;
+  const s = ensureState(chatId);
+  const idx = s.messages.findIndex((m) => m.role === "assistant" && m.request_id === requestId);
+  if (idx < 0) return;
+  const prev = s.messages[idx];
+  const next = { ...prev, sources };
+  s.messages = [...s.messages.slice(0, idx), next, ...s.messages.slice(idx + 1)];
+  emit(chatId);
+}
+
 async function ensureBridge() {
   if (bridgeInit) return bridgeInit;
   bridgeInit = (async () => {
@@ -256,6 +270,15 @@ async function ensureBridge() {
       const requestId = p.request_id || "";
       if (!chatId || !requestId) return;
       endStreamInternal(chatId, requestId);
+    });
+
+    await listen<any>("chat-sources", (event) => {
+      const p = (event.payload as any) || {};
+      const chatId = p.chat_id || "";
+      const requestId = p.request_id || "";
+      const sources = Array.isArray(p.sources) ? (p.sources as any[]) : [];
+      if (!chatId || !requestId || sources.length === 0) return;
+      attachSourcesInternal(chatId, requestId, sources);
     });
 
     await listen<{ request_id?: string; chat_id?: string; error?: string }>(

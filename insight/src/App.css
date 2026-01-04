@@ -3007,6 +3007,36 @@ body {
   opacity: 0.9;
 }
 
+.chat-message-sources {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  color: var(--muted-2);
+}
+
+html[data-theme="light"] .chat-message-sources {
+  border-top: 1px solid rgba(15, 23, 42, 0.12);
+}
+
+.chat-message-source {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.chat-message-source-name {
+  font-weight: 650;
+  color: var(--app-fg);
+}
+
+.chat-message-source-pages {
+  color: var(--muted-2);
+}
+
 .chat-message-actions {
   display: flex;
   gap: 8px;

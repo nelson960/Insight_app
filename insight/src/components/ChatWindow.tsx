@@ -58,6 +58,24 @@ type IngestProgressState = {
 
 const MAX_MD_TAIL_CHARS = 1800;
 
+function formatPageRanges(pageRanges: unknown): string | null {
+  if (!Array.isArray(pageRanges) || pageRanges.length === 0) return null;
+  const parts: string[] = [];
+  for (const r of pageRanges) {
+    if (!Array.isArray(r) || r.length < 2) continue;
+    const a = Number(r[0]);
+    const b = Number(r[1]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    const start = Math.min(a, b);
+    const end = Math.max(a, b);
+    if (start === end) parts.push(String(start));
+    else parts.push(`${start}–${end}`);
+  }
+  if (parts.length === 0) return null;
+  const joined = parts.join(", ");
+  return parts.length === 1 && !joined.includes("–") ? `page ${joined}` : `pages ${joined}`;
+}
+
 function _scanMarkdownTail(md: string): {
   commitIdx: number;
   inFence: boolean;
@@ -1039,6 +1057,21 @@ export function ChatWindow({
                 ))}
               </div>
             )}
+
+            {m.role === "assistant" && Array.isArray((m as any).sources) && (m as any).sources.length >= 2 ? (
+              <div className="chat-message-sources" aria-label="Sources">
+                {(m as any).sources.map((s: any, i: number) => {
+                  const filename = typeof s?.filename === "string" ? s.filename : "Document";
+                  const pages = formatPageRanges(s?.page_ranges);
+                  return (
+                    <div key={`${filename}-${i}`} className="chat-message-source">
+                      <span className="chat-message-source-name">{filename}</span>
+                      {pages ? <span className="chat-message-source-pages">{pages}</span> : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
 
             {m.role === "assistant" ? (
               <div className="chat-message-actions" aria-label="Message actions">
