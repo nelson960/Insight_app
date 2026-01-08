@@ -72,32 +72,75 @@ fn list_sessions() -> Result<Value, String> {
     let db_path = root.join("storage").join("db.sqlite");
     if db_path.exists() {
         if let Ok(conn) = Connection::open(db_path) {
+            // Query for chats with messages, including last message timestamp and content
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT chat_id, MAX(created_at) AS last_ts FROM messages GROUP BY chat_id ORDER BY last_ts DESC",
             ) {
                 let rows = stmt.query_map([], |row| {
                     let chat_id: String = row.get(0)?;
-                    Ok(chat_id)
+                    let last_ts: String = row.get(1)?;
+                    Ok((chat_id, last_ts))
                 });
                 if let Ok(rows) = rows {
                     for row in rows.flatten() {
-                        if seen.insert(row.clone()) {
+                        let (chat_id, last_ts) = row;
+                        if seen.insert(chat_id.clone()) {
                             let mut title: Option<String> = None;
                             if let Ok(mut tstmt) = conn.prepare(
                                 "SELECT content_json FROM messages WHERE chat_id=? AND role='user' ORDER BY created_at ASC LIMIT 1",
                             ) {
-                                if let Ok(mut trows) = tstmt.query([row.clone()]) {
+                                if let Ok(mut trows) = tstmt.query([chat_id.clone()]) {
                                     if let Ok(Some(r)) = trows.next() {
                                         let content_json: String = r.get(0).unwrap_or_default();
                                         title = _extract_title_from_content_json(&content_json);
                                     }
                                 }
                             }
-                            if let Some(t) = title {
-                                sessions.push(serde_json::json!({ "chat_id": row, "title": t }));
-                            } else {
-                                sessions.push(serde_json::json!({ "chat_id": row }));
+
+                            // Get last message content (any role)
+                            let mut last_message_content: Option<String> = None;
+                            if let Ok(mut lstmt) = conn.prepare(
+                                "SELECT content_json FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+                            ) {
+                                if let Ok(mut lrows) = lstmt.query([chat_id.clone()]) {
+                                    if let Ok(Some(r)) = lrows.next() {
+                                        let content_json: String = r.get(0).unwrap_or_default();
+                                        // Extract text from content_json
+                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content_json) {
+                                            if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                                                last_message_content = Some(truncate_string(text, 200));
+                                            } else if let Some(text) = v.as_str() {
+                                                last_message_content = Some(truncate_string(text, 200));
+                                            }
+                                        }
+                                    }
+                                }
                             }
+
+                            // Get file count
+                            let mut file_count: i64 = 0;
+                            if let Ok(mut fstmt) = conn.prepare(
+                                "SELECT COUNT(DISTINCT cf.file_id) FROM chat_files cf WHERE cf.chat_id=?",
+                            ) {
+                                if let Ok(mut frows) = fstmt.query([chat_id.clone()]) {
+                                    if let Ok(Some(r)) = frows.next() {
+                                        file_count = r.get(0).unwrap_or(0);
+                                    }
+                                }
+                            }
+
+                            let mut session_obj = serde_json::json!({
+                                "chat_id": chat_id,
+                                "last_message_at": last_ts,
+                                "file_count": file_count
+                            });
+                            if let Some(t) = title {
+                                session_obj["title"] = serde_json::json!(t);
+                            }
+                            if let Some(msg) = last_message_content {
+                                session_obj["last_message_content"] = serde_json::json!(msg);
+                            }
+                            sessions.push(session_obj);
                         }
                     }
                 }
@@ -112,10 +155,12 @@ fn list_sessions() -> Result<Value, String> {
             ) {
                 let rows = stmt.query_map([], |row| {
                     let chat_id: String = row.get(0)?;
-                    Ok(chat_id)
+                    let last_ts: String = row.get(1)?;
+                    Ok((chat_id, last_ts))
                 });
                 if let Ok(rows) = rows {
-                    for chat_id in rows.flatten() {
+                    for row in rows.flatten() {
+                        let (chat_id, last_ts) = row;
                         if !seen.insert(chat_id.clone()) {
                             continue;
                         }
@@ -146,11 +191,50 @@ fn list_sessions() -> Result<Value, String> {
                                 }
                             }
                         }
-                        if let Some(t) = title {
-                            sessions.push(serde_json::json!({ "chat_id": chat_id, "title": t }));
-                        } else {
-                            sessions.push(serde_json::json!({ "chat_id": chat_id }));
+
+                        // Get last message content if messages exist
+                        let mut last_message_content: Option<String> = None;
+                        if let Ok(mut lstmt) = conn.prepare(
+                            "SELECT content_json FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+                        ) {
+                            if let Ok(mut lrows) = lstmt.query([chat_id.clone()]) {
+                                if let Ok(Some(r)) = lrows.next() {
+                                    let content_json: String = r.get(0).unwrap_or_default();
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content_json) {
+                                        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                                            last_message_content = Some(truncate_string(text, 200));
+                                        } else if let Some(text) = v.as_str() {
+                                            last_message_content = Some(truncate_string(text, 200));
+                                        }
+                                    }
+                                }
+                            }
                         }
+
+                        // Get file count
+                        let mut file_count: i64 = 0;
+                        if let Ok(mut fstmt) = conn.prepare(
+                            "SELECT COUNT(DISTINCT cf.file_id) FROM chat_files cf WHERE cf.chat_id=?",
+                        ) {
+                            if let Ok(mut frows) = fstmt.query([chat_id.clone()]) {
+                                if let Ok(Some(r)) = frows.next() {
+                                    file_count = r.get(0).unwrap_or(0);
+                                }
+                            }
+                        }
+
+                        let mut session_obj = serde_json::json!({
+                            "chat_id": chat_id,
+                            "last_message_at": last_ts,
+                            "file_count": file_count
+                        });
+                        if let Some(t) = title {
+                            session_obj["title"] = serde_json::json!(t);
+                        }
+                        if let Some(msg) = last_message_content {
+                            session_obj["last_message_content"] = serde_json::json!(msg);
+                        }
+                        sessions.push(session_obj);
                     }
                 }
             }
@@ -174,6 +258,21 @@ fn list_sessions() -> Result<Value, String> {
         }
     }
     Ok(serde_json::json!({ "sessions": sessions }))
+}
+
+// Helper function to truncate a string to a maximum length
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        // Truncate at a word boundary if possible
+        let truncated = &s[..max_len];
+        if let Some(last_space) = truncated.rfind(' ') {
+            truncated[..last_space].to_string() + "..."
+        } else {
+            truncated.to_string() + "..."
+        }
+    }
 }
 
 #[tauri::command]
@@ -230,7 +329,7 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
 
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open db.sqlite: {e}"))?;
     let mut stmt = conn
-        .prepare("SELECT role, content_json, citations_json FROM messages WHERE chat_id=? ORDER BY created_at ASC")
+        .prepare("SELECT role, content_json, citations_json, created_at FROM messages WHERE chat_id=? ORDER BY created_at ASC")
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
     let mut out: Vec<Value> = Vec::new();
@@ -239,12 +338,13 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
             let role: String = row.get(0)?;
             let content_json: String = row.get(1)?;
             let citations_json: Option<String> = row.get(2)?;
-            Ok((role, content_json, citations_json))
+            let created_at: String = row.get(3)?;
+            Ok((role, content_json, citations_json, created_at))
         })
         .map_err(|e| format!("Query failed: {e}"))?;
 
     for row in rows.flatten() {
-        let (role, content_json, citations_json) = row;
+        let (role, content_json, citations_json, created_at) = row;
         let content: String;
         let mut attachments: Vec<String> = Vec::new();
         let mut selection: Option<Value> = None;
@@ -279,7 +379,7 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
                 content = content_json.clone();
             }
         }
-        let mut msg = serde_json::json!({ "role": role, "content": content });
+        let mut msg = serde_json::json!({ "role": role, "content": content, "created_at": created_at });
         if !attachments.is_empty() {
             msg["attachments"] = serde_json::json!(attachments);
         }

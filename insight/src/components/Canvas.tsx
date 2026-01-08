@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
+import { Plus, List, Settings, X, Paperclip, Lock, Unlock, Palette } from "lucide-react";
 import type { ChatSummary } from "../state/useSessions";
 import { engine } from "../api/engine";
+import { formatRelativeTime, truncateText } from "../utils/formatTime";
 
 export type CardLayout = {
   showChat: boolean;
@@ -72,6 +74,7 @@ type Props = {
   onDeleteChat: (chatId: string) => void;
   onDeleteChatTree: (rootChatId: string) => void;
   confirmDeleteChatId: string | null;
+  onResetConfirmDelete: () => void;
   loadingSessions: boolean;
   dockVisible?: boolean;
 };
@@ -86,7 +89,6 @@ const BOARD_MULT = 3.2;
 const BOARD_MIN_W = 2200;
 const BOARD_MIN_H = 1400;
 const CARD_MENU_WIDTH = 220;
-const CARD_MENU_SUB_WIDTH = 200;
 const STACK_ANIM_MS = 340;
 const LINK_FADE_MS = 140;
 // Collapse should feel like "stacking cards behind" (not shrinking into a dot).
@@ -174,6 +176,7 @@ export function Canvas({
   onDeleteChat,
   onDeleteChatTree,
   confirmDeleteChatId,
+  onResetConfirmDelete,
   loadingSessions,
   dockVisible = true,
 }: Props) {
@@ -209,6 +212,30 @@ export function Canvas({
     for (const s of sessions) map.set(s.chat_id, s);
     return map;
   }, [sessions]);
+
+  // Enrich session data with last message info and file count from session metadata
+  const enrichedChatData = useMemo(() => {
+    const map = new Map<
+      string,
+      { lastMessageAt: string | null; lastMessageContent: string | null; fileCount: number }
+    >();
+
+    for (const note of notes) {
+      const session = sessionById.get(note.chatId);
+      // Use session metadata (from list_sessions API) instead of loading from chatUiStore
+      const lastMessageAt = session?.last_message_at || null;
+      const lastMessageContent = session?.last_message_content || null;
+      const fileCount = session?.file_count || 0;
+
+      map.set(note.chatId, {
+        lastMessageAt,
+        lastMessageContent,
+        fileCount,
+      });
+    }
+
+    return map;
+  }, [notes, sessionById]);
 
   const noteById = useMemo(() => {
     const map = new Map<string, CanvasNote>();
@@ -254,6 +281,20 @@ export function Canvas({
       if (kids && kids.length) stack.push(...kids);
     }
     return out;
+  }
+
+  function clearGroupColorWithDescendants(chatId: string, currentAccentColor: string | null) {
+    // Clear color from this card and all descendants
+    const descendants = listDescendants(chatId);
+    descendants.forEach((descendantId) => {
+      const descendantNote = noteById.get(descendantId);
+      // Only clear if descendant doesn't have its own explicit color
+      // (i.e., it's inheriting from this parent or has the same color)
+      if (descendantNote && (!descendantNote.groupColor || descendantNote.groupColor === currentAccentColor)) {
+        onUpdateNote(descendantId, { groupColor: undefined });
+      }
+    });
+    onUpdateNote(chatId, { groupColor: undefined });
   }
 
   function startGroupStackAnimation(rootChatId: string, mode: "collapse" | "expand") {
@@ -963,7 +1004,7 @@ export function Canvas({
           }}
           type="button"
         >
-          + Card
+          <Plus className="w-4 h-4" />
         </button>
         <button
           className={`canvas-dock-icon ${chatListOpen ? "active" : ""}`}
@@ -976,7 +1017,7 @@ export function Canvas({
             setChatListOpen((v) => !v);
           }}
         >
-          ☰
+          <List className="w-4 h-4" />
         </button>
         <button
           className="canvas-dock-icon"
@@ -989,7 +1030,7 @@ export function Canvas({
             onOpenSettings();
           }}
         >
-          ⚙
+          <Settings className="w-4 h-4" />
         </button>
       </div>
 
@@ -1013,24 +1054,24 @@ export function Canvas({
                 }}
                 title={s.chat_id}
               >
-                {noteById.get(s.chat_id)?.title || s.title || s.chat_id}
-              </button>
-              <button
-                type="button"
-                className={`canvas-chatlist-del ${confirmDeleteChatId === s.chat_id ? "confirm" : ""}`}
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  onDeleteChat(s.chat_id);
-                }}
-                title={
-                  confirmDeleteChatId === s.chat_id
-                    ? "Click again to confirm delete"
-                    : "Delete chat"
-                }
-                aria-label={`Delete chat ${s.chat_id}`}
-              >
-                {confirmDeleteChatId === s.chat_id ? "Del" : "×"}
+                <span className="canvas-chatlist-item-text">{noteById.get(s.chat_id)?.title || s.title || s.chat_id}</span>
+                <button
+                  type="button"
+                  className={`canvas-chatlist-del ${confirmDeleteChatId === s.chat_id ? "confirm" : ""}`}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onDeleteChat(s.chat_id);
+                  }}
+                  title={
+                    confirmDeleteChatId === s.chat_id
+                      ? "Click again to confirm delete"
+                      : "Delete chat"
+                  }
+                  aria-label={`Delete chat ${s.chat_id}`}
+                >
+                  {confirmDeleteChatId === s.chat_id ? "Del" : <X className="w-3 h-3" />}
+                </button>
               </button>
             </div>
           ))}
@@ -1057,6 +1098,14 @@ export function Canvas({
           // WebViews can rasterize transformed layers and make text/borders look blurry.
           // Instead, notes + the board are laid out at scaled sizes/positions.
           transform: `translate(${renderX}px, ${renderY}px)`,
+        }}
+        onPointerDown={(e) => {
+          // Reset confirm delete state when clicking on canvas background
+          // Don't reset if clicking on a button or interactive element
+          const target = e.target as HTMLElement;
+          if (confirmDeleteChatId && !target.closest('button')) {
+            onResetConfirmDelete();
+          }
         }}
       >
         {board.w && board.h ? (
@@ -1101,6 +1150,7 @@ export function Canvas({
           const stackCount = stackCountByChatId[n.chatId] || 0;
           const accentColor = effectiveGroupColorByChatId[n.chatId] || null;
           const confirmDelete = confirmDeleteChatId === n.chatId;
+          const enrichedData = enrichedChatData.get(n.chatId);
           return (
             <ChatNote
               key={n.chatId}
@@ -1121,12 +1171,16 @@ export function Canvas({
               stackAnim={stackAnimByChatId[n.chatId] || null}
               accentColor={accentColor}
               confirmDelete={confirmDelete}
+              lastMessageAt={enrichedData?.lastMessageAt || null}
+              lastMessageContent={enrichedData?.lastMessageContent || null}
+              fileCount={enrichedData?.fileCount || 0}
               onFocus={() => onFocusChat(n.chatId)}
               onUpdate={(patch, opts) => applyUpdateNote(n.chatId, patch, opts)}
               onOpen={() => onOpenChat(n.chatId)}
               // Default card open shows split view (docs + chat).
               onOpenCard={() => onOpenCard(n.chatId)}
               onDelete={() => onDeleteChat(n.chatId)}
+              onClearGroupColor={() => clearGroupColorWithDescendants(n.chatId, accentColor)}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -1145,19 +1199,14 @@ export function Canvas({
             (() => {
               const note = noteById.get(cardMenu.chatId);
               if (!note) return null;
-              const locked = !!note.locked;
               const collapsed = !!note.collapsed;
               const hasChildren = (tree.childrenByParent.get(cardMenu.chatId) || []).length > 0;
               const stackCount = stackCountByChatId[cardMenu.chatId] || 0;
-              const effectiveColor = effectiveGroupColorByChatId[cardMenu.chatId] || "";
 
               const winW = typeof window !== "undefined" ? window.innerWidth : 1024;
               const winH = typeof window !== "undefined" ? window.innerHeight : 768;
               const baseX = Math.min(cardMenu.x, Math.max(8, winW - CARD_MENU_WIDTH - 8));
               const baseY = Math.min(cardMenu.y, Math.max(8, winH - 200));
-              const subToLeft = baseX + CARD_MENU_WIDTH + CARD_MENU_SUB_WIDTH + 10 > winW;
-              const subX = subToLeft ? baseX - CARD_MENU_SUB_WIDTH - 8 : baseX + CARD_MENU_WIDTH + 8;
-              const subY = Math.min(baseY, Math.max(8, winH - 220));
 
               return (
                 <div
@@ -1173,17 +1222,6 @@ export function Canvas({
                     aria-label="Card menu"
                     onPointerDown={(e) => e.stopPropagation()}
                   >
-                    <button
-                      type="button"
-                      className="canvas-card-menu-item"
-                      onClick={() => {
-                        onUpdateNote(cardMenu.chatId, { locked: !locked });
-                        closeCardMenu();
-                      }}
-                    >
-                      {locked ? "Unlock card" : "Lock card"}
-                    </button>
-
                     {hasChildren ? (
                       <button
                         type="button"
@@ -1196,24 +1234,6 @@ export function Canvas({
                         {collapsed ? "Expand group" : "Collapse group"}
                       </button>
                     ) : null}
-
-                    <button
-                      type="button"
-                      className="canvas-card-menu-item"
-                      onClick={() =>
-                        setCardMenu((prev) =>
-                          prev && prev.chatId === cardMenu.chatId
-                            ? {
-                                ...prev,
-                                sub: prev.sub === "colors" ? null : "colors",
-                                confirm: null,
-                              }
-                            : prev
-                        )
-                      }
-                    >
-                      Group color <span className="canvas-card-menu-arrow">▸</span>
-                    </button>
 
                     {collapsed && stackCount > 0 ? (
                       <button
@@ -1240,47 +1260,6 @@ export function Canvas({
                       </button>
                     ) : null}
                   </div>
-
-                  {cardMenu.sub === "colors" ? (
-                    <div
-                      className="canvas-card-menu-sub"
-                      style={{ left: subX, top: subY }}
-                      role="menu"
-                      aria-label="Group color"
-                      onPointerDown={(e) => e.stopPropagation()}
-                    >
-                      <div className="canvas-card-menu-sub-title">Group color</div>
-                      <div className="canvas-card-color-row">
-                        {GROUP_COLORS.map((c) => {
-                          const selected = effectiveColor === c.value;
-                          return (
-                            <button
-                              key={c.id}
-                              type="button"
-                              className={`canvas-card-color ${selected ? "active" : ""}`}
-                              title={c.label}
-                              aria-label={c.label}
-                              onClick={() => {
-                                onUpdateNote(cardMenu.chatId, { groupColor: c.value });
-                                closeCardMenu();
-                              }}
-                              style={{ backgroundColor: c.value }}
-                            />
-                          );
-                        })}
-                      </div>
-                      <button
-                        type="button"
-                        className="canvas-card-menu-item canvas-card-menu-item-muted"
-                        onClick={() => {
-                          onUpdateNote(cardMenu.chatId, { groupColor: undefined });
-                          closeCardMenu();
-                        }}
-                      >
-                        Clear color
-                      </button>
-                    </div>
-                  ) : null}
                 </div>
               );
             })(),
@@ -1309,10 +1288,14 @@ function ChatNote({
   stackAnim,
   accentColor,
   confirmDelete,
+  lastMessageAt,
+  lastMessageContent,
+  fileCount,
   onFocus,
   onOpen,
   onOpenCard,
   onDelete,
+  onClearGroupColor,
   onUpdate,
   onContextMenu,
 }: {
@@ -1341,10 +1324,14 @@ function ChatNote({
   };
   accentColor: string | null;
   confirmDelete: boolean;
+  lastMessageAt: string | null;
+  lastMessageContent: string | null;
+  fileCount: number;
   onFocus: () => void;
   onOpen: () => void;
   onOpenCard: () => void;
   onDelete: () => void;
+  onClearGroupColor: () => void;
   onUpdate: (patch: Partial<CanvasNote>, opts?: { clampToViewport?: boolean }) => void;
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
@@ -1367,7 +1354,11 @@ function ChatNote({
   const minH = 120;
   const [isRenaming, setIsRenaming] = useState(false);
   const [titleDraft, setTitleDraft] = useState(title);
+  const [colorPickerOpen, setColorPickerOpen] = useState(false);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
+  const colorPickerRef = useRef<HTMLDivElement | null>(null);
+  const paletteButtonRef = useRef<HTMLButtonElement | null>(null);
+  const justClosedColorPickerRef = useRef(false);
 
   useEffect(() => {
     if (isRenaming) return;
@@ -1382,6 +1373,27 @@ function ChatNote({
     }, 0);
     return () => window.clearTimeout(t);
   }, [isRenaming]);
+
+  useEffect(() => {
+    if (!colorPickerOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const t = e.target as Node | null;
+      if (!t) return;
+      // Don't close if clicking inside the color picker itself
+      if (colorPickerRef.current && colorPickerRef.current.contains(t)) return;
+      // Don't close if clicking the palette button - let it handle the toggle
+      if (paletteButtonRef.current && paletteButtonRef.current.contains(t)) return;
+      // Close the menu on any other click
+      setColorPickerOpen(false);
+      justClosedColorPickerRef.current = true;
+      // Reset the flag after a short delay
+      setTimeout(() => {
+        justClosedColorPickerRef.current = false;
+      }, 100);
+    };
+    window.addEventListener("pointerdown", onPointerDown, { capture: true });
+    return () => window.removeEventListener("pointerdown", onPointerDown, { capture: true } as any);
+  }, [colorPickerOpen]);
 
   function commitRename(nextTitle: string) {
     const trimmed = (nextTitle || "").trim();
@@ -1597,11 +1609,6 @@ function ChatNote({
                 {title}
               </div>
               <div className="canvas-note-header-right">
-                {locked ? (
-                  <div className="canvas-note-lock" title="Locked" aria-label="Locked">
-                    🔒
-                  </div>
-                ) : null}
                 {collapsed && stackCount > 0 ? (
                   <button
                     type="button"
@@ -1617,19 +1624,49 @@ function ChatNote({
                   </button>
                 ) : null}
                 {!collapsed ? (
-                  <button
-                    type="button"
-                    className={`canvas-note-del ${confirmDelete ? "confirm" : ""}`}
-                    title={confirmDelete ? "Click again to confirm delete" : "Delete card"}
-                    aria-label={`Delete card ${title}`}
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      onDelete();
-                    }}
-                  >
-                    {confirmDelete ? "Del" : "×"}
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="canvas-note-lock-btn"
+                      title={locked ? "Unlock card" : "Lock card"}
+                      aria-label={locked ? "Unlock card" : "Lock card"}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onUpdate({ locked: !locked });
+                      }}
+                    >
+                      {locked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
+                    </button>
+                    <button
+                      ref={paletteButtonRef}
+                      type="button"
+                      className="canvas-note-lock-btn"
+                      title="Card color"
+                      aria-label="Card color"
+                      data-palette-button="true"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setColorPickerOpen(!colorPickerOpen);
+                      }}
+                    >
+                      <Palette className="w-3 h-3" />
+                    </button>
+                    <button
+                      type="button"
+                      className={`canvas-note-del ${confirmDelete ? "confirm" : ""}`}
+                      title={confirmDelete ? "Click again to confirm delete" : "Delete card"}
+                      aria-label={`Delete card ${title}`}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onDelete();
+                      }}
+                    >
+                      {confirmDelete ? "Del" : <X className="w-3 h-3" />}
+                    </button>
+                  </>
                 ) : null}
               </div>
             </>
@@ -1645,9 +1682,20 @@ function ChatNote({
             // Ignore clicks on resize handles.
             const t = e.target as HTMLElement | null;
             if (t && t.closest(".canvas-note-handle")) return;
+            // Don't open if we just closed the color picker
+            if (justClosedColorPickerRef.current) return;
             e.preventDefault();
             e.stopPropagation();
             bringToFront();
+            // If color picker is open, just close it and don't open the card
+            if (colorPickerOpen) {
+              setColorPickerOpen(false);
+              justClosedColorPickerRef.current = true;
+              setTimeout(() => {
+                justClosedColorPickerRef.current = false;
+              }, 100);
+              return;
+            }
             if (collapsed && stackCount > 0) {
               onUpdate({ collapsed: false });
               return;
@@ -1659,22 +1707,38 @@ function ChatNote({
           tabIndex={-1}
         >
           <div className="canvas-note-preview">
-            {files.length ? (
-              <>
-                {files.slice(0, 3).map((name, idx) => (
+            <div className="canvas-note-preview-meta">
+              {lastMessageAt ? (
+                <div className="canvas-note-preview-time" title="Last activity">
+                  {formatRelativeTime(lastMessageAt)}
+                </div>
+              ) : null}
+              {fileCount > 0 ? (
+                <div className="canvas-note-preview-files" title={`${fileCount} file${fileCount === 1 ? "" : "s"}`}>
+                  <Paperclip className="w-4 h-4" /> {fileCount}
+                </div>
+              ) : null}
+            </div>
+            {lastMessageContent ? (
+              <div className="canvas-note-preview-message" title={lastMessageContent}>
+                {truncateText(lastMessageContent, 80)}
+              </div>
+            ) : null}
+            {files.length > 0 && !lastMessageContent ? (
+              <div className="canvas-note-preview-files-list">
+                {files.slice(0, 2).map((name, idx) => (
                   <div key={`${idx}-${name}`} className="canvas-note-preview-file" title={name}>
                     {name}
                   </div>
                 ))}
-                {files.length > 3 ? (
-                  <div className="canvas-note-preview-sub">+{files.length - 3} more</div>
+                {files.length > 2 ? (
+                  <div className="canvas-note-preview-sub">+{files.length - 2} more</div>
                 ) : null}
-              </>
-            ) : (
-              <>
-                <div className="canvas-note-preview-sub">No files</div>
-              </>
-            )}
+              </div>
+            ) : null}
+            {!files.length && !lastMessageContent ? (
+              <div className="canvas-note-preview-sub">New chat</div>
+            ) : null}
           </div>
         </div>
       </div>
@@ -1721,6 +1785,51 @@ function ChatNote({
             role="presentation"
           />
         </>
+      ) : null}
+      {colorPickerOpen ? (
+        <div
+          ref={colorPickerRef}
+          className="canvas-note-color-picker"
+          style={{
+            position: "absolute",
+            top: "34px",
+            right: "8px",
+            zIndex: 1000,
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <div className="canvas-card-color-row">
+            {GROUP_COLORS.map((c) => {
+              const selected = accentColor === c.value;
+              return (
+                <button
+                  key={c.id}
+                  type="button"
+                  className={`canvas-card-color ${selected ? "active" : ""}`}
+                  title={c.label}
+                  aria-label={c.label}
+                  onClick={() => {
+                    onUpdate({ groupColor: c.value });
+                    setColorPickerOpen(false);
+                  }}
+                  style={{ backgroundColor: c.value }}
+                />
+              );
+            })}
+            <button
+              type="button"
+              className="canvas-card-color-clear"
+              title="No color"
+              aria-label="No color"
+              onClick={() => {
+                onClearGroupColor();
+                setColorPickerOpen(false);
+              }}
+            >
+              ×
+            </button>
+          </div>
+        </div>
       ) : null}
     </div>
   );

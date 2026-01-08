@@ -2,7 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
-export type ChatSummary = { chat_id: string; title?: string; local?: boolean };
+export type ChatSummary = {
+  chat_id: string;
+  title?: string;
+  local?: boolean;
+  last_message_at?: string;
+  last_message_content?: string;
+  file_count?: number;
+};
 
 export function useSessions() {
   const [sessions, setSessions] = useState<ChatSummary[]>([]);

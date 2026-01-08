@@ -325,6 +325,14 @@ function App() {
     [overlayCardId, updateNote]
   );
 
+  const handleOverlayTitleChange = useCallback(
+    (newTitle: string) => {
+      if (!overlayCardId) return;
+      updateNote(overlayCardId, { title: newTitle || undefined });
+    },
+    [overlayCardId, updateNote]
+  );
+
   // Keep one global canvas note per chat (auto-place missing ones).
   useEffect(() => {
     if (loading) return;
@@ -578,6 +586,7 @@ function App() {
             onDeleteChat={deleteChat}
             onDeleteChatTree={deleteChatTree}
             confirmDeleteChatId={confirmDeleteChatId}
+            onResetConfirmDelete={() => setConfirmDeleteChatId(null)}
             loadingSessions={loading}
             dockVisible={!overlayCardId && !overlayChatId}
           />
@@ -604,6 +613,7 @@ function App() {
                     onClose={() => setOverlayCardId(null)}
                     initialLayout={layout}
                     onLayoutChange={handleOverlayLayoutChange}
+                    onTitleChange={handleOverlayTitleChange}
                     sessions={sortedSessions}
                     loadingSessions={loading}
                     onOpenCard={(chatId) => {

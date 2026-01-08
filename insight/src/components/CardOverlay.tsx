@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FileText, MessageSquare, Settings, ArrowLeftRight, X } from "lucide-react";
+import NewCardIcon from "./icons/NewCardIcon";
 import { ChatWindow } from "./ChatWindow";
 import { DocumentsPane } from "./DocumentsPane";
 import { SplitView } from "./SplitView";
@@ -11,6 +13,7 @@ type Props = {
   onClose: () => void;
   initialLayout?: CardLayout;
   onLayoutChange?: (next: CardLayout) => void;
+  onTitleChange?: (newTitle: string) => void;
   sessions: ChatSummary[];
   loadingSessions: boolean;
   onOpenCard: (chatId: string) => void;
@@ -33,6 +36,7 @@ export function CardOverlay({
   onClose,
   initialLayout,
   onLayoutChange,
+  onTitleChange,
   sessions,
   loadingSessions,
   onOpenCard,
@@ -53,8 +57,11 @@ export function CardOverlay({
   const [docsRefreshSeq, setDocsRefreshSeq] = useState(0);
   const [selection, setSelection] = useState<{ text: string; file_id?: string } | null>(null);
   const [cardsOpen, setCardsOpen] = useState(false);
+  const [isRenaming, setIsRenaming] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(title);
   const cardsWrapRef = useRef<HTMLDivElement | null>(null);
   const cardsMenuRef = useRef<HTMLDivElement | null>(null);
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
 
   const isSplit = showChat && showDocs;
 
@@ -101,6 +108,21 @@ export function CardOverlay({
     window.addEventListener("pointerdown", onPointerDown, { capture: true });
     return () => window.removeEventListener("pointerdown", onPointerDown, { capture: true } as any);
   }, [cardsOpen]);
+
+  // Sync titleDraft when title prop changes (but not during renaming)
+  useEffect(() => {
+    if (!isRenaming) {
+      setTitleDraft(title);
+    }
+  }, [title, isRenaming]);
+
+  // Focus the rename input when renaming starts
+  useEffect(() => {
+    if (isRenaming) {
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    }
+  }, [isRenaming]);
 
   const docsPane = useMemo(
     () => (
@@ -177,6 +199,17 @@ export function CardOverlay({
     setShowDocs(true);
   }
 
+  function commitRename(nextTitle: string) {
+    const trimmed = (nextTitle || "").trim();
+    onTitleChange?.(trimmed ? trimmed : title);
+    setIsRenaming(false);
+  }
+
+  function cancelRename() {
+    setTitleDraft(title);
+    setIsRenaming(false);
+  }
+
   return (
     <div
       className="chat-overlay card-overlay card-overlay-fullscreen"
@@ -192,7 +225,97 @@ export function CardOverlay({
         onPointerDown={(e) => e.stopPropagation()}
       >
         <div className="chat-overlay-header card-overlay-header">
-          <div className="card-overlay-header-left" ref={cardsWrapRef}>
+          <div className="card-overlay-header-left">
+            {chatOnRight ? (
+              <button
+                className={`card-overlay-docs-btn ${showDocs ? "active" : ""}`}
+                type="button"
+                aria-label={showDocs ? "Hide documents" : "Show documents"}
+                title={showDocs ? "Hide documents" : "Documents"}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  toggleDocsPane();
+                }}
+              >
+                <FileText className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                className={`card-overlay-chat-btn ${showChat ? "active" : ""}`}
+                onClick={toggleChatPane}
+                type="button"
+                aria-pressed={showChat}
+                title={showChat ? "Hide chat" : "Show chat"}
+              >
+                <MessageSquare className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+          {isRenaming ? (
+            <input
+              ref={renameInputRef}
+              className="card-overlay-title-input"
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  commitRename(titleDraft);
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  cancelRename();
+                }
+              }}
+              onBlur={() => commitRename(titleDraft)}
+              aria-label="Rename card"
+            />
+          ) : (
+            <div
+              className="chat-overlay-title card-overlay-title"
+              title={title}
+              onDoubleClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setTitleDraft(title);
+                setIsRenaming(true);
+              }}
+            >
+              {title}
+            </div>
+          )}
+          <div className="card-overlay-header-right">
+            <div className="card-overlay-actions">
+            {chatOnRight ? (
+              <button
+                className={`card-overlay-chat-btn ${showChat ? "active" : ""}`}
+                onClick={toggleChatPane}
+                type="button"
+                aria-pressed={showChat}
+                title={showChat ? "Hide chat" : "Show chat"}
+              >
+                <MessageSquare className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                className={`card-overlay-docs-btn ${showDocs ? "active" : ""}`}
+                type="button"
+                aria-label={showDocs ? "Hide documents" : "Show documents"}
+                title={showDocs ? "Hide documents" : "Documents"}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  toggleDocsPane();
+                }}
+              >
+                <FileText className="w-4 h-4" />
+              </button>
+            )}
+            <div className="card-overlay-cards-wrap" ref={cardsWrapRef}>
             <button
               className={`card-overlay-cards-btn ${cardsOpen ? "active" : ""}`}
               type="button"
@@ -210,20 +333,7 @@ export function CardOverlay({
               <div className="card-overlay-cards-menu" ref={cardsMenuRef}>
                 <div className="card-overlay-cards-menu-row">
                   <button
-                    className="canvas-dock-btn"
-                    type="button"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      const created = onCreateCard();
-                      setCardsOpen(false);
-                      if (created) onOpenCard(created);
-                    }}
-                  >
-                    + Card
-                  </button>
-                  <button
-                    className="canvas-dock-icon"
+                    className="canvas-dock-icon card-menu-btn"
                     type="button"
                     aria-label="Settings"
                     title="Settings"
@@ -234,7 +344,36 @@ export function CardOverlay({
                       onOpenSettings();
                     }}
                   >
-                    ⚙
+                    <Settings className="w-4 h-4" />
+                  </button>
+                  {isSplit ? (
+                    <button
+                      className="canvas-dock-icon card-menu-btn"
+                      type="button"
+                      aria-label="Swap panes"
+                      title="Swap panes"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setChatOnRight((v) => !v);
+                      }}
+                    >
+                      <ArrowLeftRight className="w-4 h-4" />
+                    </button>
+                  ) : null}
+                  <button
+                    className="canvas-dock-btn card-menu-btn btn-large-icon"
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      const created = onCreateCard();
+                      setCardsOpen(false);
+                      if (created) onOpenCard(created);
+                    }}
+                    title="Create new card"
+                  >
+                    <NewCardIcon className="w-7 h-7" />
                   </button>
                 </div>
                 <div className="canvas-chatlist" role="menu" aria-label="Cards">
@@ -255,63 +394,31 @@ export function CardOverlay({
                         }}
                         title={s.chat_id}
                       >
-                        {s.title || s.chat_id}
-                      </button>
-                      <button
-                        type="button"
-                        className={`canvas-chatlist-del ${confirmDeleteChatId === s.chat_id ? "confirm" : ""}`}
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          onDeleteChat(s.chat_id);
-                        }}
-                        title={
-                          confirmDeleteChatId === s.chat_id
-                            ? "Click again to confirm delete"
-                            : "Delete card"
-                        }
-                        aria-label={`Delete card ${s.chat_id}`}
-                      >
-                        {confirmDeleteChatId === s.chat_id ? "Del" : "×"}
+                        <span className="canvas-chatlist-item-text">{s.title || s.chat_id}</span>
+                        <button
+                          type="button"
+                          className={`canvas-chatlist-del ${confirmDeleteChatId === s.chat_id ? "confirm" : ""}`}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            onDeleteChat(s.chat_id);
+                          }}
+                          title={
+                            confirmDeleteChatId === s.chat_id
+                              ? "Click again to confirm delete"
+                              : "Delete card"
+                          }
+                          aria-label={`Delete card ${s.chat_id}`}
+                        >
+                          {confirmDeleteChatId === s.chat_id ? "Del" : <X className="w-3 h-3" />}
+                        </button>
                       </button>
                     </div>
                   ))}
                 </div>
               </div>
             ) : null}
-          </div>
-          <div className="chat-overlay-title card-overlay-title">{title}</div>
-          <div className="card-overlay-header-right">
-            <div className="card-overlay-actions">
-            <button
-              className={`card-overlay-chat-btn ${showChat ? "active" : ""}`}
-              onClick={toggleChatPane}
-              type="button"
-              aria-pressed={showChat}
-              title={showChat ? "Hide chat" : "Show chat"}
-            >
-              Chat
-            </button>
-            <button
-              className={`card-overlay-chat-btn ${showDocs ? "active" : ""}`}
-              onClick={toggleDocsPane}
-              type="button"
-              aria-pressed={showDocs}
-              title={showDocs ? "Hide documents" : "Show documents"}
-            >
-              Docs
-            </button>
-            {isSplit ? (
-              <button
-                className="card-overlay-swap-btn"
-                onClick={() => setChatOnRight((v) => !v)}
-                type="button"
-                title="Swap panes"
-                aria-label="Swap panes"
-              >
-                ⇄
-              </button>
-            ) : null}
+            </div>
             <button className="chat-overlay-close" onClick={onClose}>
               ×
             </button>

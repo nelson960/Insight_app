@@ -10,6 +10,7 @@ export type ChatMessage = {
   selection?: { text: string; file_id?: string; page?: number };
   focus_document_id?: string;
   sources?: any[];
+  created_at?: string;
 };
 
 type PersistedMessage = {
@@ -19,6 +20,11 @@ type PersistedMessage = {
   selection?: { text: string; file_id?: string; page?: number };
   focus_document_id?: string;
   sources?: any[];
+};
+
+export type ChatDraft = {
+  input: string;
+  attachments: string[];
 };
 
 export type ChatUiSnapshot = {
@@ -32,6 +38,7 @@ export type ChatUiSnapshot = {
 
 type ChatUiState = ChatUiSnapshot & {
   loadPromise?: Promise<void>;
+  draft?: ChatDraft;
 };
 
 type StreamIndexEntry = {
@@ -138,6 +145,7 @@ export async function ensureChatUiLoaded(chatId: string) {
           focus_document_id:
             typeof m.focus_document_id === "string" ? m.focus_document_id : undefined,
           sources: Array.isArray((m as any).sources) ? ((m as any).sources as any[]) : undefined,
+          created_at: typeof (m as any).created_at === "string" ? (m as any).created_at : undefined,
         }));
       }
     } catch {
@@ -314,4 +322,27 @@ async function ensureBridge() {
     });
   })();
   return bridgeInit;
+}
+
+// Draft management functions
+export function setChatDraft(chatId: string, draft: ChatDraft | null) {
+  if (!chatId) return;
+  const s = ensureState(chatId);
+  s.draft = draft ?? undefined;
+  emit(chatId);
+}
+
+export function getChatDraft(chatId: string): ChatDraft | null {
+  if (!chatId) return null;
+  const state = states.get(chatId);
+  return state?.draft ?? null;
+}
+
+export function clearChatDraft(chatId: string) {
+  if (!chatId) return;
+  const s = states.get(chatId);
+  if (s) {
+    s.draft = undefined;
+    emit(chatId);
+  }
 }

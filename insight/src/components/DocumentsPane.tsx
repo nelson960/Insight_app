@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { X, Check, Pencil, Search, Download } from "lucide-react";
 
 import { engine } from "../api/engine";
 import { DocEditor } from "../editor/DocEditor";
@@ -1224,7 +1225,7 @@ export function DocumentsPane({
                         });
                     }}
                   >
-                    {confirmDeleteFileId === f.file_id ? "Del" : "×"}
+                    {confirmDeleteFileId === f.file_id ? "Del" : <X className="w-2.5 h-2.5" strokeWidth={3} />}
                   </button>
                 ) : null}
               </div>
@@ -1372,7 +1373,7 @@ export function DocumentsPane({
 		                      });
 		                    }}
 			                  >
-			                    ⌕
+			                    <Search className="w-4 h-4" />
 			                  </button>
 
 		                  <div className="docs-reader-header-actions">
@@ -1385,7 +1386,7 @@ export function DocumentsPane({
 		                          title="Export"
 		                          onClick={() => setIsExportMenuOpen((prev) => !prev)}
 		                        >
-		                          ⤓
+		                          <Download className="w-4 h-4" />
 		                        </button>
 		                        {isExportMenuOpen ? (
 		                          <div className="docs-reader-export-menu" role="menu" aria-label="Export options">
@@ -1445,7 +1446,7 @@ export function DocumentsPane({
 		                        setIsEditing(true);
 		                      }}
 		                    >
-		                      <span className="docs-reader-edit-icon">{isEditing ? "✓" : "✎"}</span>
+		                      {isEditing ? <Check className="w-4 h-4" /> : <Pencil className="w-4 h-4" />}
 		                    </button>
 		                  </div>
 			                </div>

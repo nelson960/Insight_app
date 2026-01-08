@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Check, Copy, GitBranch, Square, X } from "lucide-react";
+import SendHorizontalIcon from "./icons/SendHorizontalIcon";
 import {
   cancelActiveStreamAndWait,
   engineCancel,
@@ -12,9 +14,12 @@ import { ChatMarkdown, ChatMarkdownStream } from "./ChatMarkdown";
 import {
   beginStreamTurn,
   cancelStreamTurn,
+  clearChatDraft,
   ensureChatUiLoaded,
+  getChatDraft,
   getChatUiSnapshot,
   rollbackStreamTurn,
+  setChatDraft,
   subscribeChatUi,
 } from "../state/chatUiStore";
 
@@ -165,6 +170,15 @@ export function ChatWindow({
   const isStreaming = chatUi.isStreaming;
   const activeRequestId = chatUi.activeRequestId;
 
+  // Track active streaming message content length for scroll updates
+  const activeStreamContentLen = (() => {
+    if (!activeRequestId) return 0;
+    const m = messages.find(
+      (x) => x.role === "assistant" && x.request_id === activeRequestId
+    );
+    return (m?.content ?? "").length;
+  })();
+
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -199,6 +213,12 @@ export function ChatWindow({
   const chatPopoverTimerRef = useRef<number | null>(null);
   const toastTimerRef = useRef<number | null>(null);
 
+  // Scroll state: stick-to-bottom pattern with refs
+  const stickToBottomRef = useRef<boolean>(true);
+  const programmaticScrollRef = useRef<boolean>(false);
+  const savedPositionsRef = useRef<Map<string, number>>(new Map());
+  const prevChatIdRef = useRef<string | null>(null);
+  const scrollSaveTimeoutRef = useRef<number | null>(null);
 
   const effectiveSelection = selection === undefined ? localSelection : selection;
 
@@ -210,6 +230,27 @@ export function ChatWindow({
   function clearSelectionValue() {
     if (selection === undefined) setLocalSelection(null);
     onClearSelection?.();
+  }
+
+  function handleInputChange(value: string) {
+    setInput(value);
+    if (chatId) {
+      setChatDraft(chatId, {
+        input: value,
+        attachments: attachedPaths,
+      });
+    }
+  }
+
+  function handleSetAttachments(paths: string[] | ((prev: string[]) => string[])) {
+    const newPaths = typeof paths === "function" ? paths(attachedPaths) : paths;
+    setAttachedPaths(paths);
+    if (chatId) {
+      setChatDraft(chatId, {
+        input: input,
+        attachments: newPaths,
+      });
+    }
   }
 
   function showToast(message: string) {
@@ -225,8 +266,131 @@ export function ChatWindow({
   useEffect(() => {
     return () => {
       if (toastTimerRef.current != null) window.clearTimeout(toastTimerRef.current);
+      if (scrollSaveTimeoutRef.current != null) window.clearTimeout(scrollSaveTimeoutRef.current);
     };
   }, []);
+
+  // Scroll helper functions
+  function isNearBottom(el: HTMLElement): boolean {
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    return distance <= 48;
+  }
+
+  function scrollToBottom() {
+    const el = messagesRef.current;
+    if (!el) return;
+
+    programmaticScrollRef.current = true;
+    el.scrollTop = el.scrollHeight; // browser clamps to max
+
+    requestAnimationFrame(() => {
+      programmaticScrollRef.current = false;
+    });
+  }
+
+  function saveScrollPosition(chatId: string) {
+    const messagesEl = messagesRef.current;
+    if (!messagesEl) return;
+    savedPositionsRef.current.set(chatId, messagesEl.scrollTop);
+
+    // Debounced save to sessionStorage
+    if (scrollSaveTimeoutRef.current != null) {
+      clearTimeout(scrollSaveTimeoutRef.current);
+    }
+    scrollSaveTimeoutRef.current = window.setTimeout(() => {
+      const data = Array.from(savedPositionsRef.current.entries());
+      sessionStorage.setItem('chat-scroll-positions', JSON.stringify(data));
+    }, 500);
+  }
+
+  // Fresh session detection and load saved positions on mount
+  useEffect(() => {
+    const hasSessionMarker = sessionStorage.getItem('insight-session-active');
+    if (!hasSessionMarker) {
+      // Fresh session: clear saved positions and set marker
+      savedPositionsRef.current.clear();
+      sessionStorage.setItem('insight-session-active', 'true');
+    } else {
+      // Existing session: load saved positions from sessionStorage
+      const stored = sessionStorage.getItem('chat-scroll-positions');
+      if (stored) {
+        try {
+          const data = JSON.parse(stored) as [string, number][];
+          savedPositionsRef.current = new Map<string, number>(data);
+        } catch {
+          // Invalid data, start fresh
+          console.warn('Failed to parse saved scroll positions');
+        }
+      }
+    }
+  }, []);
+
+  // Update scroll mode when streaming starts/ends
+
+  // User scroll handler - updates stickToBottomRef and saves position
+  useEffect(() => {
+    const messagesEl = messagesRef.current;
+    if (!messagesEl || !chatId) return;
+
+    const handleScroll = () => {
+      // Ignore scroll events triggered by our own scrollToBottom calls
+      if (programmaticScrollRef.current) return;
+
+      // Update stickToBottom based on whether user is near bottom
+      stickToBottomRef.current = isNearBottom(messagesEl);
+
+      // Always save current position (debounced happens inside saveScrollPosition)
+      saveScrollPosition(chatId);
+    };
+
+    messagesEl.addEventListener('scroll', handleScroll, { passive: true });
+    return () => {
+      messagesEl.removeEventListener('scroll', handleScroll);
+    };
+  }, [chatId]);
+
+  // Streaming auto-scroll: pin to bottom during streaming AND after it ends (final render/layout)
+  useLayoutEffect(() => {
+    if (!chatId) return;
+    if (!stickToBottomRef.current) return;
+
+    // Pin to bottom during streaming AND after it ends
+    scrollToBottom();
+  }, [chatId, isStreaming, activeStreamContentLen, messages.length]);
+
+  // ChatId switch: save old position, restore new position
+  useEffect(() => {
+    if (!chatId) return;
+
+    const prevChatId = prevChatIdRef.current;
+    if (prevChatId === chatId) return; // No change
+    prevChatIdRef.current = chatId;
+
+    const messagesEl = messagesRef.current;
+    if (!messagesEl) return;
+
+    // Save previous chat's position
+    if (prevChatId) {
+      savedPositionsRef.current.set(prevChatId, messagesEl.scrollTop);
+    }
+
+    // Restore new chat's position or scroll to bottom
+    const savedPos = savedPositionsRef.current.get(chatId);
+    if (savedPos !== undefined) {
+      // Restore saved position
+      requestAnimationFrame(() => {
+        const el = messagesRef.current;
+        if (el) {
+          el.scrollTop = savedPos;
+          stickToBottomRef.current = isNearBottom(el);
+        }
+      });
+    } else {
+      // No saved position: scroll to bottom and set stickToBottom
+      scrollToBottom();
+      stickToBottomRef.current = true;
+    }
+  }, [chatId]);
 
   useEffect(() => {
     function onFocusChat(e: Event) {
@@ -249,10 +413,6 @@ export function ChatWindow({
     el.style.height = `${next}px`;
     el.style.overflowY = el.scrollHeight > INPUT_MAX_HEIGHT_PX ? "auto" : "hidden";
   }
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
 
   useEffect(() => {
     if (!branchTarget) return;
@@ -398,8 +558,18 @@ export function ChatWindow({
     setIsSending(false);
 
     setChatUi(getChatUiSnapshot(chatId));
-    if (!chatId) {
+
+    // Restore draft when chatId changes
+    const draft = chatId ? getChatDraft(chatId) : null;
+    if (draft) {
+      setInput(draft.input);
+      setAttachedPaths(draft.attachments);
+    } else {
+      setInput("");
       setAttachedPaths([]);
+    }
+
+    if (!chatId) {
       setContextStatus(null);
       return;
     }
@@ -635,7 +805,7 @@ export function ChatWindow({
       }
 
       // Only attach; actual ingestion happens when user clicks Send (with query).
-      setAttachedPaths((prev) => {
+      handleSetAttachments((prev) => {
         const set = new Set(prev);
         for (const p of accepted) set.add(p);
         return Array.from(set);
@@ -646,7 +816,7 @@ export function ChatWindow({
   }
 
   function removeAttachment(path: string) {
-    setAttachedPaths((prev) => prev.filter((p) => p !== path));
+    handleSetAttachments((prev) => prev.filter((p) => p !== path));
   }
 
   async function sendMessage() {
@@ -707,6 +877,7 @@ export function ChatWindow({
 
     setInput("");
     setAttachedPaths([]);
+    clearChatDraft(chatId);
     setIngestProgress(null);
     // Selection is a one-shot context for this turn; clear the input-bar snippet after send.
     if (selectionPayload) clearSelectionValue();
@@ -926,6 +1097,10 @@ export function ChatWindow({
     setIngestProgress(null);
     setIsSending(false);
 
+    // Scroll to bottom and set stickToBottom to true
+    stickToBottomRef.current = true;
+    scrollToBottom();
+
     // Best-effort backend cancel (stops ASGI + llama.cpp compute).
     engineCancel(rid).catch(() => {});
   }
@@ -1081,17 +1256,17 @@ export function ChatWindow({
               </div>
             ) : null}
 
-            {m.role === "assistant" ? (
+            {m.role === "assistant" && !isStreaming ? (
               <div className="chat-message-actions" aria-label="Message actions">
                 <button
                   type="button"
                   className="chat-message-action chat-message-action-icon"
                   onClick={() => copyMessage(m)}
-                  disabled={!m.content || isStreaming}
+                  disabled={!m.content}
                   aria-label="Copy message"
                   title={copiedMessageId === m.id ? "Copied" : "Copy"}
                 >
-                  {copiedMessageId === m.id ? "✓" : "⧉"}
+                  {copiedMessageId === m.id ? <Check className="w-1 h-1" /> : <Copy className="w-1 h-1" />}
                 </button>
                 <button
                   type="button"
@@ -1101,11 +1276,11 @@ export function ChatWindow({
                     setBranchShareDocs(true);
                     setBranchTarget({ id: m.id, role: m.role, content: m.content });
                   }}
-                  disabled={!m.content || isStreaming}
+                  disabled={!m.content}
                   aria-label="Branch to new card"
                   title="Branch to a new card"
                 >
-                  ↗
+                  <GitBranch className="w-1 h-1" />
                 </button>
               </div>
             ) : null}
@@ -1196,7 +1371,7 @@ export function ChatWindow({
                   aria-label={`Remove attachment ${name}`}
                   title="Remove"
                 >
-                  ×
+                  <X className="w-3 h-3" />
                 </button>
               </div>
             );
@@ -1253,7 +1428,7 @@ export function ChatWindow({
                   clearSelectionValue();
                 }}
               >
-                ×
+                <X className="w-3 h-3" />
               </button>
             </div>
           ) : null}
@@ -1273,7 +1448,7 @@ export function ChatWindow({
               className="chat-input"
               placeholder="Ask Insight anything about your data…"
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => handleInputChange(e.target.value)}
               onKeyDown={handleKeyDown}
               rows={1}
               ref={inputElRef}
@@ -1281,6 +1456,17 @@ export function ChatWindow({
             />
           </div>
         </div>
+        <button
+          className="chat-send-btn"
+          onClick={isStreaming ? stopStreaming : sendMessage}
+          disabled={
+            !active ||
+            (isStreaming && !activeRequestId) ||
+            (!isStreaming && (isSending || !input.trim()))
+          }
+        >
+          {isStreaming ? <Square className="w-5 h-5" style={{ width: "18px", height: "18px" }} /> : <SendHorizontalIcon size={24} className="" />}
+        </button>
         <div className="chat-context-wrap">
           {contextStatus ? (
             (() => {
@@ -1357,17 +1543,6 @@ export function ChatWindow({
             </div>
           )}
         </div>
-        <button
-          className="chat-send-btn"
-          onClick={isStreaming ? stopStreaming : sendMessage}
-          disabled={
-            !active ||
-            (isStreaming && !activeRequestId) ||
-            (!isStreaming && (isSending || !input.trim()))
-          }
-        >
-          {isStreaming ? "Stop" : "Send"}
-        </button>
       </div>
     </div>
   );
