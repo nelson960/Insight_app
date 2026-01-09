@@ -42,10 +42,42 @@ class IngestionScheduler:
         raw = os.getenv(key)
         if raw is None:
             return int(default)
-        try:
-            return int(str(raw).strip())
-        except Exception:
+        text = str(raw).strip()
+        if not text:
             return int(default)
+        try:
+            return int(text)
+        except Exception:
+            pass
+        # Allow simple duration suffixes (e.g., "3m", "3minutes", "45s").
+        lowered = text.lower()
+        units = {
+            "seconds": 1,
+            "second": 1,
+            "secs": 1,
+            "sec": 1,
+            "s": 1,
+            "minutes": 60,
+            "minute": 60,
+            "mins": 60,
+            "min": 60,
+            "m": 60,
+            "hours": 3600,
+            "hour": 3600,
+            "hrs": 3600,
+            "hr": 3600,
+            "h": 3600,
+        }
+        for suffix, scale in sorted(units.items(), key=lambda item: -len(item[0])):
+            if lowered.endswith(suffix):
+                num = lowered[: -len(suffix)].strip()
+                if not num:
+                    break
+                try:
+                    return max(1, int(float(num) * scale))
+                except Exception:
+                    break
+        return int(default)
 
     @staticmethod
     def _parse_created_at(value: object) -> datetime | None:

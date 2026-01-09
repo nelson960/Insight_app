@@ -49,6 +49,7 @@ def rg_search(
         _rg_binary(),
         "--json",
         "--no-config",
+        "--smart-case",
         "--hidden",
         "--no-heading",
         "--max-count",
@@ -129,6 +130,13 @@ def read_raw_window(
                     break
                 out_lines.append(raw.rstrip("\n"))
     except Exception:
+        logger.warning(
+            "read_raw_window failed path=%s lines=%s-%s",
+            path,
+            line_start,
+            line_end,
+            exc_info=True,
+        )
         return ""
     return "\n".join(out_lines).strip()
 

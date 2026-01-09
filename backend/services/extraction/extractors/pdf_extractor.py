@@ -124,7 +124,79 @@ def _render_line_text(line: dict[str, Any]) -> str:
     return text.strip("\n")
 
 
-def _sort_text_blocks(blocks: list[dict[str, Any]], *, page_width: float) -> list[dict[str, Any]]:
+def _block_bbox(block: dict[str, Any]) -> tuple[float, float, float, float]:
+    bbox = block.get("bbox") or (0, 0, 0, 0)
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+
+
+def _block_text_lines(block: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for line in block.get("lines") or []:
+        if not isinstance(line, dict):
+            continue
+        rendered = _render_line_text(line).strip()
+        if rendered:
+            lines.append(rendered)
+    return lines
+
+
+def _looks_like_page_number(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.strip().lower()
+    if re.match(r"^(page\s*)?\d+(\s*/\s*\d+)?$", lower):
+        return True
+    if re.match(r"^(page\s*)?[ivxlcdm]+$", lower):
+        return True
+    return False
+
+
+def _is_header_footer_noise(lines: list[str], *, y0: float, y1: float, page_height: float) -> bool:
+    if not lines or page_height <= 0:
+        return False
+    joined = " ".join(ln.strip() for ln in lines if ln.strip()).strip()
+    if not joined:
+        return False
+    if len(joined) > 60:
+        return False
+    top_zone = page_height * 0.06
+    bottom_zone = page_height * 0.94
+    if y1 <= top_zone or y0 >= bottom_zone:
+        return _looks_like_page_number(joined)
+    return False
+
+
+def _column_splits(blocks: list[dict[str, Any]], *, page_width: float) -> list[float]:
+    if page_width <= 0:
+        return []
+    xs: list[float] = []
+    for b in blocks:
+        x0, _, x1, _ = _block_bbox(b)
+        if x1 - x0 <= page_width * 0.8:
+            xs.append(x0)
+    xs.sort()
+    if len(xs) < 2:
+        return []
+    threshold = max(24.0, page_width * 0.18)
+    splits: list[float] = []
+    for i in range(len(xs) - 1):
+        gap = xs[i + 1] - xs[i]
+        if gap > threshold:
+            splits.append((xs[i] + xs[i + 1]) / 2.0)
+    if not splits:
+        return []
+    splits = sorted(set(splits))[:3]
+    return splits
+
+
+def _sort_text_blocks(
+    blocks: list[dict[str, Any]],
+    *,
+    page_width: float,
+    page_height: float,
+) -> list[dict[str, Any]]:
     """
     Sort blocks into a best-effort reading order.
 
@@ -135,20 +207,51 @@ def _sort_text_blocks(blocks: list[dict[str, Any]], *, page_width: float) -> lis
         return []
 
     def key_xy(b: dict[str, Any]) -> tuple[float, float]:
-        bbox = b.get("bbox") or (0, 0, 0, 0)
-        return (float(bbox[1]), float(bbox[0]))
+        x0, y0, _, _ = _block_bbox(b)
+        return (y0, x0)
 
-    xs = sorted(float((b.get("bbox") or (0, 0, 0, 0))[0]) for b in blocks)
-    if len(xs) >= 2 and page_width > 0:
-        gaps = [(xs[i + 1] - xs[i], i) for i in range(len(xs) - 1)]
-        max_gap, max_idx = max(gaps, key=lambda t: t[0])
-        if max_gap > page_width * 0.25:
-            split_x = (xs[max_idx] + xs[max_idx + 1]) / 2.0
-            left = [b for b in blocks if float((b.get("bbox") or (0, 0, 0, 0))[0]) <= split_x]
-            right = [b for b in blocks if float((b.get("bbox") or (0, 0, 0, 0))[0]) > split_x]
-            return sorted(left, key=key_xy) + sorted(right, key=key_xy)
+    filtered: list[dict[str, Any]] = []
+    for b in blocks:
+        _, y0, _, y1 = _block_bbox(b)
+        lines = _block_text_lines(b)
+        if _is_header_footer_noise(lines, y0=y0, y1=y1, page_height=page_height):
+            continue
+        filtered.append(b)
+    if filtered:
+        blocks = filtered
 
-    return sorted(blocks, key=key_xy)
+    splits = _column_splits(blocks, page_width=page_width)
+    if not splits:
+        return sorted(blocks, key=key_xy)
+
+    groups: list[list[dict[str, Any]]] = [[] for _ in range(len(splits) + 1)]
+    for b in blocks:
+        x0, y0, x1, _ = _block_bbox(b)
+        idx = 0
+        while idx < len(splits) and x0 > splits[idx]:
+            idx += 1
+        groups[idx].append(b)
+
+    groups = [sorted(g, key=key_xy) for g in groups if g]
+    if not groups:
+        return sorted(blocks, key=key_xy)
+
+    top_spanners: list[dict[str, Any]] = []
+    if len(groups) > 1 and page_width > 0 and page_height > 0:
+        for g in groups:
+            for b in list(g):
+                x0, y0, x1, y1 = _block_bbox(b)
+                if (x1 - x0) >= page_width * 0.75 and y1 <= page_height * 0.18:
+                    top_spanners.append(b)
+                    g.remove(b)
+        top_spanners.sort(key=key_xy)
+
+    ordered: list[dict[str, Any]] = []
+    if top_spanners:
+        ordered.extend(top_spanners)
+    for g in groups:
+        ordered.extend(g)
+    return ordered
 
 
 def _heading_level(max_size: float, median_size: float) -> int:
@@ -327,7 +430,11 @@ class PDFExtractor(SimpleExtractor):
                     span_sizes.extend(list(_iter_span_sizes(b)))
 
                 median_size = float(statistics.median(span_sizes)) if span_sizes else 11.0
-                ordered_blocks = _sort_text_blocks(text_blocks, page_width=float(getattr(page.rect, "width", 0) or 0))
+                ordered_blocks = _sort_text_blocks(
+                    text_blocks,
+                    page_width=float(getattr(page.rect, "width", 0) or 0),
+                    page_height=float(getattr(page.rect, "height", 0) or 0),
+                )
                 page_toc = toc_by_page.get(page_num, [])
 
                 page_text_parts: list[str] = []

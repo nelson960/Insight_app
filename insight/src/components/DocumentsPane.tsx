@@ -41,6 +41,7 @@ type Props = {
   onActiveFileIdChange?: (fileId: string | null) => void;
   onSelectionChange?: (sel: { file_id: string; text: string } | null) => void;
   onAskSelection?: () => void;
+  onRequireModel?: () => Promise<boolean>;
 };
 
 function formatBytes(n: number) {
@@ -288,6 +289,7 @@ export function DocumentsPane({
   onActiveFileIdChange,
   onSelectionChange,
   onAskSelection,
+  onRequireModel,
 }: Props) {
   const [files, setFiles] = useState<ChatFile[]>([]);
   const [pendingUploads, setPendingUploads] = useState<string[]>([]);
@@ -593,6 +595,10 @@ export function DocumentsPane({
   async function ingestDroppedPaths(paths: string[]) {
     if (!paths.length) return;
     if (ingestInFlightRef.current) return;
+    if (onRequireModel) {
+      const ok = await onRequireModel();
+      if (!ok) return;
+    }
     ingestInFlightRef.current = true;
     setPendingUploads(
       paths

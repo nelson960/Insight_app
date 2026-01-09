@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Dict, Optional
 
 _emit: Optional[Callable[[Dict[str, Any]], None]] = None
+logger = logging.getLogger(__name__)
 
 
 def set_ipc_emitter(fn: Optional[Callable[[Dict[str, Any]], None]]) -> None:
@@ -41,4 +43,5 @@ def emit_event(name: str, **payload: Any) -> None:
         fn(obj)
     except Exception:
         # Never let event emission break core flows.
+        logger.warning("IPC event emission failed name=%s", name, exc_info=True)
         return

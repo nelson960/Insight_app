@@ -77,6 +77,7 @@ APP = create_app()
 _IPC_ALLOWED_ENDPOINTS: Dict[str, List[str]] = {
     "GET": [
         "/settings",
+        "/settings/health",
         "/settings/llm/info",
         "/settings/busy",
         "/settings/storage",
@@ -98,6 +99,7 @@ _IPC_ALLOWED_ENDPOINTS: Dict[str, List[str]] = {
         "/settings",
         "/settings/model/validate",
         "/settings/llm/apply",
+        "/settings/embedding/download",
         "/settings/storage/clean_cache",
         "/settings/storage/reset",
         "/settings/index/repair",
@@ -643,6 +645,16 @@ async def main_async() -> None:
         set_ipc_emitter(manager.writer.emit)
     except Exception:
         pass
+
+    # Emit startup health report once (for UI startup modal).
+    try:
+        from backend.services.health import run_startup_health  # local import
+        from backend.services.ipc_events import emit_event  # local import
+
+        report = run_startup_health()
+        emit_event("startup_health", report=report)
+    except Exception:
+        logger.warning("Startup health check failed", exc_info=True)
 
     # Bridge stdin (thread) -> async dispatcher.
     # Use a bounded channel to avoid unbounded buffering if Rust sends fast.

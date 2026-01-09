@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 class LlamaSessionManager:
     _PROMPT_RENDERER_LLAMA3 = "llama3_manual_v2"
     _PROMPT_RENDERER_CHATML = "chatml_manual_v1"
+    _PROMPT_RENDERER_UNKNOWN = "unsupported"
     _PROMPT_RENDERER_ID = _PROMPT_RENDERER_LLAMA3
     _PERSIST_DEBOUNCE_SEC = 0.75
     _SNAPSHOT_DEBOUNCE_SEC = 0.35
@@ -91,6 +92,11 @@ class LlamaSessionManager:
         # This must happen after model load (so `llm.metadata` exists) and before
         # we compute model_info() (which surfaces the selected renderer).
         self._PROMPT_RENDERER_ID = self._detect_prompt_renderer_id()
+        if self._PROMPT_RENDERER_ID == self._PROMPT_RENDERER_UNKNOWN:
+            raise ValueError(
+                "Unsupported chat template for this model. "
+                "Please choose a GGUF with a known chat template (Llama-3 or Qwen/ChatML)."
+            )
 
         self._model_info = self._build_model_info()
         try:
@@ -265,19 +271,15 @@ class LlamaSessionManager:
         except Exception:
             meta = {}
         try:
-            arch = str(meta.get("general.architecture") or "")
-        except Exception:
-            arch = ""
-        try:
             template = str(meta.get("tokenizer.chat_template") or "")
         except Exception:
             template = ""
 
         if "<|im_start|>" in template and "<|im_end|>" in template:
             return self._PROMPT_RENDERER_CHATML
-        if arch.lower().startswith("qwen"):
-            return self._PROMPT_RENDERER_CHATML
-        return self._PROMPT_RENDERER_LLAMA3
+        if "<|start_header_id|>" in template and "<|eot_id|>" in template:
+            return self._PROMPT_RENDERER_LLAMA3
+        return self._PROMPT_RENDERER_UNKNOWN
 
     def cancel_request(self, request_id: str) -> bool:
         """
@@ -1303,6 +1305,8 @@ class LlamaSessionManager:
         renderer = str(getattr(self, "_PROMPT_RENDERER_ID", "") or self._PROMPT_RENDERER_LLAMA3)
         if renderer == self._PROMPT_RENDERER_CHATML:
             return self._render_chatml_prompt(messages, add_generation_prompt=add_generation_prompt)
+        if renderer == self._PROMPT_RENDERER_UNKNOWN:
+            raise ValueError("Unsupported chat template for this model.")
         return self._render_llama3_prompt(messages, add_generation_prompt=add_generation_prompt)
 
     def _stop_markers(self) -> List[str]:
@@ -1791,6 +1795,38 @@ class LlamaSessionManager:
     def _load_persisted_sessions(self) -> None:
         if not self.persist_dir or not self.persist_dir.exists():
             return
+        # Drop orphaned session metadata (e.g., crash mid-snapshot left .json/.meta without .kv).
+        try:
+            kv_ids = {p.stem for p in self.persist_dir.glob("*.kv")}
+            msg_ids: set[str] = set()
+            meta_ids: set[str] = set()
+            for p in self.persist_dir.iterdir():
+                if not p.is_file():
+                    continue
+                name = p.name
+                if name.endswith(".meta.json"):
+                    sid = name[: -len(".meta.json")]
+                    if sid:
+                        meta_ids.add(sid)
+                    continue
+                if name.endswith(".json"):
+                    sid = name[: -len(".json")]
+                    if sid:
+                        msg_ids.add(sid)
+            orphan_ids = (msg_ids | meta_ids) - kv_ids
+            for session_id in orphan_ids:
+                for suffix in (".json", ".meta.json"):
+                    path = self.persist_dir / f"{session_id}{suffix}"
+                    if path.exists():
+                        try:
+                            path.unlink()
+                        except Exception:
+                            pass
+                logger.warning(
+                    "Dropped orphan session metadata for %s (missing .kv snapshot)", session_id
+                )
+        except Exception as exc:
+            logger.debug("Failed to reconcile persisted session files: %s", exc)
         # Load .kv state + .json messages + optional .meta.json.
         #
         # Security note: historically we pickled the state object into `.kv`. Pickle is unsafe
@@ -1865,6 +1901,7 @@ class LlamaSessionManager:
                 self.sessions[session_id] = session_payload
                 self._locks.setdefault(session_id, threading.RLock())
             except Exception:
+                logger.warning("Failed to load persisted session from %s", path, exc_info=True)
                 continue
 
     def _start_persist_worker(self) -> None:
@@ -2661,10 +2698,9 @@ class LlamaSessionManager:
             # Push summary into LTM store (async) if available
             if self.ltm_store:
                 try:
-                    payload = f"[chat:{session_id}] {summary_text}"
                     threading.Thread(
                         target=self.ltm_store.save_memories,
-                        args=(session_id, [payload]),
+                        args=(session_id, [summary_text]),
                         daemon=True,
                     ).start()
                 except Exception as exc:

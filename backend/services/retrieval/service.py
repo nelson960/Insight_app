@@ -123,6 +123,7 @@ class RetrievalService:
         try:
             out = self._metadata_store.fetch_chunks_for_files(file_ids, limit_per_file=limit_per_file)
         except Exception:
+            logger.warning("fetch_chunks_for_files failed", exc_info=True)
             out = {fid: [] for fid in file_ids}
 
         # Enrich with filename (best-effort) for UI/debug consumers.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -55,6 +56,21 @@ def _upload_size_bytes(upload: UploadFile) -> int:
         return max(0, size)
     except Exception:
         return 0
+
+
+async def _stream_upload_to_cache(upload: UploadFile, dest_path: Path) -> tuple[str, int]:
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    hasher = hashlib.sha256()
+    size_bytes = 0
+    with dest_path.open("wb") as f:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            hasher.update(chunk)
+            size_bytes += len(chunk)
+    return hasher.hexdigest(), size_bytes
 
 
 def _guess_mime_from_suffix(filename: str) -> str:
@@ -165,27 +181,29 @@ async def upload_files(
     stored_files = []
     for upload in files:
         suffix = Path(upload.filename).suffix
-        content = await upload.read()
-        hash_value = hashlib.sha256(content).hexdigest()
+        temp_path = workspace.cache / f"upload_{uuid.uuid4().hex}{suffix or '.tmp'}"
+        hash_value, size_bytes = await _stream_upload_to_cache(upload, temp_path)
         file_id = f"file_{hash_value}"
         enc_path = workspace.uploads / f"{file_id}.enc"
+        cache_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
+        if temp_path != cache_path:
+            try:
+                temp_path.replace(cache_path)
+            except Exception:
+                cache_path.write_bytes(temp_path.read_bytes())
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
         logger.info("Encrypting upload %s as %s", upload.filename, enc_path.name)
-        enc_path.write_bytes(encrypt_bytes(key, content))
-        size_bytes = len(content)
+        enc_path.write_bytes(encrypt_bytes(key, cache_path.read_bytes()))
         is_large = _is_large_for_chat(size_bytes)
         if is_large:
             mime = (upload.content_type or "").strip() or _guess_mime_from_suffix(upload.filename)
             # Path B ("raw_large") needs a plaintext file on disk for rg_search + window reads.
             # Store a cache copy keyed by file_id so it can be cleaned up with the rest of cache.
-            try:
-                cache_path = workspace.cache / f"{file_id}{suffix or '.txt'}"
-                cache_path.write_bytes(content)
-            except Exception:
-                pass
         else:
-            temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
-            temp_path.write_bytes(content)
-            mime = detect_mime_type(temp_path)
+            mime = detect_mime_type(cache_path)
         logger.info("Registering file %s (%s)", file_id, upload.filename)
         metadata_store.register_file(
             file_id=file_id,
@@ -217,10 +235,9 @@ async def upload_files(
             stored_files.append({"file_id": file_id, "filename": upload.filename, "job_id": "raw_large"})
             continue
 
-        temp_path = workspace.cache / f"{file_id}{suffix or '.tmp'}"
         request = IngestionRequest(
             file_id=file_id,
-            source_path=str(temp_path),
+            source_path=str(cache_path),
             filename=upload.filename,
             mime=mime,
             size_bytes=size_bytes,
@@ -230,7 +247,7 @@ async def upload_files(
             user_id=user_id or "default",
             chat_id=chat_id,
             source="upload",
-            cleanup_path=str(temp_path),
+            cleanup_path=str(cache_path),
         )
         job_id = scheduler.schedule(request)
         logger.info("Queued ingestion job %s for %s", job_id, file_id)

@@ -230,6 +230,10 @@ class DocSearchService:
         blocks = _build_indexed_blocks(doc)
         index = _DocIndex(updated_at=updated_at, blocks=blocks)
         with self._lock:
+            existing = self._cache.get(file_id)
+            if existing and existing.updated_at == updated_at:
+                self._cache.move_to_end(file_id, last=True)
+                return existing
             self._cache[file_id] = index
             self._cache.move_to_end(file_id, last=True)
             while len(self._cache) > self._max_cached_files:
@@ -239,4 +243,3 @@ class DocSearchService:
 
 
 __all__ = ["DocSearchMatch", "DocSearchService"]
-

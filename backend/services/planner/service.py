@@ -19,10 +19,10 @@ class PlannerService:
             chat_id=request.chat_id,
             user_message=request.query,
             documents=request.documents or [],
-            attachments=getattr(request, "attachments", []) or [],
-            focus_document_id=getattr(request, "focus_document_id", None),
-            doc_pane_open=getattr(request, "doc_pane_open", None),
-            selection=getattr(request, "selection", None),
+            attachments=request.attachments or [],
+            focus_document_id=request.focus_document_id,
+            doc_pane_open=request.doc_pane_open,
+            selection=request.selection,
         )
         return PlannerResult(
             answer=reply,
@@ -38,11 +38,11 @@ class PlannerService:
             chat_id=request.chat_id,
             user_message=request.query,
             documents=request.documents or [],
-            attachments=getattr(request, "attachments", []) or [],
-            focus_document_id=getattr(request, "focus_document_id", None),
-            doc_pane_open=getattr(request, "doc_pane_open", None),
-            selection=getattr(request, "selection", None),
-            request_id=getattr(request, "request_id", None),
+            attachments=request.attachments or [],
+            focus_document_id=request.focus_document_id,
+            doc_pane_open=request.doc_pane_open,
+            selection=request.selection,
+            request_id=request.request_id,
         )
 
 

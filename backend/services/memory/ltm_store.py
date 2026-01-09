@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -35,6 +36,7 @@ class LongTermMemoryStore:
         self._embedder = embedder
         self._memories: List[Dict[str, Any]] = []  # in-memory list of {chat_id, text, embedding, type}
         self._summaries: Dict[str, str] = {}
+        self._max_memories_per_chat = 5
 
     def retrieve(self, chat_id: str, query: str, *, top_k: int = 5) -> List[MemoryHit]:
         if not self._embedder:
@@ -58,6 +60,7 @@ class LongTermMemoryStore:
     def save_memories(self, chat_id: str, texts: List[str]) -> None:
         if not self._embedder:
             return
+        now = int(time.time())
         for text in texts:
             if not text:
                 continue
@@ -68,8 +71,10 @@ class LongTermMemoryStore:
                     "text": text,
                     "embedding": emb,
                     "type": "memory",
+                    "created_at": now,
                 }
             )
+        self._prune_memories(chat_id)
 
     def update_conv_summary(self, chat_id: str, summary_text: str) -> None:
         if summary_text:
@@ -80,6 +85,16 @@ class LongTermMemoryStore:
         self._memories = [m for m in self._memories if m.get("chat_id") != chat_id]
         if chat_id in self._summaries:
             self._summaries.pop(chat_id, None)
+
+    def _prune_memories(self, chat_id: str) -> None:
+        if self._max_memories_per_chat <= 0:
+            return
+        memories = [m for m in self._memories if m.get("chat_id") == chat_id]
+        if len(memories) <= self._max_memories_per_chat:
+            return
+        memories.sort(key=lambda m: m.get("created_at") or 0)
+        keep_ids = set(id(m) for m in memories[-self._max_memories_per_chat :])
+        self._memories = [m for m in self._memories if id(m) in keep_ids or m.get("chat_id") != chat_id]
 
 
 __all__ = ["LongTermMemoryStore", "MemoryHit"]

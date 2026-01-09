@@ -352,7 +352,10 @@ def list_sessions():
 
 @router.get("/context/{chat_id}")
 def context_status(chat_id: str):
-    mgr = AppDependencies.session_manager()
+    try:
+        mgr = AppDependencies.session_manager()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     try:
         status = mgr.get_context_status(chat_id)
     except ValueError:

@@ -9,6 +9,11 @@ import { useSessions } from "./state/useSessions";
 import { engine } from "./api/engine";
 import { setTheme as setAppTheme } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
+import {
+  StartupHealthModal,
+  HealthReport,
+} from "./components/StartupHealthModal";
 
 const NOTES_STORAGE_KEY = "insight.canvas.notes.v1";
 const LINKS_STORAGE_KEY = "insight.canvas.links.v1";
@@ -138,11 +143,44 @@ function App() {
   const [links, setLinks] = useState<CanvasLink[]>([]);
   const [overlayChatId, setOverlayChatId] = useState<string | null>(null);
   const [overlayCardId, setOverlayCardId] = useState<string | null>(null);
+  const [overlayChatClosing, setOverlayChatClosing] = useState(false);
+  const [overlayCardClosing, setOverlayCardClosing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>("system");
   const [confirmDeleteChatId, setConfirmDeleteChatId] = useState<string | null>(
     null
   );
+  const [startupHealth, setStartupHealth] = useState<HealthReport | null>(null);
+  const [startupHealthOpen, setStartupHealthOpen] = useState(false);
+
+  const pickBlockingHealthIssues = useCallback((report?: HealthReport | null) => {
+    if (!report) return null;
+    const blockingCodes = new Set([
+      "model_not_configured",
+      "model_missing",
+      "model_not_file",
+      "model_wrong_extension",
+      "model_invalid",
+      "embedding_missing",
+      "embedding_downloading",
+      "embedding_download_failed",
+    ]);
+    const issues = Array.isArray(report.issues)
+      ? report.issues.filter((issue) => blockingCodes.has(issue.code))
+      : [];
+    if (!issues.length) return null;
+    return { ...report, ok: false, issues };
+  }, []);
+
+  const ensureModelReady = useCallback(async () => {
+    const res = await engine<HealthReport>("/settings/health", undefined, "GET");
+    if (!res.ok) return true;
+    const trimmed = pickBlockingHealthIssues(res.data as any);
+    if (!trimmed) return true;
+    setStartupHealth(trimmed);
+    setStartupHealthOpen(true);
+    return false;
+  }, [pickBlockingHealthIssues]);
 
   // Load persisted app settings (theme) from backend.
   useEffect(() => {
@@ -161,6 +199,39 @@ function App() {
     })();
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  // Startup health checks (model/config validation).
+  useEffect(() => {
+    let cancelled = false;
+    const handleReport = (report?: HealthReport | null) => {
+      if (cancelled) return;
+      const trimmed = pickBlockingHealthIssues(report);
+      if (!trimmed) {
+        setStartupHealth(null);
+        setStartupHealthOpen(false);
+        return;
+      }
+      setStartupHealth(trimmed);
+      setStartupHealthOpen(true);
+    };
+
+    (async () => {
+      const res = await engine<HealthReport>("/settings/health", undefined, "GET");
+      if (!res.ok || cancelled) return;
+      handleReport(res.data as any);
+    })();
+
+    const unlistenPromise = listen<{ report?: HealthReport }>("engine-event", (event) => {
+      const payload = event.payload as any;
+      if (payload?.name !== "startup_health") return;
+      handleReport(payload?.report || payload);
+    });
+
+    return () => {
+      cancelled = true;
+      unlistenPromise.then((unsub) => unsub()).catch(() => {});
     };
   }, []);
 
@@ -257,15 +328,37 @@ function App() {
   }
 
   function closeOverlay() {
-    setOverlayChatId(null);
+    if (!overlayChatId) return;
+    setOverlayChatClosing(true);
+    window.setTimeout(() => {
+      setOverlayChatId(null);
+      setOverlayChatClosing(false);
+    }, 240);
   }
+
+  function closeOverlayCard() {
+    if (!overlayCardId) return;
+    setOverlayCardClosing(true);
+    window.setTimeout(() => {
+      setOverlayCardId(null);
+      setOverlayCardClosing(false);
+    }, 240);
+  }
+
+  useEffect(() => {
+    if (overlayChatId) setOverlayChatClosing(false);
+  }, [overlayChatId]);
+
+  useEffect(() => {
+    if (overlayCardId) setOverlayCardClosing(false);
+  }, [overlayCardId]);
 
   useEffect(() => {
     if (!overlayChatId && !overlayCardId) return;
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === "Escape") {
-        setOverlayChatId(null);
-        setOverlayCardId(null);
+        closeOverlay();
+        closeOverlayCard();
         setSettingsOpen(false);
       }
     }
@@ -574,12 +667,14 @@ function App() {
             onOpenChat={(chatId) => {
               setActiveChat(chatId);
               setOverlayChatId(chatId);
+              setOverlayChatClosing(false);
               setOverlayCardId(null);
             }}
             onCreateChatAt={createChatCardAt}
             onOpenCard={(chatId) => {
               setActiveChat(chatId);
               setOverlayCardId(chatId);
+              setOverlayCardClosing(false);
               setOverlayChatId(null);
             }}
             onOpenSettings={() => setSettingsOpen(true)}
@@ -596,8 +691,16 @@ function App() {
             themeMode={themeMode}
             onThemeModeChange={(mode) => setThemeMode(mode)}
           />
+          <StartupHealthModal
+            open={startupHealthOpen}
+            report={startupHealth}
+            onOpenSettings={() => {
+              setStartupHealthOpen(false);
+              setSettingsOpen(true);
+            }}
+          />
           {overlayCardId ? (
-            <OverlayBoundary title="Card UI crashed" onClose={() => setOverlayCardId(null)}>
+            <OverlayBoundary title="Card UI crashed" onClose={closeOverlayCard}>
               {(() => {
                 const note = notes.find((n) => n.chatId === overlayCardId);
                 const layout = note?.layout ?? DEFAULT_CARD_LAYOUT;
@@ -610,7 +713,8 @@ function App() {
                       overlayCardId
                     }
                     chatId={overlayCardId}
-                    onClose={() => setOverlayCardId(null)}
+                    onClose={closeOverlayCard}
+                    closing={overlayCardClosing}
                     initialLayout={layout}
                     onLayoutChange={handleOverlayLayoutChange}
                     onTitleChange={handleOverlayTitleChange}
@@ -619,6 +723,7 @@ function App() {
                     onOpenCard={(chatId) => {
                       setActiveChat(chatId);
                       setOverlayCardId(chatId);
+                      setOverlayCardClosing(false);
                       setOverlayChatId(null);
                     }}
                     onCreateCard={() => {
@@ -633,6 +738,7 @@ function App() {
                     onOpenSettings={() => setSettingsOpen(true)}
                     onDeleteChat={deleteChat}
                     confirmDeleteChatId={confirmDeleteChatId}
+                    onRequireModel={ensureModelReady}
                   />
                 );
               })()}
@@ -641,6 +747,7 @@ function App() {
           {overlayChatId ? (
             <div
               className="chat-overlay"
+              data-state={overlayChatClosing ? "closing" : "open"}
               role="dialog"
               aria-modal="true"
               aria-label="Chat"
@@ -679,6 +786,7 @@ function App() {
                       embedded={false}
                       showTopbar={false}
                       docsVisible={false}
+                      onRequireModel={ensureModelReady}
                     />
                   </OverlayBoundary>
                 </div>

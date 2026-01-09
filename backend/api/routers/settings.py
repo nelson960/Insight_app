@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -10,6 +11,14 @@ from fastapi import APIRouter, Body, HTTPException
 from backend.api.deps import AppDependencies
 from backend.core.workspace import get_workspace
 from backend.services.retrieval.index_maintenance import validate_file_index, repair_file_index
+from backend.services.health import run_startup_health
+from backend.services.connectors.nomic import (
+    MissingDependencyError,
+    ensure_local_nomic_model_files,
+    get_download_state,
+    set_download_state,
+)
+from backend.services.connectors.nomic_onnx import NomicOnnxConfig
 from backend.services.storage import SQLiteConfig, create_sqlite_store
 
 
@@ -165,6 +174,43 @@ def busy_state() -> Dict[str, Any]:
     return AppDependencies.busy_state()
 
 
+@router.get("/health")
+def health_state() -> Dict[str, Any]:
+    """
+    Lightweight startup checks for the desktop UI.
+    """
+    return run_startup_health()
+
+
+@router.post("/embedding/download")
+def download_embedding_model() -> Dict[str, Any]:
+    _require_idle("download embedding model")
+    model_dir = AppDependencies.nomic_model_dir()
+    model_dir.mkdir(parents=True, exist_ok=True)
+    cfg = NomicOnnxConfig()
+    required = [cfg.model_filename, "tokenizer.json"]
+    missing = [p for p in required if not (model_dir / p).exists()]
+    if not missing:
+        set_download_state("ready")
+        return {"ok": True, "downloaded": False, "path": str(model_dir), "status": "ready"}
+    state = get_download_state()
+    if state.get("status") == "downloading":
+        return {"ok": True, "downloaded": False, "path": str(model_dir), "status": "downloading"}
+
+    def _run_download() -> None:
+        try:
+            ensure_local_nomic_model_files(model_dir, required_paths=required)
+        except MissingDependencyError as exc:
+            set_download_state("error", str(exc))
+        except Exception as exc:
+            set_download_state("error", str(exc))
+
+    set_download_state("downloading")
+    t = threading.Thread(target=_run_download, daemon=True)
+    t.start()
+    return {"ok": True, "downloaded": False, "path": str(model_dir), "status": "downloading"}
+
+
 @router.post("")
 def set_settings(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """
@@ -274,7 +320,7 @@ def apply_llm_settings(payload: Dict[str, Any] = Body(default={})) -> Dict[str, 
     ws_base = Path(AppDependencies.workspace().base)
 
     # Reset all user data (closes Qdrant/SQLite first).
-    AppDependencies.reset_all(confirm=True)
+    AppDependencies.reset_all(confirm=True, keep_em_models=True)
 
     # Recreate a fresh DB and restore only app settings. Do not open local Qdrant here
     # (it is expensive and can hold locks until the engine restarts).
@@ -402,7 +448,8 @@ def reset_storage(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
 
     try:
         _require_idle("reset")
-        AppDependencies.reset_all(confirm=True)
+        AppDependencies.reset_all(confirm=True, keep_em_models=False)
+        set_download_state("idle")
         return {"ok": True, "restart_required": True}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}

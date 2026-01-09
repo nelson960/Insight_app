@@ -154,7 +154,14 @@ class RawLargeAgentLoop:
             return cache_path
 
         stored_path = str(record.get("stored_path") or "")
-        is_encrypted = bool(int(record.get("is_encrypted") or 0)) if record.get("is_encrypted") is not None else False
+        is_encrypted_raw = record.get("is_encrypted")
+        if is_encrypted_raw is None:
+            is_encrypted = False
+        else:
+            try:
+                is_encrypted = bool(int(is_encrypted_raw))
+            except (ValueError, TypeError):
+                is_encrypted = False
         if not stored_path or not is_encrypted:
             p = Path(stored_path)
             return p if p.exists() else None
@@ -183,13 +190,17 @@ class RawLargeAgentLoop:
 
         path = self._resolve_plaintext_path(file_id=file_id, record=rec)
         if not path:
-            logger.info("raw_large no plaintext path file_id=%s request_id=%s", file_id, request_id)
+            logger.warning("raw_large no plaintext path file_id=%s request_id=%s", file_id, request_id)
             return []
 
         terms = _extract_terms(query, limit=int(cfg.max_patterns))
         if not terms:
-            terms = [(query or "").strip()][:1]
+            query_clean = (query or "").strip()
+            terms = [query_clean] if query_clean else []
         terms = [t for t in terms if t]
+        if not terms:
+            logger.info("raw_large no searchable terms file_id=%s request_id=%s", file_id, request_id)
+            return []
 
         all_hits: list[tuple[int, str]] = []  # (line, text)
         for term in terms[: max(1, int(cfg.max_patterns))]:
@@ -267,4 +278,3 @@ class RawLargeAgentLoop:
 
 
 __all__ = ["RawLargeAgentConfig", "RawLargeAgentLoop"]
-

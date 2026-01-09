@@ -34,6 +34,7 @@ type Props = {
   onSetSelection?: (sel: { text: string; file_id?: string } | null) => void;
   onClearSelection?: () => void;
   onRequestDocsRefresh?: () => void;
+  onRequireModel?: () => Promise<boolean>;
 };
 
 type ContextStatus = {
@@ -164,6 +165,7 @@ export function ChatWindow({
   onSetSelection,
   onClearSelection,
   onRequestDocsRefresh,
+  onRequireModel,
 }: Props) {
   const [chatUi, setChatUi] = useState(() => getChatUiSnapshot(chatId));
   const messages = chatUi.messages;
@@ -720,6 +722,10 @@ export function ChatWindow({
       return;
     }
     if (isStreaming || !active) return;
+    if (onRequireModel) {
+      const ok = await onRequireModel();
+      if (!ok) return;
+    }
 
     const LARGE_MODE_THRESHOLD_BYTES = 5 * 1024 * 1024; // keep aligned with backend default (INSIGHT_MAX_MULTI_FILE_BYTES)
     const LARGE_MODE_ALLOWED_SUFFIXES = new Set([".txt", ".log", ".json"]);
@@ -826,6 +832,10 @@ export function ChatWindow({
       setError("Select or create a chat first.");
       return;
     }
+    if (onRequireModel) {
+      const ok = await onRequireModel();
+      if (!ok) return;
+    }
 
     const inputBeforeSend = input;
     const attachedBeforeSend = attachedPaths.slice();
@@ -856,7 +866,7 @@ export function ChatWindow({
 
     const attached = attachedPaths.slice();
     const attachedNames = attached.map(filenameFromPath);
-    const selectionPayload = effectiveSelection?.text
+    let selectionPayload = effectiveSelection?.text
       ? effectiveSelection.file_id
         ? { text: effectiveSelection.text, file_id: effectiveSelection.file_id }
         : { text: effectiveSelection.text }
@@ -944,6 +954,14 @@ export function ChatWindow({
             } catch {
               // ignore
             }
+          }
+        }
+
+        // If a stale selection from another file is still present, drop it for this turn.
+        if (selectionPayload && (selectionPayload as any).file_id) {
+          const selFile = String((selectionPayload as any).file_id || "");
+          if (selFile && !docIdsForTurn.includes(selFile)) {
+            selectionPayload = undefined;
           }
         }
       }

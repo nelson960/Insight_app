@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -28,6 +29,7 @@ class LtmQdrantStore:
         self._collection = collection
         self._embedder = embedder
         self._vector_size = None
+        self._max_memories_per_chat = 5
         self._ensure_collection()
 
     # ---- Public API ----
@@ -75,6 +77,7 @@ class LtmQdrantStore:
     def save_memories(self, chat_id: str, texts: List[str]) -> None:
         if not self._embedder:
             return
+        now = int(time.time())
         points = []
         for text in texts:
             if not text:
@@ -89,11 +92,13 @@ class LtmQdrantStore:
                         "chat_id": chat_id,
                         "type": "memory",
                         "text": text,
+                        "created_at": now,
                     },
                 )
             )
         if points:
             self._client.upsert(collection_name=self._collection, points=points)
+            self._prune_memories(chat_id)
 
     def update_conv_summary(self, chat_id: str, summary_text: str) -> None:
         if not self._embedder or not summary_text:
@@ -110,7 +115,7 @@ class LtmQdrantStore:
         try:
             self._client.delete(collection_name=self._collection, points_selector=qmodels.FilterSelector(filter=flt))
         except Exception:
-            pass
+            logger.warning("Failed to delete LTM summary for chat_id=%s", chat_id, exc_info=True)
         self._client.upsert(
             collection_name=self._collection,
             points=[
@@ -136,9 +141,47 @@ class LtmQdrantStore:
         try:
             self._client.delete(collection_name=self._collection, points_selector=qmodels.FilterSelector(filter=flt))
         except Exception:
-            logger.warning("Failed to delete LTM entries for chat_id=%s", chat_id)
+            logger.warning("Failed to delete LTM entries for chat_id=%s", chat_id, exc_info=True)
 
     # ---- Internal ----
+    def _prune_memories(self, chat_id: str) -> None:
+        if self._max_memories_per_chat <= 0:
+            return
+        flt = qmodels.Filter(
+            must=[
+                qmodels.FieldCondition(key="chat_id", match=qmodels.MatchValue(value=chat_id)),
+                qmodels.FieldCondition(key="type", match=qmodels.MatchValue(value="memory")),
+            ]
+        )
+        points, _ = self._client.scroll(
+            collection_name=self._collection,
+            scroll_filter=flt,
+            limit=5000,
+            with_payload=True,
+        )
+        if len(points) <= self._max_memories_per_chat:
+            return
+        scored = []
+        for p in points:
+            payload = p.payload or {}
+            created_at = payload.get("created_at")
+            try:
+                created_val = int(created_at)
+            except (TypeError, ValueError):
+                created_val = 0
+            scored.append((created_val, p.id))
+        scored.sort(key=lambda x: x[0])
+        to_delete = [pid for _, pid in scored[:-self._max_memories_per_chat]]
+        if not to_delete:
+            return
+        try:
+            self._client.delete(
+                collection_name=self._collection,
+                points_selector=qmodels.PointIdsList(points=to_delete),
+            )
+        except Exception:
+            logger.warning("Failed to prune LTM memories for chat_id=%s", chat_id, exc_info=True)
+
     def _ensure_collection(self) -> None:
         try:
             self._client.get_collection(self._collection)

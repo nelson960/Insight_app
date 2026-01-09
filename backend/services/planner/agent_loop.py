@@ -316,7 +316,12 @@ class MultiFileAgentLoop:
                                 continue
                             seen_starts.add(si)
                             uniq_starts.append(si)
+                        max_iterations = max(1, int(target_windows_per_file) * 2)
+                        iterations = 0
                         while len(uniq_starts) < int(target_windows_per_file) and len(full_text) > max_chars:
+                            iterations += 1
+                            if iterations > max_iterations:
+                                break
                             # Add an evenly spaced start position if we don't have enough unique slices.
                             frac = (len(uniq_starts) + 1) / float(target_windows_per_file + 1)
                             pos = int(max(0, min(len(full_text) - max_chars, int(len(full_text) * frac))))
@@ -389,12 +394,14 @@ class MultiFileAgentLoop:
             for fid in fids:
                 used = 0
                 hits = 0
+                if fid not in windows_map:
+                    continue
                 for w in windows_map.get(fid, []):
                     if not w.text:
                         continue
                     hits += 1
                     used += _approx_tokens(w.text)
-                name = windows_map.get(fid, [SeqWindow(fid, "Document", 0, 0, "", None, None)])[0].filename
+                name = windows_map[fid][0].filename if windows_map.get(fid) else "Document"
                 mix[name] = {"windows": hits, "tokens": used}
             logger.debug(
                 "agent_loop windows query_len=%d files=%d per_file_k=%d per_file_cap=%d compare=%s mix=%s request_id=%s",

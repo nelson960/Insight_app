@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
@@ -55,31 +54,14 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def _ipc_only(request: Request, call_next):
         """
-        Desktop mode default: reject non-IPC HTTP requests.
+        IPC-only backend: reject all non-IPC HTTP requests.
 
         The UI talks to Python via Tauri IPC (engine.py), which injects the header.
-        If you explicitly want to run a localhost HTTP server for debugging, set:
-            INSIGHT_ALLOW_HTTP=1
         """
-        allow_http = os.getenv("INSIGHT_ALLOW_HTTP", "").strip().lower() in ("1", "true", "yes")
         is_ipc = request.headers.get(_IPC_HEADER) == _IPC_VALUE
-
-        # Hardening: destructive settings endpoints are IPC-only, even when running
-        # with INSIGHT_ALLOW_HTTP=1 for debugging.
-        destructive_settings_paths = {
-            "/settings/llm/apply",
-            "/settings/storage/clean_cache",
-            "/settings/storage/reset",
-            "/settings/index/repair",
-        }
-        if request.url.path in destructive_settings_paths and not is_ipc:
+        if not is_ipc:
             return JSONResponse(status_code=403, content={"ok": False, "error": "ipc_required"})
-
-        if allow_http:
-            return await call_next(request)
-        if is_ipc:
-            return await call_next(request)
-        return JSONResponse(status_code=403, content={"ok": False, "error": "http_disabled"})
+        return await call_next(request)
 
     app.include_router(chat.router)
     app.include_router(docs.router)

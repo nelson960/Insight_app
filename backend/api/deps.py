@@ -293,7 +293,7 @@ class AppDependencies:
         }
 
     @classmethod
-    def reset_all(cls, *, confirm: bool = False) -> None:
+    def reset_all(cls, *, confirm: bool = False, keep_em_models: bool = False) -> None:
         """
         Delete all user data and reset in-memory singletons.
 
@@ -344,5 +344,5 @@ class AppDependencies:
         cls._doc_search_service = None
 
         ws = cls.workspace()
-        ws.reset(confirm=True)
+        ws.reset(confirm=True, keep_em_models=keep_em_models)
         cls._workspace = None

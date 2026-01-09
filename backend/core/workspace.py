@@ -5,7 +5,6 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-import yaml
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DIR = _PROJECT_ROOT / "storage"
@@ -20,10 +19,9 @@ class Workspace:
         self._ensure_permissions()
 
     def _ensure_structure(self) -> None:
-        for sub in ["uploads", "qdrant", "cache", "logs", "keys", "config"]:
+        for sub in ["uploads", "qdrant", "cache", "logs", "keys"]:
             path = self.base / sub
             path.mkdir(parents=True, exist_ok=True)
-        (self.config_dir / "config.yaml").touch(exist_ok=True)
 
     def _ensure_permissions(self) -> None:
         try:
@@ -55,30 +53,7 @@ class Workspace:
     def keys(self) -> Path:
         return self.base / "keys"
 
-    @property
-    def config_path(self) -> Path:
-        return self.config_dir / "config.yaml"
-
-    @property
-    def config_dir(self) -> Path:
-        return self.base / "config"
-
-    @property
-    def runtime_config_path(self) -> Path:
-        # Retained for backward compatibility; runtime config now lives in config.yaml.
-        return self.config_path
-
-    def save_config(self, cfg: dict) -> None:
-        with self.config_path.open("w", encoding="utf-8") as handle:
-            yaml.safe_dump(cfg, handle)
-
-    def load_config(self) -> dict:
-        if not self.config_path.exists():
-            return {}
-        with self.config_path.open("r", encoding="utf-8") as handle:
-            return yaml.safe_load(handle) or {}
-
-    def reset(self, *, confirm: bool = False) -> None:
+    def reset(self, *, confirm: bool = False, keep_em_models: bool = False) -> None:
         if not confirm:
             raise ValueError("Reset not confirmed.")
         targets = [
@@ -88,9 +63,10 @@ class Workspace:
             self.db,
             self.logs,
             self.keys,
-            self.config_dir,
             self.base / "kv_sessions",
         ]
+        if not keep_em_models:
+            targets.append(self.base / "em_models")
         for target in targets:
             if not target.exists():
                 continue

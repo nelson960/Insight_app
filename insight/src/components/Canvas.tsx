@@ -37,13 +37,6 @@ export type CanvasLink = {
 
 type Viewport = { x: number; y: number; scale: number };
 type Board = { w: number; h: number };
-type CardMenuState = {
-  chatId: string;
-  x: number;
-  y: number;
-  sub: null | "colors";
-  confirm: null | "deleteGroup";
-};
 
 type GroupStackAnim = {
   mode: "collapse" | "expand";
@@ -88,7 +81,6 @@ const ZOOM_SPEED = 0.0015;
 const BOARD_MULT = 3.2;
 const BOARD_MIN_W = 2200;
 const BOARD_MIN_H = 1400;
-const CARD_MENU_WIDTH = 220;
 const STACK_ANIM_MS = 340;
 const LINK_FADE_MS = 140;
 // Collapse should feel like "stacking cards behind" (not shrinking into a dot).
@@ -198,11 +190,9 @@ export function Canvas({
   });
   const [isPanning, setIsPanning] = useState(false);
   const [chatListOpen, setChatListOpen] = useState(false);
-  const [cardMenu, setCardMenu] = useState<CardMenuState | null>(null);
   const [filesByChatId, setFilesByChatId] = useState<Record<string, string[]>>({});
   const chatIdSetRef = useRef<Set<string>>(new Set());
   const fileReloadTimersRef = useRef<Record<string, number>>({});
-  const cardMenuRef = useRef<HTMLDivElement | null>(null);
   const panRef = useRef<{ startX: number; startY: number; startVpX: number; startVpY: number } | null>(
     null
   );
@@ -476,25 +466,6 @@ export function Canvas({
     }
     return fading;
   }, [groupStackAnim]);
-
-  function openCardMenu(chatId: string, clientX: number, clientY: number) {
-    if (!chatId) return;
-    onFocusChat(chatId);
-    setCardMenu({ chatId, x: clientX, y: clientY, sub: null, confirm: null });
-  }
-
-  function closeCardMenu() {
-    setCardMenu(null);
-  }
-
-  useEffect(() => {
-    if (!cardMenu) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeCardMenu();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [cardMenu]);
 
   const chatIdsKey = useMemo(() => {
     const ids = [...new Set(notes.map((n) => n.chatId))].sort();
@@ -1181,11 +1152,6 @@ export function Canvas({
               onOpenCard={() => onOpenCard(n.chatId)}
               onDelete={() => onDeleteChat(n.chatId)}
               onClearGroupColor={() => clearGroupColorWithDescendants(n.chatId, accentColor)}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                openCardMenu(n.chatId, e.clientX, e.clientY);
-              }}
             />
           );
         })}
@@ -1193,78 +1159,6 @@ export function Canvas({
       </div>
       {dockVisible && typeof document !== "undefined" && document.body
         ? createPortal(dock, document.body)
-        : null}
-      {cardMenu && typeof document !== "undefined" && document.body
-        ? createPortal(
-            (() => {
-              const note = noteById.get(cardMenu.chatId);
-              if (!note) return null;
-              const collapsed = !!note.collapsed;
-              const hasChildren = (tree.childrenByParent.get(cardMenu.chatId) || []).length > 0;
-              const stackCount = stackCountByChatId[cardMenu.chatId] || 0;
-
-              const winW = typeof window !== "undefined" ? window.innerWidth : 1024;
-              const winH = typeof window !== "undefined" ? window.innerHeight : 768;
-              const baseX = Math.min(cardMenu.x, Math.max(8, winW - CARD_MENU_WIDTH - 8));
-              const baseY = Math.min(cardMenu.y, Math.max(8, winH - 200));
-
-              return (
-                <div
-                  className="canvas-card-menu-overlay"
-                  onPointerDown={() => closeCardMenu()}
-                  onContextMenu={(e) => e.preventDefault()}
-                >
-                  <div
-                    ref={cardMenuRef}
-                    className="canvas-card-menu"
-                    style={{ left: baseX, top: baseY }}
-                    role="menu"
-                    aria-label="Card menu"
-                    onPointerDown={(e) => e.stopPropagation()}
-                  >
-                    {hasChildren ? (
-                      <button
-                        type="button"
-                        className="canvas-card-menu-item"
-                        onClick={() => {
-                          applyUpdateNote(cardMenu.chatId, { collapsed: !collapsed });
-                          closeCardMenu();
-                        }}
-                      >
-                        {collapsed ? "Expand group" : "Collapse group"}
-                      </button>
-                    ) : null}
-
-                    {collapsed && stackCount > 0 ? (
-                      <button
-                        type="button"
-                        className={`canvas-card-menu-item canvas-card-menu-item-danger ${
-                          cardMenu.confirm === "deleteGroup" ? "confirm" : ""
-                        }`}
-                        onClick={() => {
-                          if (cardMenu.confirm !== "deleteGroup") {
-                            setCardMenu((prev) =>
-                              prev && prev.chatId === cardMenu.chatId
-                                ? { ...prev, confirm: "deleteGroup", sub: null }
-                                : prev
-                            );
-                            return;
-                          }
-                          onDeleteChatTree(cardMenu.chatId);
-                          closeCardMenu();
-                        }}
-                      >
-                        {cardMenu.confirm === "deleteGroup"
-                          ? "Confirm delete group"
-                          : "Delete group"}
-                      </button>
-                    ) : null}
-                  </div>
-                </div>
-              );
-            })(),
-            document.body
-          )
         : null}
     </>
   );
@@ -1297,7 +1191,6 @@ function ChatNote({
   onDelete,
   onClearGroupColor,
   onUpdate,
-  onContextMenu,
 }: {
   chatId: string;
   title: string;
@@ -1333,7 +1226,6 @@ function ChatNote({
   onDelete: () => void;
   onClearGroupColor: () => void;
   onUpdate: (patch: Partial<CanvasNote>, opts?: { clampToViewport?: boolean }) => void;
-  onContextMenu: (e: React.MouseEvent) => void;
 }) {
   const dragRef = useRef<{ startX: number; startY: number; startPx: number; startPy: number } | null>(
     null
@@ -1416,12 +1308,27 @@ function ChatNote({
     const t = e.target as HTMLElement | null;
     if (t && (t.closest("button") || t.closest("input"))) return;
     bringToFront();
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
     dragRef.current = { startX: e.clientX, startY: e.clientY, startPx: x, startPy: y };
     dragMovedRef.current = false;
   }
 
   function moveDrag(e: React.PointerEvent) {
     if (!dragRef.current) return;
+    if (e.buttons !== 1) {
+      dragRef.current = null;
+      dragMovedRef.current = false;
+      try {
+        (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      return;
+    }
     const dx = (e.clientX - dragRef.current.startX) / scale;
     const dy = (e.clientY - dragRef.current.startY) / scale;
     if (Math.abs(dx) + Math.abs(dy) > 2) {
@@ -1545,7 +1452,6 @@ function ChatNote({
           : {}),
       }}
       onPointerDown={() => bringToFront()}
-      onContextMenu={onContextMenu}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();

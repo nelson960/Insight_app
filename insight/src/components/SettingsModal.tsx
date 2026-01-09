@@ -48,6 +48,20 @@ type BusyState = {
   llm?: any;
 };
 
+type HealthIssue = {
+  code: string;
+  severity: "error" | "warning";
+  message: string;
+  fix: string;
+  action?: string;
+};
+
+type HealthReport = {
+  ok: boolean;
+  issues: HealthIssue[];
+  checks?: Record<string, any>;
+};
+
 function formatBytes(bytes: number) {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -83,6 +97,9 @@ export function SettingsModal(props: {
   const [engineBusy, setEngineBusy] = useState<BusyState | null>(null);
   const [llmLoaded, setLlmLoaded] = useState(false);
   const [llmInfo, setLlmInfo] = useState<LlmModelInfo | null>(null);
+  const [healthReport, setHealthReport] = useState<HealthReport | null>(null);
+  const [embeddingDownloading, setEmbeddingDownloading] = useState(false);
+  const [embeddingDownloadError, setEmbeddingDownloadError] = useState<string | null>(null);
 
   function getErrorText(res: { error?: string; data?: any }, fallback: string) {
     return (
@@ -101,6 +118,8 @@ export function SettingsModal(props: {
     setCleanResult(null);
     setModelValidation(null);
     setRestartRequired(false);
+    setEmbeddingDownloading(false);
+    setEmbeddingDownloadError(null);
     setBusy(true);
     (async () => {
       const res = await engine<SettingsResponse>(
@@ -137,12 +156,41 @@ export function SettingsModal(props: {
       if (bs.ok) setEngineBusy(bs.data as any);
     };
     tick();
-    const id = window.setInterval(tick, 3000);
+    const id = window.setInterval(tick, 15000);
     return () => {
       alive = false;
       window.clearInterval(id);
     };
   }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    const tick = async () => {
+      if (!alive) return;
+      await refreshHealth();
+    };
+    tick();
+    const id = window.setInterval(tick, 10000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    const checks = healthReport?.checks || {};
+    const status = checks.embedding_download_status;
+    const err = checks.embedding_download_error;
+    if (status === "downloading") {
+      setEmbeddingDownloading(true);
+    } else if (status === "ready" || status === "idle") {
+      setEmbeddingDownloading(false);
+    }
+    if (err) {
+      setEmbeddingDownloadError(err);
+    }
+  }, [healthReport]);
 
   const sortedBreakdown = useMemo(() => {
     if (!storage?.breakdown) return [];
@@ -152,6 +200,11 @@ export function SettingsModal(props: {
   async function refreshStorage() {
     const st = await engine<StorageUsage>("/settings/storage", undefined, "GET");
     if (st.ok) setStorage(st.data as any);
+  }
+
+  async function refreshHealth() {
+    const res = await engine<HealthReport>("/settings/health", undefined, "GET");
+    if (res.ok) setHealthReport(res.data as any);
   }
 
   async function saveSettingsPatch(patch: Partial<SettingsState>) {
@@ -174,7 +227,16 @@ export function SettingsModal(props: {
 
   async function validateModel(path: string) {
     setModelValidation(null);
-    const res = await engine<any>("/settings/model/validate", { model_path: path }, "POST");
+    const trimmed = path.trim();
+    if (!trimmed) {
+      setModelValidation({ ok: false, msg: "Model path is required" });
+      return false;
+    }
+    if (!trimmed.toLowerCase().endsWith(".gguf")) {
+      setModelValidation({ ok: false, msg: "Model must be a .gguf file" });
+      return false;
+    }
+    const res = await engine<any>("/settings/model/validate", { model_path: trimmed }, "POST");
     if (!res.ok || !(res.data as any)?.ok) {
       setModelValidation({ ok: false, msg: (res.data as any)?.error || res.error || "Invalid model" });
       return false;
@@ -235,7 +297,10 @@ export function SettingsModal(props: {
     }
 
     setRestartRequired(true);
+    setLlmLoaded(false);
+    setLlmInfo(null);
     await refreshStorage();
+    await refreshHealth();
     setCleanResult("Model settings applied and workspace cleared. Restart the app/engine to reload the model.");
   }
 
@@ -276,10 +341,48 @@ export function SettingsModal(props: {
     setRestartRequired(true);
     const st = await engine<StorageUsage>("/settings/storage", undefined, "GET");
     if (st.ok) setStorage(st.data as any);
+    const settingsRes = await engine<SettingsResponse>("/settings", undefined, "GET");
+    if (settingsRes.ok && (settingsRes.data as any)?.settings) {
+      const next = (settingsRes.data as any).settings as SettingsState;
+      setSettings((prev) => ({ ...prev, ...next }));
+      const mode = next.theme_mode;
+      if (mode) onThemeModeChange(mode);
+    }
+    if (settingsRes.ok) {
+      const loaded = Boolean((settingsRes.data as any)?.llm?.loaded);
+      setLlmLoaded(loaded);
+      setLlmInfo(((settingsRes.data as any)?.llm?.model_info as any) || null);
+    } else {
+      setLlmLoaded(false);
+      setLlmInfo(null);
+    }
+    setModelValidation(null);
     const total = st.ok ? formatBytes((st.data as any)?.total_bytes ?? 0) : "0 B";
     setCleanResult(
       `Delete complete. Workspace cleared (KV/Qdrant/DB/uploads/cache/logs/keys/config). Current storage: ${total}. Please restart the app.`
     );
+    onClose();
+    window.setTimeout(() => {
+      window.location.reload();
+    }, 60);
+  }
+
+  async function downloadEmbeddings() {
+    if (embeddingDownloading) return;
+    setEmbeddingDownloadError(null);
+    if (engineBusy?.busy) {
+      setEmbeddingDownloadError(
+        "Background work is running. Wait for it to finish before downloading embeddings."
+      );
+      return;
+    }
+    setEmbeddingDownloading(true);
+    const res = await engine<any>("/settings/embedding/download", {}, "POST");
+    if (!res.ok || !(res.data as any)?.ok) {
+      setEmbeddingDownloadError(getErrorText(res, "Failed to download embeddings"));
+      setEmbeddingDownloading(false);
+    }
+    await refreshHealth();
   }
 
   if (!open) return null;
@@ -349,6 +452,89 @@ export function SettingsModal(props: {
               </button>
               <div className="settings-muted">{cleanResult || ""}</div>
             </div>
+          </section>
+
+          <section className="settings-section">
+            <div className="settings-section-title">Health</div>
+            {healthReport ? (
+              (() => {
+                const checks = (healthReport as any)?.checks || {};
+                const embeddingPresent = checks.embedding_present === true;
+                const embeddingStatus = checks.embedding_download_status;
+                const showEmbeddingPanel =
+                  !embeddingPresent ||
+                  embeddingStatus === "downloading" ||
+                  embeddingStatus === "error";
+                const embeddingBusy = embeddingDownloading || embeddingStatus === "downloading";
+                const issues = (healthReport.issues || []).filter(
+                  (issue) =>
+                    ![
+                      "embedding_missing",
+                      "embedding_downloading",
+                      "embedding_download_failed",
+                    ].includes(issue.code)
+                );
+                if (issues.length === 0 && !showEmbeddingPanel) {
+                  return (
+                    <div className="settings-health-ok">
+                      <span className="settings-health-dot ok" />
+                      All systems operational
+                    </div>
+                  );
+                }
+                return (
+                  <div className="settings-health-list">
+                    {showEmbeddingPanel ? (
+                      <div className="settings-health-item warning">
+                        <div className="settings-health-title">
+                          {embeddingBusy
+                            ? "Embedding model downloading"
+                            : embeddingStatus === "error"
+                            ? "Embedding download failed"
+                            : "Embedding model missing"}
+                        </div>
+                        <div className="settings-health-fix">
+                          {embeddingBusy
+                            ? "Keep Insight open until the download completes."
+                            : "Downloads the local ONNX embedding model required for ingestion/search."}
+                        </div>
+                        <div className="settings-row">
+                          <button
+                            className="settings-btn"
+                            type="button"
+                            onClick={downloadEmbeddings}
+                            disabled={embeddingBusy || !!engineBusy?.busy}
+                          >
+                            {embeddingBusy ? "Downloading…" : "Download embeddings"}
+                          </button>
+                          {embeddingDownloadError ? (
+                            <div className="settings-hint err">{embeddingDownloadError}</div>
+                          ) : null}
+                        </div>
+                        {embeddingBusy ? (
+                          <div className="settings-health-bar">
+                            <span />
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {issues.map((issue) => (
+                      <div
+                        key={issue.code}
+                        className={`settings-health-item ${issue.severity}`}
+                      >
+                        <div className="settings-health-title">
+                          {issue.message}
+                        </div>
+                        <div className="settings-health-fix">{issue.fix}</div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()
+            ) : (
+              <div className="settings-muted">Checking system health…</div>
+            )}
           </section>
 
           <section className="settings-section">

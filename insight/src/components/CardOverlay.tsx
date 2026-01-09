@@ -21,6 +21,8 @@ type Props = {
   onOpenSettings: () => void;
   onDeleteChat: (chatId: string) => void;
   confirmDeleteChatId: string | null;
+  onRequireModel?: () => Promise<boolean>;
+  closing?: boolean;
 };
 
 const DEFAULT_LAYOUT: CardLayout = {
@@ -44,6 +46,8 @@ export function CardOverlay({
   onOpenSettings,
   onDeleteChat,
   confirmDeleteChatId,
+  onRequireModel,
+  closing = false,
 }: Props) {
   const [showChat, setShowChat] = useState(initialLayout?.showChat ?? DEFAULT_LAYOUT.showChat);
   const [showDocs, setShowDocs] = useState(initialLayout?.showDocs ?? DEFAULT_LAYOUT.showDocs);
@@ -97,6 +101,11 @@ export function CardOverlay({
   }, [chatId, initialLayout?.activeFileId]);
 
   useEffect(() => {
+    // Avoid stale selection carrying across document switches (can bias retrieval).
+    setSelection(null);
+  }, [activeFileId]);
+
+  useEffect(() => {
     if (!cardsOpen) return;
     const onPointerDown = (e: PointerEvent) => {
       const t = e.target as Node | null;
@@ -133,9 +142,10 @@ export function CardOverlay({
         onActiveFileIdChange={setActiveFileId}
         onSelectionChange={setSelection}
         onAskSelection={askSelection}
+        onRequireModel={onRequireModel}
       />
     ),
-    [activeFileId, askSelection, chatId, docsRefreshSeq]
+    [activeFileId, askSelection, chatId, docsRefreshSeq, onRequireModel]
   );
 
   const chatPane = useMemo(
@@ -158,9 +168,10 @@ export function CardOverlay({
           }
         }}
         onRequestDocsRefresh={() => setDocsRefreshSeq((v) => v + 1)}
+        onRequireModel={onRequireModel}
       />
     ),
-    [activeFileId, chatId, selection, showDocs]
+    [activeFileId, chatId, selection, showDocs, onRequireModel]
   );
 
   const left = useMemo(() => {
@@ -213,6 +224,7 @@ export function CardOverlay({
   return (
     <div
       className="chat-overlay card-overlay card-overlay-fullscreen"
+      data-state={closing ? "closing" : "open"}
       role="dialog"
       aria-modal="true"
       aria-label="Card"
