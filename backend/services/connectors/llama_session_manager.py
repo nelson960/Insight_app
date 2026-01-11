@@ -264,9 +264,8 @@ class LlamaSessionManager:
         """
         Infer which prompt renderer to use for the loaded model.
 
-        We avoid llama-cpp-python "apply_chat_template" APIs (not available in our pinned
-        version) and instead render prompts ourselves. To keep correctness across models,
-        we detect common chat templates from GGUF metadata:
+        We render prompts ourselves. To keep correctness across models, we detect
+        common chat templates from GGUF metadata:
         - Llama-3 style: <|start_header_id|> ... <|eot_id|>
         - ChatML (Qwen/Qwen2.5): <|im_start|> ... <|im_end|>
         """
@@ -1293,8 +1292,7 @@ class LlamaSessionManager:
         """
         Prefill the model KV for a full chat transcript without generating new tokens.
 
-        This codebase targets llama_cpp versions without a public chat-template renderer,
-        so we pre-render a stable prompt (renderer selected per-model) and prefill via
+        We pre-render a stable prompt (renderer selected per-model) and prefill via
         `eval()` only.
         """
         prompt = self._render_prompt(messages, add_generation_prompt=False)
@@ -1331,8 +1329,10 @@ class LlamaSessionManager:
           <|im_start|>{role}\n{content}<|im_end|>\n
         """
         system_message = ""
+        has_system = False
         rest = list(messages or [])
         if rest and rest[0].get("role") == "system":
+            has_system = True
             system_message = rest[0].get("content") or ""
             rest = rest[1:]
 

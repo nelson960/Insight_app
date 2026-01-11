@@ -129,8 +129,10 @@ class RawEngine:
 
     def _render_chatml_prompt(self, messages: Sequence[Dict[str, str]], *, add_generation_prompt: bool) -> str:
         system_message = ""
+        has_system = False
         rest = list(messages or [])
         if rest and rest[0].get("role") == "system":
+            has_system = True
             system_message = rest[0].get("content") or ""
             rest = rest[1:]
 

@@ -62,6 +62,27 @@ type HealthReport = {
   checks?: Record<string, any>;
 };
 
+type RawEngineStatus = {
+  ok?: boolean;
+  running: boolean;
+  starting?: boolean;
+  pid?: number | null;
+  host?: string | null;
+  port?: number | null;
+  requested_port?: number | null;
+  log_dir?: string | null;
+  command?: string | null;
+  started_at?: number | null;
+  start_requested_at?: number | null;
+  exit_code?: number | null;
+  error?: string | null;
+};
+
+type RawEngineLogLine = {
+  ts: number;
+  line: string;
+};
+
 function formatBytes(bytes: number) {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -99,7 +120,13 @@ export function SettingsModal(props: {
   const [healthReport, setHealthReport] = useState<HealthReport | null>(null);
   const [embeddingDownloading, setEmbeddingDownloading] = useState(false);
   const [embeddingDownloadError, setEmbeddingDownloadError] = useState<string | null>(null);
+  const [rawEngineStatus, setRawEngineStatus] = useState<RawEngineStatus | null>(null);
+  const [rawEngineLogs, setRawEngineLogs] = useState<RawEngineLogLine[]>([]);
+  const [rawEngineError, setRawEngineError] = useState<string | null>(null);
+  const [rawEngineBusy, setRawEngineBusy] = useState(false);
+  const [rawLogsOpen, setRawLogsOpen] = useState(false);
   const resetWrapRef = useRef<HTMLDivElement | null>(null);
+  const rawLogRef = useRef<HTMLDivElement | null>(null);
 
   function getErrorText(res: { error?: string; data?: any }, fallback: string) {
     return (
@@ -111,6 +138,15 @@ export function SettingsModal(props: {
     );
   }
 
+  function formatLogTime(ts: number) {
+    if (!Number.isFinite(ts)) return "";
+    try {
+      return new Date(ts * 1000).toLocaleTimeString();
+    } catch {
+      return "";
+    }
+  }
+
   useEffect(() => {
     if (!open) return;
     setResetOpen(false);
@@ -119,6 +155,7 @@ export function SettingsModal(props: {
     setRestartRequired(false);
     setEmbeddingDownloading(false);
     setEmbeddingDownloadError(null);
+    setRawEngineError(null);
     setBusy(true);
     (async () => {
       const res = await engine<SettingsResponse>(
@@ -158,6 +195,7 @@ export function SettingsModal(props: {
     return () => document.removeEventListener("mousedown", handleOutsideClick);
   }, [resetOpen]);
 
+
   useEffect(() => {
     if (!open) return;
     let alive = true;
@@ -190,6 +228,24 @@ export function SettingsModal(props: {
   }, [open]);
 
   useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    const tick = async () => {
+      if (!alive) return;
+      await refreshRawEngineStatus();
+      if (rawLogsOpen) {
+        await refreshRawEngineLogs();
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, rawLogsOpen ? 2500 : 12000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [open, rawLogsOpen]);
+
+  useEffect(() => {
     const checks = healthReport?.checks || {};
     const status = checks.embedding_download_status;
     const err = checks.embedding_download_error;
@@ -203,10 +259,23 @@ export function SettingsModal(props: {
     }
   }, [healthReport]);
 
+  useEffect(() => {
+    if (!rawLogsOpen) return;
+    if (!rawLogRef.current) return;
+    rawLogRef.current.scrollTop = rawLogRef.current.scrollHeight;
+  }, [rawEngineLogs, rawLogsOpen]);
+
   const sortedBreakdown = useMemo(() => {
     if (!storage?.breakdown) return [];
     return Object.entries(storage.breakdown).sort((a, b) => (b[1].bytes || 0) - (a[1].bytes || 0));
   }, [storage]);
+
+  const rawRunning = Boolean(rawEngineStatus?.running);
+  const rawStarting = Boolean(rawEngineStatus?.starting);
+  const rawBaseUrl =
+    rawRunning && rawEngineStatus?.host && rawEngineStatus?.port
+      ? `http://${rawEngineStatus.host}:${rawEngineStatus.port}`
+      : "";
 
   async function refreshStorage() {
     const st = await engine<StorageUsage>("/settings/storage", undefined, "GET");
@@ -216,6 +285,31 @@ export function SettingsModal(props: {
   async function refreshHealth() {
     const res = await engine<HealthReport>("/settings/health", undefined, "GET");
     if (res.ok) setHealthReport(res.data as any);
+  }
+
+  async function refreshRawEngineStatus() {
+    const res = await engine<RawEngineStatus>("/settings/raw_engine/status", undefined, "GET");
+    if (res.ok) setRawEngineStatus(res.data as any);
+  }
+
+  async function refreshRawEngineLogs() {
+    const res = await engine<{ lines?: RawEngineLogLine[] }>("/settings/raw_engine/logs?limit=250", undefined, "GET");
+    if (res.ok) setRawEngineLogs((res.data as any)?.lines || []);
+  }
+
+  async function toggleRawEngine() {
+    if (rawEngineBusy) return;
+    setRawEngineBusy(true);
+    setRawEngineError(null);
+    const running = Boolean(rawEngineStatus?.running);
+    const endpoint = running ? "/settings/raw_engine/stop" : "/settings/raw_engine/start";
+    const res = await engine<any>(endpoint, {}, "POST");
+    if (!res.ok || (res.data as any)?.ok === false) {
+      setRawEngineError(getErrorText(res, "Failed to toggle raw API server"));
+    }
+    await refreshRawEngineStatus();
+    await refreshRawEngineLogs();
+    setRawEngineBusy(false);
   }
 
   async function saveSettingsPatch(patch: Partial<SettingsState>) {
@@ -264,7 +358,6 @@ export function SettingsModal(props: {
       const ok = await validateModel(path);
       if (!ok) return;
       setSettings((p) => ({ ...p, llm_model_path: path }));
-      setLlmApplyArmed(false);
     } catch (e: any) {
       setModelValidation({ ok: false, msg: e?.message || String(e) });
     }
@@ -278,7 +371,6 @@ export function SettingsModal(props: {
 
     const ok = await validateModel(settings.llm_model_path);
     if (!ok) {
-      setLlmApplyArmed(false);
       return;
     }
 
@@ -295,8 +387,6 @@ export function SettingsModal(props: {
       "POST"
     );
     setBusy(false);
-    setLlmApplyArmed(false);
-
     if (!res.ok) {
       setCleanResult(getErrorText(res, "Failed to apply model settings"));
       return;
@@ -523,11 +613,12 @@ export function SettingsModal(props: {
                   className="settings-input"
                   value={settings.llm_model_path}
                   placeholder="Path to .gguf"
-                  onChange={(e) => setSettings((p) => ({ ...p, llm_model_path: e.target.value }))}
+                  onChange={(e) => {
+                    setSettings((p) => ({ ...p, llm_model_path: e.target.value }));
+                  }}
                   onBlur={async () => {
                     if (!settings.llm_model_path) return;
                     const ok = await validateModel(settings.llm_model_path);
-                    if (ok) setLlmApplyArmed(false);
                   }}
                 />
                 <button
@@ -613,6 +704,76 @@ export function SettingsModal(props: {
               <div className="settings-hint">
                 Changing model/context clears chats, files, indexes, and KV sessions.
               </div>
+            </div>
+          </section>
+
+          <section className="settings-section">
+            <div className="settings-section-title">Raw API Server</div>
+            <div className="settings-row settings-col">
+              <label className="settings-label">Toggle</label>
+              <div className="settings-inline settings-inline-tight">
+                <button
+                  className={`settings-icon-btn settings-toggle-btn ${rawRunning ? "active" : ""}`}
+                  type="button"
+                  onClick={toggleRawEngine}
+                  disabled={rawEngineBusy || rawStarting}
+                  aria-label={rawRunning ? "Stop raw API server" : "Start raw API server"}
+                  title={rawRunning ? "Stop raw API server" : "Start raw API server"}
+                >
+                  <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 3.5v8.2" />
+                    <path d="M7.3 5.8a7 7 0 1 0 9.4 0" />
+                  </svg>
+                </button>
+                <div className={`settings-raw-status ${rawRunning ? "on" : "off"}`}>
+                  {rawRunning ? "Running" : rawStarting ? "Starting…" : "Stopped"}
+                </div>
+                {rawEngineBusy || rawStarting ? <div className="settings-muted">Working…</div> : null}
+              </div>
+              <div className="settings-hint">
+                {rawBaseUrl ? (
+                  <>
+                    Base URL <code>{rawBaseUrl}</code>
+                    {rawEngineStatus?.requested_port &&
+                    rawEngineStatus.port &&
+                    rawEngineStatus.requested_port !== rawEngineStatus.port ? (
+                      <>
+                        {" "}
+                        • requested <code>{rawEngineStatus.requested_port}</code>
+                      </>
+                    ) : null}
+                  </>
+                ) : (
+                  rawStarting
+                    ? "Starting raw server. This may take a moment while the model loads."
+                    : "Raw server is off. Starting it will load the model a second time."
+                )}
+              </div>
+              {rawEngineError || rawEngineStatus?.error ? (
+                <div className="settings-hint err">{rawEngineError || rawEngineStatus?.error}</div>
+              ) : null}
+
+              <details
+                className="settings-dropdown"
+                open={rawLogsOpen}
+                onToggle={(e) => setRawLogsOpen((e.target as HTMLDetailsElement).open)}
+              >
+                <summary>Raw server logs & options</summary>
+                <div className="settings-dropdown-panel">
+                  <div className="settings-raw-console" ref={rawLogRef}>
+                    {rawEngineLogs.length ? (
+                      rawEngineLogs.map((entry, idx) => (
+                        <div key={`${entry.ts}-${idx}`} className="settings-raw-line">
+                          <span className="settings-raw-time">{formatLogTime(entry.ts)}</span>
+                          <span className="settings-raw-text">{entry.line}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="settings-muted">No raw server logs yet.</div>
+                    )}
+                  </div>
+                </div>
+              </details>
             </div>
           </section>
 

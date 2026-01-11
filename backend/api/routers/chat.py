@@ -61,7 +61,7 @@ def _required_file_ids_for_turn(payload: dict) -> list[str]:
         chat_id = payload.get("chat_id")
         if isinstance(chat_id, str) and chat_id:
             try:
-                store, _ = AppDependencies.storage()
+                store = AppDependencies.sqlite_store()
                 all_ids = store.list_file_ids_for_chat(chat_id)
                 out_all = []
                 for fid in (all_ids or []):
@@ -104,7 +104,7 @@ def _required_file_ids_for_turn(payload: dict) -> list[str]:
         chat_id = payload.get("chat_id")
         if isinstance(chat_id, str) and chat_id:
             try:
-                store, _ = AppDependencies.storage()
+                store = AppDependencies.sqlite_store()
                 rows = store.list_files_for_chat(chat_id)
                 last_fid: Optional[str] = None
                 best_fid: Optional[str] = None
@@ -157,7 +157,7 @@ def _enforce_rag_ready(payload: dict) -> None:
     if not required:
         return
 
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
     files = store.list_files_status_for_chat(chat_id)
     status_by_id: dict[str, str] = {}
     for f in files or []:
@@ -393,7 +393,7 @@ def branch_chat(payload: Dict[str, Any] = Body(...)):
     # Create a stable-ish ID that matches the rest of the app's "chat-*" convention.
     child_chat_id = f"chat-{int(datetime.now(timezone.utc).timestamp() * 1000)}-{uuid.uuid4().hex[:6]}"
 
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
 
     shared_file_ids: list[str] = []
     if share_docs:
@@ -468,7 +468,7 @@ def branch_chat(payload: Dict[str, Any] = Body(...)):
 def delete_session(chat_id: str):
     deleted: Dict[str, Any] = {"chat_id": chat_id}
 
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
 
     # 0) Cancel any in-flight ingestion jobs for this chat so they don't recreate chunks
     # after we've deleted Qdrant/SQLite rows. The scheduler will skip cancellation for

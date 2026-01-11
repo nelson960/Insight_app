@@ -6,21 +6,13 @@ from typing import Any, Dict, List, Optional
 
 from backend.core.workspace import get_workspace
 from backend.services.security import KeyManager
+from backend.services.gguf_metadata import detect_chat_template_kind, is_gguf
 from backend.services.storage import SQLiteConfig, create_sqlite_store
 from backend.api.deps import AppDependencies
 from backend.services.connectors.nomic import get_download_state, maybe_start_auto_download
 from backend.services.connectors.nomic_onnx import NomicOnnxConfig
 
 logger = logging.getLogger(__name__)
-
-
-def _is_gguf(path: Path) -> bool:
-    try:
-        with path.open("rb") as handle:
-            head = handle.read(4)
-        return head == b"GGUF"
-    except Exception:
-        return False
 
 
 def _issue(
@@ -148,7 +140,7 @@ def run_startup_health() -> Dict[str, Any]:
                     action="open_settings",
                 )
             )
-        elif not _is_gguf(p):
+        elif not is_gguf(p):
             issues.append(
                 _issue(
                     "model_invalid",
@@ -158,6 +150,19 @@ def run_startup_health() -> Dict[str, Any]:
                     action="open_settings",
                 )
             )
+        else:
+            template_kind = detect_chat_template_kind(p)
+            checks["model_chat_template_kind"] = template_kind
+            if template_kind not in {"chatml", "llama3"}:
+                issues.append(
+                    _issue(
+                        "model_template_unsupported",
+                        "error",
+                        "The model chat template is not supported.",
+                        "Choose a GGUF with a ChatML or Llama-3 chat template.",
+                        action="open_settings",
+                    )
+                )
 
     # Embedding assets presence (documents will not ingest without them).
     embed_base = AppDependencies.nomic_model_dir()

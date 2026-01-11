@@ -13,7 +13,7 @@ router = APIRouter(prefix="/docs", tags=["Docs"])
 
 @router.get("/page/{chat_id}/{file_id}")
 def get_doc_page(chat_id: str, file_id: str):
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
 
     record = store.get_file(file_id)
     if not record:
@@ -81,7 +81,7 @@ def get_doc_page(chat_id: str, file_id: str):
 
 @router.put("/page/{chat_id}/{file_id}")
 def save_doc_page(chat_id: str, file_id: str, payload: Dict[str, Any] = Body(...)):
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
 
     record = store.get_file(file_id)
     if not record:

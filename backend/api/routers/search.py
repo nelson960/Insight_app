@@ -16,7 +16,7 @@ def search_doc(
     case_sensitive: bool = Query(False),
     whole_word: bool = Query(False),
 ):
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
     if not store.chat_has_file(chat_id, file_id):
         return {
             "chat_id": chat_id,

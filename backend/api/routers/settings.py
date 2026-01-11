@@ -6,12 +6,13 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Query
 
 from backend.api.deps import AppDependencies
 from backend.core.workspace import get_workspace
 from backend.services.retrieval.index_maintenance import validate_file_index, repair_file_index
 from backend.services.health import run_startup_health
+from backend.services.gguf_metadata import detect_chat_template_kind, is_gguf
 from backend.services.connectors.nomic import (
     MissingDependencyError,
     ensure_local_nomic_model_files,
@@ -19,7 +20,8 @@ from backend.services.connectors.nomic import (
     set_download_state,
 )
 from backend.services.connectors.nomic_onnx import NomicOnnxConfig
-from backend.services.storage import SQLiteConfig, create_sqlite_store
+from backend.services.storage import SQLiteConfig, SQLiteMetadataStore, create_sqlite_store
+from backend.services.raw_engine_server.manager import raw_engine_manager
 
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
@@ -49,15 +51,6 @@ def _normalize_ctx_size(v: Any, default: int = 32768) -> int:
     return x if x in ALLOWED_CTX_SIZES else default
 
 
-def _is_gguf(path: Path) -> bool:
-    try:
-        with path.open("rb") as f:
-            head = f.read(4)
-        return head == b"GGUF"
-    except Exception:
-        return False
-
-
 def _dir_usage(path: Path) -> Tuple[int, int]:
     """
     Return (bytes, files) under `path` (recursive).
@@ -82,6 +75,18 @@ def _dir_usage(path: Path) -> Tuple[int, int]:
     return total, files
 
 
+def _settings_store() -> tuple[SQLiteMetadataStore, bool]:
+    """
+    Return a SQLite settings store without forcing Qdrant initialization.
+
+    Returns (store, should_close).
+    """
+    existing = getattr(AppDependencies, "_sqlite_store", None)
+    if isinstance(existing, SQLiteMetadataStore):
+        return existing, False
+    return AppDependencies.sqlite_store(), False
+
+
 def _require_idle(op: str) -> None:
     state = AppDependencies.busy_state()
     if not state.get("busy"):
@@ -97,8 +102,12 @@ def _require_idle(op: str) -> None:
 
 @router.get("")
 def get_settings() -> Dict[str, Any]:
-    store, _ = AppDependencies.storage()
-    settings = store.list_settings()
+    store, should_close = _settings_store()
+    try:
+        settings = store.list_settings()
+    finally:
+        if should_close:
+            store.close()
 
     # Provide stable defaults even if unset.
     model_path = settings.get("llm_model_path")
@@ -182,6 +191,46 @@ def health_state() -> Dict[str, Any]:
     return run_startup_health()
 
 
+@router.get("/raw_engine/status")
+def raw_engine_status() -> Dict[str, Any]:
+    return raw_engine_manager().status()
+
+
+@router.post("/raw_engine/start")
+def raw_engine_start() -> Dict[str, Any]:
+    store, should_close = _settings_store()
+    try:
+        model_path = store.get_setting("llm_model_path", "")
+    finally:
+        if should_close:
+            store.close()
+    if not isinstance(model_path, str) or not model_path:
+        return {"ok": False, "error": "Set a GGUF model path in Settings → Model first."}
+    p = Path(model_path).expanduser()
+    if not p.exists():
+        return {"ok": False, "error": f"Model file not found: {p}"}
+    if not p.is_file():
+        return {"ok": False, "error": f"Not a file: {p}"}
+    if p.suffix.lower() != ".gguf":
+        return {"ok": False, "error": "Model must be a .gguf file"}
+    if not is_gguf(p):
+        return {"ok": False, "error": "File does not look like a valid GGUF model"}
+    template_kind = detect_chat_template_kind(p)
+    if template_kind not in {"chatml", "llama3"}:
+        return {"ok": False, "error": "Unsupported chat template. Use ChatML or Llama-3."}
+    return raw_engine_manager().start()
+
+
+@router.post("/raw_engine/stop")
+def raw_engine_stop() -> Dict[str, Any]:
+    return raw_engine_manager().stop()
+
+
+@router.get("/raw_engine/logs")
+def raw_engine_logs(limit: int = Query(250, ge=1, le=250)) -> Dict[str, Any]:
+    return {"ok": True, "lines": raw_engine_manager().logs(limit)}
+
+
 @router.post("/embedding/download")
 def download_embedding_model() -> Dict[str, Any]:
     _require_idle("download embedding model")
@@ -216,11 +265,11 @@ def set_settings(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """
     Persist app settings. Some settings require restart to take effect.
     """
-    store, _ = AppDependencies.storage()
-
     settings = payload.get("settings") if isinstance(payload, dict) else None
     if not isinstance(settings, dict):
         return {"ok": False, "error": "missing settings object"}
+
+    store, should_close = _settings_store()
 
     restart_required = False
 
@@ -229,11 +278,15 @@ def set_settings(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         if mode in ("system", "dark", "light"):
             store.set_setting("theme_mode", mode)
         else:
+            if should_close:
+                store.close()
             return {"ok": False, "error": "invalid theme_mode"}
 
     # LLM settings (model path / ctx size) are applied via /settings/llm/apply because they
     # require clearing user data (KV sessions + DB + Qdrant) to avoid inconsistent state.
     if "llm_model_path" in settings or "llm_ctx_size" in settings:
+        if should_close:
+            store.close()
         return {
             "ok": False,
             "error": "Use POST /settings/llm/apply to change model or context length (requires reset).",
@@ -244,6 +297,8 @@ def set_settings(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         store.set_setting("llm_gpu_layers", gl)
         restart_required = True
 
+    if should_close:
+        store.close()
     return {"ok": True, "restart_required": restart_required}
 
 
@@ -259,8 +314,14 @@ def validate_model(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         return {"ok": False, "error": f"Not a file: {p}"}
     if p.suffix.lower() != ".gguf":
         return {"ok": False, "error": "Model must be a .gguf file"}
-    if not _is_gguf(p):
+    if not is_gguf(p):
         return {"ok": False, "error": "File does not look like a valid GGUF model"}
+    template_kind = detect_chat_template_kind(p)
+    if template_kind not in {"chatml", "llama3"}:
+        return {
+            "ok": False,
+            "error": "Unsupported chat template. Use a GGUF with ChatML or Llama-3.",
+        }
     try:
         size = p.stat().st_size
     except Exception:
@@ -270,6 +331,7 @@ def validate_model(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "model_path": str(p),
         "size_bytes": int(size),
         "note": "Model path looks valid. Full compatibility is verified when the engine loads the model.",
+        "chat_template_kind": template_kind,
     }
 
 
@@ -292,8 +354,12 @@ def apply_llm_settings(payload: Dict[str, Any] = Body(default={})) -> Dict[str, 
     if not isinstance(settings, dict):
         return {"ok": False, "error": "settings object is required"}
 
-    store, _ = AppDependencies.storage()
-    merged = dict(store.list_settings())
+    store, should_close = _settings_store()
+    try:
+        merged = dict(store.list_settings())
+    finally:
+        if should_close:
+            store.close()
 
     if "llm_ctx_size" in settings:
         merged["llm_ctx_size"] = _normalize_ctx_size(settings.get("llm_ctx_size"), 32768)
@@ -312,8 +378,11 @@ def apply_llm_settings(payload: Dict[str, Any] = Body(default={})) -> Dict[str, 
             return {"ok": False, "error": f"Not a file: {p}"}
         if p.suffix.lower() != ".gguf":
             return {"ok": False, "error": "Model must be a .gguf file"}
-        if not _is_gguf(p):
+        if not is_gguf(p):
             return {"ok": False, "error": "File does not look like a valid GGUF model"}
+        template_kind = detect_chat_template_kind(p)
+        if template_kind not in {"chatml", "llama3"}:
+            return {"ok": False, "error": "Unsupported chat template. Use ChatML or Llama-3."}
         merged["llm_model_path"] = str(p)
 
     # Remember workspace base (reset_all clears the workspace singleton).

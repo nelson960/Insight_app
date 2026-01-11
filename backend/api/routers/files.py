@@ -387,7 +387,7 @@ async def list_files_for_chat(chat_id: str):
     """
     List files associated with a chat (used by the desktop Documents pane).
     """
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
     rows = store.list_files_for_chat(chat_id)
     files: list[dict[str, object]] = []
     for row in rows:
@@ -423,7 +423,7 @@ async def delete_file_from_chat(chat_id: str, file_id: str):
     if not file_id:
         raise HTTPException(status_code=400, detail="file_id is required")
 
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
     if not store.chat_has_file(chat_id, file_id):
         raise HTTPException(status_code=404, detail="file not linked to chat")
 
@@ -530,7 +530,7 @@ async def ingestion_progress(chat_id: str):
     This is intentionally cheap and deterministic: it reflects SQLite file/job rows,
     not transient in-memory state.
     """
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
     return store.chat_ingestion_progress(chat_id)
 
 @router.get("/extracted/{file_id}")
@@ -540,7 +540,7 @@ async def get_extracted_view(file_id: str):
 
     The desktop UI should render these blocks instead of attempting to embed PDFs/DOCX directly.
     """
-    store, _ = AppDependencies.storage()
+    store = AppDependencies.sqlite_store()
     record = store.get_file(file_id)
     if not record:
         raise HTTPException(status_code=404, detail="file not found")

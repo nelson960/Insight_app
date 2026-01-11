@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from backend.core.workspace import get_workspace, Workspace
-from backend.services.bootstrap import create_storage_backends
 from backend.services.ingestion import (
     IngestionPipeline,
     IngestionPipelineConfig,
@@ -20,7 +19,14 @@ from backend.services.memory.ltm_qdrant_store import LtmQdrantStore
 from backend.services.retrieval.rag_store import RagStore
 from backend.services.retrieval import RetrievalService
 from backend.services.security import KeyManager
-from backend.services.storage import SQLiteConfig, QdrantConfig, SQLiteMetadataStore, QdrantVectorIndex
+from backend.services.storage import (
+    SQLiteConfig,
+    QdrantConfig,
+    SQLiteMetadataStore,
+    QdrantVectorIndex,
+    create_sqlite_store,
+    create_qdrant_index,
+)
 from backend.services.connectors import NomicOnnxConfig, NomicOnnxEmbedTextConnector, LlamaSessionManager
 from backend.services.search import DocSearchService, FileSearchService
 
@@ -51,25 +57,36 @@ class AppDependencies:
         return cls._workspace
 
     @classmethod
-    def storage(cls) -> tuple[SQLiteMetadataStore, QdrantVectorIndex]:
-        if cls._sqlite_store is None or cls._vector_index is None:
+    def sqlite_store(cls) -> SQLiteMetadataStore:
+        if cls._sqlite_store is None:
+            with cls._storage_lock:
+                if cls._sqlite_store is None:
+                    cls._sqlite_store = create_sqlite_store(cls.workspace().db, config=SQLiteConfig())
+        return cls._sqlite_store
+
+    @classmethod
+    def vector_index(cls) -> QdrantVectorIndex:
+        if cls._vector_index is None:
             # Protect local Qdrant initialization from concurrent calls.
             with cls._storage_lock:
-                if cls._sqlite_store is None or cls._vector_index is None:
-                    cls._sqlite_store, cls._vector_index = create_storage_backends(
-                        sqlite_path=cls.workspace().db,
-                        sqlite_config=SQLiteConfig(),
-                        qdrant_config=QdrantConfig(
+                if cls._vector_index is None:
+                    cls._vector_index = create_qdrant_index(
+                        config=QdrantConfig(
                             collection_name="insight_chunks",
                             path=str(cls.workspace().qdrant),
-                        ),
+                        )
                     )
-        return cls._sqlite_store, cls._vector_index
+        return cls._vector_index
+
+    @classmethod
+    def storage(cls) -> tuple[SQLiteMetadataStore, QdrantVectorIndex]:
+        return cls.sqlite_store(), cls.vector_index()
 
     @classmethod
     def ingestion_pipeline(cls) -> IngestionPipeline:
         if cls._ingestion_pipeline is None:
-            sqlite_store, vector_index = cls.storage()
+            sqlite_store = cls.sqlite_store()
+            vector_index = cls.vector_index()
             cls._ingestion_pipeline = create_ingestion_pipeline(
                 metadata_store=sqlite_store,
                 vector_index=vector_index,
@@ -85,14 +102,14 @@ class AppDependencies:
     @classmethod
     def ingestion_scheduler(cls) -> IngestionScheduler:
         if cls._ingestion_scheduler is None:
-            sqlite_store, _ = cls.storage()
+            sqlite_store = cls.sqlite_store()
             cls._ingestion_scheduler = IngestionScheduler(cls.ingestion_pipeline(), sqlite_store)
         return cls._ingestion_scheduler
 
     @classmethod
     def planner_service(cls) -> PlannerService:
         if cls._planner_service is None:
-            sqlite_store, _ = cls.storage()
+            sqlite_store = cls.sqlite_store()
             orchestrator = InsightOrchestrator(
                 session_mgr=cls.session_manager(),
                 rag_store=cls.rag_store(),
@@ -105,7 +122,7 @@ class AppDependencies:
     @classmethod
     def session_manager(cls) -> LlamaSessionManager:
         if cls._session_manager is None:
-            sqlite_store, _ = cls.storage()
+            sqlite_store = cls.sqlite_store()
 
             model_path_raw = sqlite_store.get_setting("llm_model_path", "")
             model_path_raw = model_path_raw if isinstance(model_path_raw, str) else ""
@@ -149,7 +166,8 @@ class AppDependencies:
     @classmethod
     def rag_store(cls) -> RagStore:
         if cls._rag_store is None:
-            sqlite_store, vector_index = cls.storage()
+            sqlite_store = cls.sqlite_store()
+            vector_index = cls.vector_index()
             retrieval = RetrievalService(
                 qdrant_client=vector_index.client,
                 collection_name=vector_index.collection_name,
@@ -161,9 +179,15 @@ class AppDependencies:
     @classmethod
     def ltm_store(cls) -> LongTermMemoryStore:
         if cls._ltm_store is None:
-            _, vector_index = cls.storage()
-            client = vector_index.client  # reuse same Qdrant client to avoid lock conflicts
-            cls._ltm_store = LtmQdrantStore(client=client, embedder=cls.query_embedder())
+            try:
+                client = cls.vector_index().client  # reuse same Qdrant client to avoid lock conflicts
+                cls._ltm_store = LtmQdrantStore(client=client, embedder=cls.query_embedder())
+            except Exception as exc:
+                logger.warning("Falling back to in-memory LTM store: %s", exc)
+                cls._ltm_store = LongTermMemoryStore(
+                    metadata_store=cls.sqlite_store(),
+                    embedder=cls.query_embedder(),
+                )
         return cls._ltm_store
 
     @classmethod
@@ -175,14 +199,14 @@ class AppDependencies:
     @classmethod
     def search_service(cls) -> FileSearchService:
         if cls._search_service is None:
-            sqlite_store, _ = cls.storage()
+            sqlite_store = cls.sqlite_store()
             cls._search_service = FileSearchService(sqlite_store)
         return cls._search_service
 
     @classmethod
     def doc_search_service(cls) -> DocSearchService:
         if cls._doc_search_service is None:
-            sqlite_store, _ = cls.storage()
+            sqlite_store = cls.sqlite_store()
             cls._doc_search_service = DocSearchService(sqlite_store)
         return cls._doc_search_service
 
@@ -248,12 +272,25 @@ class AppDependencies:
         Best-effort activity check used to block destructive operations (reset/clean)
         while background work is running (ingestion, streaming, KV snapshot/persist).
         """
-        store, _ = cls.storage()
+        store = cls._sqlite_store
+        close_store = False
+        if store is None:
+            try:
+                store = SQLiteMetadataStore(cls.workspace().db, config=SQLiteConfig())
+                close_store = True
+            except Exception:
+                store = None
         active_jobs_db = 0
-        try:
-            active_jobs_db = int(store.count_jobs_with_status(("queued", "running")))
-        except Exception:
-            active_jobs_db = 0
+        if store is not None:
+            try:
+                active_jobs_db = int(store.count_jobs_with_status(("queued", "running")))
+            except Exception:
+                active_jobs_db = 0
+            if close_store:
+                try:
+                    store.close()
+                except Exception:
+                    pass
 
         ingestion_state: dict[str, int] | None = None
         active_jobs_mem = 0

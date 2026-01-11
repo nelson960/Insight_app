@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -72,6 +73,7 @@ pub struct EngineProcess {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     state: Arc<RouterState>,
+    pid_path: PathBuf,
 }
 
 struct RouterState {
@@ -102,6 +104,8 @@ fn next_request_id() -> String {
 impl EngineProcess {
     pub fn spawn(python_bin: &str) -> Result<Self> {
         let project_root = resolve_project_root()?;
+        let pid_path = project_root.join("storage").join("engine.pid");
+        cleanup_stale_engine(&pid_path);
         let engine_path = project_root.join("backend").join("engine.py");
 
         let mut child = Command::new(python_bin)
@@ -132,10 +136,13 @@ impl EngineProcess {
         // This is required to support /chat streaming + concurrent /files/* requests.
         spawn_stdout_router(BufReader::new(stdout), state.clone());
 
+        write_pid(&pid_path, child.id());
+
         Ok(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             state,
+            pid_path,
         })
     }
 
@@ -263,6 +270,7 @@ impl EngineProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = fs::remove_file(&self.pid_path);
     }
 }
 
@@ -276,6 +284,74 @@ impl Drop for EngineProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = fs::remove_file(&self.pid_path);
+    }
+}
+
+fn write_pid(pid_path: &PathBuf, pid: u32) {
+    if let Some(parent) = pid_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(pid_path, pid.to_string());
+}
+
+fn cleanup_stale_engine(pid_path: &PathBuf) {
+    let pid = match fs::read_to_string(pid_path) {
+        Ok(raw) => raw.trim().parse::<u32>().ok(),
+        Err(_) => None,
+    };
+    if pid.is_none() {
+        let _ = fs::remove_file(pid_path);
+        return;
+    }
+    let pid = pid.unwrap();
+    if !pid_is_engine(pid) {
+        let _ = fs::remove_file(pid_path);
+        return;
+    }
+    terminate_pid(pid);
+    let _ = fs::remove_file(pid_path);
+}
+
+fn terminate_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
+fn pid_is_engine(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let cmd = String::from_utf8_lossy(&output.stdout);
+                return cmd.contains("backend/engine.py") || cmd.contains("engine.py");
+            }
+        }
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        true
     }
 }
 
