@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { engine } from "../api/engine";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -91,8 +91,7 @@ export function SettingsModal(props: {
   const [restartRequired, setRestartRequired] = useState(false);
   const [modelValidation, setModelValidation] = useState<{ ok: boolean; msg: string } | null>(null);
   const [cleanResult, setCleanResult] = useState<string | null>(null);
-  const [resetArmed, setResetArmed] = useState(false);
-  const [llmApplyArmed, setLlmApplyArmed] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [engineBusy, setEngineBusy] = useState<BusyState | null>(null);
   const [llmLoaded, setLlmLoaded] = useState(false);
@@ -100,6 +99,7 @@ export function SettingsModal(props: {
   const [healthReport, setHealthReport] = useState<HealthReport | null>(null);
   const [embeddingDownloading, setEmbeddingDownloading] = useState(false);
   const [embeddingDownloadError, setEmbeddingDownloadError] = useState<string | null>(null);
+  const resetWrapRef = useRef<HTMLDivElement | null>(null);
 
   function getErrorText(res: { error?: string; data?: any }, fallback: string) {
     return (
@@ -113,8 +113,7 @@ export function SettingsModal(props: {
 
   useEffect(() => {
     if (!open) return;
-    setResetArmed(false);
-    setLlmApplyArmed(false);
+    setResetOpen(false);
     setCleanResult(null);
     setModelValidation(null);
     setRestartRequired(false);
@@ -146,6 +145,18 @@ export function SettingsModal(props: {
       setBusy(false);
     })().catch(() => setBusy(false));
   }, [open]);
+
+  useEffect(() => {
+    if (!resetOpen) return;
+    function handleOutsideClick(event: MouseEvent) {
+      if (!resetWrapRef.current) return;
+      if (!resetWrapRef.current.contains(event.target as Node)) {
+        setResetOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, [resetOpen]);
 
   useEffect(() => {
     if (!open) return;
@@ -264,11 +275,6 @@ export function SettingsModal(props: {
       setCleanResult("Background work is running. Wait for it to finish before applying model settings.");
       return;
     }
-    if (!llmApplyArmed) {
-      setLlmApplyArmed(true);
-      setCleanResult("Click again to confirm. This will delete all chats, files, indexes, and KV sessions.");
-      return;
-    }
 
     const ok = await validateModel(settings.llm_model_path);
     if (!ok) {
@@ -325,19 +331,14 @@ export function SettingsModal(props: {
       setCleanResult("Background work is running. Wait for it to finish before resetting.");
       return;
     }
-    if (!resetArmed) {
-      setResetArmed(true);
-      return;
-    }
     setBusy(true);
     const res = await engine<any>("/settings/storage/reset", { confirm: true }, "POST");
     setBusy(false);
     if (!res.ok) {
       setCleanResult(getErrorText(res, "Reset failed"));
-      setResetArmed(false);
       return;
     }
-    setResetArmed(false);
+    setResetOpen(false);
     setRestartRequired(true);
     const st = await engine<StorageUsage>("/settings/storage", undefined, "GET");
     if (st.ok) setStorage(st.data as any);
@@ -359,7 +360,7 @@ export function SettingsModal(props: {
     setModelValidation(null);
     const total = st.ok ? formatBytes((st.data as any)?.total_bytes ?? 0) : "0 B";
     setCleanResult(
-      `Delete complete. Workspace cleared (KV/Qdrant/DB/uploads/cache/logs/keys/config). Current storage: ${total}. Please restart the app.`
+      `Delete complete. Workspace cleared (KV/Qdrant/DB/uploads/cache/logs). Current storage: ${total}. Please restart the app.`
     );
     onClose();
     window.setTimeout(() => {
@@ -403,8 +404,10 @@ export function SettingsModal(props: {
       >
         <div className="settings-header">
           <div className="settings-title">Settings</div>
-          <button className="settings-close" type="button" onClick={onClose} aria-label="Close">
-            ×
+          <button className="settings-icon-btn settings-close" type="button" onClick={onClose} aria-label="Close">
+            <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M6 6l12 12M18 6l-12 12" />
+            </svg>
           </button>
         </div>
 
@@ -420,40 +423,6 @@ export function SettingsModal(props: {
         ) : null}
 
         <div className="settings-body">
-          <section className="settings-section">
-            <div className="settings-section-title">Storage</div>
-            <div className="settings-row">
-              <div className="settings-kv">
-                <div className="k">Workspace</div>
-                <div className="v">{storage?.base || "…"}</div>
-              </div>
-              <div className="settings-kv">
-                <div className="k">Total</div>
-                <div className="v">{storage ? formatBytes(storage.total_bytes) : "…"}</div>
-              </div>
-              <button className="settings-btn" type="button" onClick={refreshStorage}>
-                Refresh
-              </button>
-            </div>
-            <div className="settings-breakdown">
-              {sortedBreakdown.map(([name, info]) => (
-                <div key={name} className="settings-breakdown-row">
-                  <div className="name">{name}</div>
-                  <div className="bytes">{formatBytes(info.bytes)}</div>
-                </div>
-              ))}
-            </div>
-            <div className="settings-row">
-              <button className="settings-btn" type="button" disabled={!!engineBusy?.busy} onClick={() => cleanCache(false)}>
-                Clean cache
-              </button>
-              <button className="settings-btn" type="button" disabled={!!engineBusy?.busy} onClick={() => cleanCache(true)}>
-                Clean cache + logs
-              </button>
-              <div className="settings-muted">{cleanResult || ""}</div>
-            </div>
-          </section>
-
           <section className="settings-section">
             <div className="settings-section-title">Health</div>
             {healthReport ? (
@@ -500,12 +469,20 @@ export function SettingsModal(props: {
                         </div>
                         <div className="settings-row">
                           <button
-                            className="settings-btn"
+                            className="settings-icon-btn"
                             type="button"
                             onClick={downloadEmbeddings}
                             disabled={embeddingBusy || !!engineBusy?.busy}
+                            aria-label={
+                              embeddingBusy ? "Embedding download in progress" : "Download embeddings"
+                            }
+                            title={embeddingBusy ? "Downloading…" : "Download embeddings"}
                           >
-                            {embeddingBusy ? "Downloading…" : "Download embeddings"}
+                            <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M12 4v10" />
+                              <path d="M8.5 10.5L12 14l3.5-3.5" />
+                              <path d="M5 18h14" />
+                            </svg>
                           </button>
                           {embeddingDownloadError ? (
                             <div className="settings-hint err">{embeddingDownloadError}</div>
@@ -553,8 +530,17 @@ export function SettingsModal(props: {
                     if (ok) setLlmApplyArmed(false);
                   }}
                 />
-                <button className="settings-btn" type="button" onClick={browseModel}>
-                  Browse…
+                <button
+                  className="settings-icon-btn"
+                  type="button"
+                  onClick={browseModel}
+                  aria-label="Browse for a GGUF model"
+                  title="Browse model file"
+                >
+                  <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 8h6l2 2h8v8H4z" />
+                    <path d="M4 8V6h6l2 2" />
+                  </svg>
                 </button>
               </div>
               {modelValidation ? (
@@ -601,25 +587,28 @@ export function SettingsModal(props: {
               <label className="settings-label">Context length</label>
               <div className="settings-inline">
                 <select
-                  className="settings-select"
+                  className="settings-select settings-select-compact"
                   value={String(settings.llm_ctx_size || 32768)}
                   onChange={(e) => {
                     const v = Number(e.target.value);
                     setSettings((p) => ({ ...p, llm_ctx_size: v }));
-                    setLlmApplyArmed(false);
                   }}
                 >
                   <option value="8192">8k</option>
                   <option value="32768">32k</option>
                 </select>
-                <button
-                  className={`settings-btn danger ${llmApplyArmed ? "confirm" : ""}`}
-                  type="button"
-                  disabled={busy || !!engineBusy?.busy}
-                  onClick={applyLlmSettings}
-                >
-                  {llmApplyArmed ? "Click again to confirm" : "Apply (resets all data)"}
-                </button>
+                <div className="settings-apply-wrap">
+                  <button
+                    className="settings-reset-confirm settings-apply-confirm"
+                    type="button"
+                    disabled={busy || !!engineBusy?.busy}
+                    onClick={applyLlmSettings}
+                    aria-label="Apply model settings (resets all data)"
+                    title="Apply (resets all data)"
+                  >
+                    Apply model
+                  </button>
+                </div>
               </div>
               <div className="settings-hint">
                 Changing model/context clears chats, files, indexes, and KV sessions.
@@ -631,52 +620,130 @@ export function SettingsModal(props: {
             <div className="settings-section-title">Appearance</div>
             <div className="settings-row">
               <button
-                className={`settings-btn ${themeMode === "system" ? "active" : ""}`}
+                className={`settings-icon-btn ${themeMode === "system" ? "active" : ""}`}
                 type="button"
                 onClick={() => {
                   onThemeModeChange("system");
                   saveSettingsPatch({ theme_mode: "system" });
                 }}
+                aria-label="Use system theme"
+                title="System"
               >
-                System
+                <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="3.5" y="4.5" width="17" height="12" rx="2" />
+                  <path d="M8 19.5h8" />
+                  <path d="M12 16.5v3" />
+                </svg>
               </button>
               <button
-                className={`settings-btn ${themeMode === "dark" ? "active" : ""}`}
+                className={`settings-icon-btn ${themeMode === "dark" ? "active" : ""}`}
                 type="button"
                 onClick={() => {
                   onThemeModeChange("dark");
                   saveSettingsPatch({ theme_mode: "dark" });
                 }}
+                aria-label="Use dark theme"
+                title="Dark"
               >
-                Dark
+                <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M14.5 4.5a7 7 0 1 0 5 12.5a7.5 7.5 0 0 1 -5 -12.5z" />
+                </svg>
               </button>
               <button
-                className={`settings-btn ${themeMode === "light" ? "active" : ""}`}
+                className={`settings-icon-btn ${themeMode === "light" ? "active" : ""}`}
                 type="button"
                 onClick={() => {
                   onThemeModeChange("light");
                   saveSettingsPatch({ theme_mode: "light" });
                 }}
+                aria-label="Use light theme"
+                title="Light"
               >
-                Light
+                <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="12" cy="12" r="4.2" />
+                  <path d="M12 2.5v3.2" />
+                  <path d="M12 18.3v3.2" />
+                  <path d="M2.5 12h3.2" />
+                  <path d="M18.3 12h3.2" />
+                  <path d="M4.6 4.6l2.3 2.3" />
+                  <path d="M17.1 17.1l2.3 2.3" />
+                  <path d="M19.4 4.6l-2.3 2.3" />
+                  <path d="M6.9 17.1l-2.3 2.3" />
+                </svg>
               </button>
             </div>
           </section>
 
           <section className="settings-section danger">
-            <div className="settings-section-title">Reset</div>
-            <div className="settings-hint">
-              Deletes all data under <code>storage/</code> (DB, Qdrant, KV sessions, uploads, cache, logs, keys, config). Does not touch <code>models/</code>.
-            </div>
+            <div className="settings-section-title">Storage</div>
             <div className="settings-row">
-              <button
-                className={`settings-btn danger ${resetArmed ? "confirm" : ""}`}
-                type="button"
-                disabled={busy || !!engineBusy?.busy}
-                onClick={resetAll}
-              >
-                {resetArmed ? "Click again to confirm delete" : "Delete all data"}
-              </button>
+              <div className="settings-kv">
+                <div className="k">Workspace</div>
+                <div className="v">{storage?.base || "…"}</div>
+              </div>
+              <div className="settings-kv settings-kv-total">
+                <div className="k">Total</div>
+                <div className="v settings-total-row">
+                  <span>{storage ? formatBytes(storage.total_bytes) : "…"}</span>
+                  <button
+                    className="settings-icon-btn settings-refresh-btn"
+                    type="button"
+                    onClick={refreshStorage}
+                    aria-label="Refresh storage usage"
+                    title="Refresh storage"
+                  >
+                    <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M20 12a8 8 0 1 1-2.3-5.6" />
+                      <path d="M20 5v5h-5" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <details className="settings-dropdown">
+              <summary>Storage files</summary>
+              <div className="settings-dropdown-panel">
+                <div className="settings-breakdown">
+                  {sortedBreakdown.map(([name, info]) => (
+                    <div key={name} className="settings-breakdown-row">
+                      <div className="name">{name}</div>
+                      <div className="bytes">{formatBytes(info.bytes)}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </details>
+            <div className="settings-divider" />
+            <div className="settings-section-title">Reset</div>
+            <div className="settings-row">
+              <div className="settings-reset-wrap" ref={resetWrapRef}>
+                <button
+                  className="settings-icon-btn danger reset-trigger"
+                  type="button"
+                  disabled={busy || !!engineBusy?.busy}
+                  onClick={() => setResetOpen((prev) => !prev)}
+                  aria-label="Reset all data"
+                  title="Reset all data"
+                >
+                  <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 7h16" />
+                    <path d="M9 7V5h6v2" />
+                    <path d="M7 7l1 12h8l1-12" />
+                  </svg>
+                </button>
+                {resetOpen && (
+                  <div className="settings-reset-popover" role="dialog" aria-label="Confirm reset">
+                    <button
+                      className="settings-reset-confirm"
+                      type="button"
+                      disabled={busy || !!engineBusy?.busy}
+                      onClick={resetAll}
+                    >
+                      Reset
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </section>
         </div>

@@ -1303,16 +1303,12 @@ function ChatNote({
   }
 
   function beginDrag(e: React.PointerEvent) {
-    if (locked) return;
+    if (locked || isRenaming) return;
     if (e.button !== 0) return;
+    if (e.detail > 1) return;
     const t = e.target as HTMLElement | null;
     if (t && (t.closest("button") || t.closest("input"))) return;
     bringToFront();
-    try {
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    } catch {
-      // ignore
-    }
     dragRef.current = { startX: e.clientX, startY: e.clientY, startPx: x, startPy: y };
     dragMovedRef.current = false;
   }

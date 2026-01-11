@@ -279,7 +279,7 @@ def apply_llm_settings(payload: Dict[str, Any] = Body(default={})) -> Dict[str, 
     Apply model/context settings and clear user data.
 
     This is destructive by design:
-    - deletes DB (messages/files/doc_pages/chunks/jobs), Qdrant vectors, KV sessions, uploads, cache, logs, keys, config
+    - deletes DB (messages/files/doc_pages/chunks/jobs), Qdrant vectors, KV sessions, uploads, cache, logs
     - preserves the updated app settings so the engine can restart/reload cleanly
     """
     confirm = payload.get("confirm") if isinstance(payload, dict) else None
@@ -346,15 +346,13 @@ def storage_usage() -> Dict[str, Any]:
     ws = AppDependencies.workspace()
     base = Path(ws.base)
 
-    # Workspace structure includes: uploads, qdrant, cache, logs, keys, config, db.sqlite.
+    # Workspace structure includes: uploads, qdrant, cache, logs, db.sqlite.
     parts = {
         "uploads": base / "uploads",
         "qdrant": base / "qdrant",
         "kv_sessions": base / "kv_sessions",
         "cache": base / "cache",
         "logs": base / "logs",
-        "keys": base / "keys",
-        "config": base / "config",
         "db": base / "db.sqlite",
     }
     breakdown: Dict[str, Any] = {}
@@ -439,7 +437,7 @@ def clean_cache(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
 @router.post("/storage/reset")
 def reset_storage(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
     """
-    Deletes *all* user data in the workspace (SQLite, Qdrant, KV sessions, uploads, cache, logs, keys, config).
+    Deletes *all* user data in the workspace (SQLite, Qdrant, KV sessions, uploads, cache, logs).
     Requires restart to reinitialize clients.
     """
     confirm = payload.get("confirm") if isinstance(payload, dict) else None

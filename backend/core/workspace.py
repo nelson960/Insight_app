@@ -19,7 +19,7 @@ class Workspace:
         self._ensure_permissions()
 
     def _ensure_structure(self) -> None:
-        for sub in ["uploads", "qdrant", "cache", "logs", "keys"]:
+        for sub in ["uploads", "qdrant", "cache", "logs"]:
             path = self.base / sub
             path.mkdir(parents=True, exist_ok=True)
 
@@ -49,10 +49,6 @@ class Workspace:
     def logs(self) -> Path:
         return self.base / "logs"
 
-    @property
-    def keys(self) -> Path:
-        return self.base / "keys"
-
     def reset(self, *, confirm: bool = False, keep_em_models: bool = False) -> None:
         if not confirm:
             raise ValueError("Reset not confirmed.")
@@ -62,7 +58,6 @@ class Workspace:
             self.cache,
             self.db,
             self.logs,
-            self.keys,
             self.base / "kv_sessions",
         ]
         if not keep_em_models:

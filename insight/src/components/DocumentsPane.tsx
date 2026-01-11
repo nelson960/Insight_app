@@ -342,6 +342,9 @@ export function DocumentsPane({
 
   const isControlled = typeof activeFileId !== "undefined";
   const effectiveActiveFileId = isControlled ? (activeFileId ?? null) : internalActiveFileId;
+  const filesRef = useRef<ChatFile[]>([]);
+  const [pendingActiveFileId, setPendingActiveFileId] = useState<string | null>(null);
+  const pendingActiveFileIdRef = useRef<string | null>(null);
 
   function setActiveFileId(nextId: string | null) {
     setConfirmDeleteFileId(null);
@@ -358,9 +361,18 @@ export function DocumentsPane({
   }, [effectiveActiveFileId]);
 
   useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
+
+  useEffect(() => {
+    pendingActiveFileIdRef.current = pendingActiveFileId;
+  }, [pendingActiveFileId]);
+
+  useEffect(() => {
     setError(null);
     setFiles([]);
     setPendingUploads([]);
+    setPendingActiveFileId(null);
     setIsLoadingFiles(false);
     setIsDropHover(false);
     dropCounterRef.current = 0;
@@ -421,6 +433,13 @@ export function DocumentsPane({
       if (typeof targetChatId !== "string" || targetChatId !== chatId) return;
       const fid = typeof ce?.detail?.fileId === "string" ? ce.detail.fileId : "";
       if (!fid) return;
+      const current = filesRef.current;
+      const exists = current.some((f) => f.file_id === fid);
+      if (!exists) {
+        setPendingActiveFileId(fid);
+      } else {
+        setPendingActiveFileId(null);
+      }
       setActiveFileId(fid);
     }
     window.addEventListener("insight:docs-select", onSelect as any);
@@ -458,6 +477,14 @@ export function DocumentsPane({
     if (next.length) {
       setPendingUploads((prev) => (prev.length ? [] : prev));
     }
+    const pendingId = pendingActiveFileIdRef.current;
+    if (pendingId) {
+      const found = next.some((f) => f.file_id === pendingId);
+      if (found) {
+        setActiveFileId(pendingId);
+        setPendingActiveFileId(null);
+      }
+    }
     return next;
   }
 
@@ -491,6 +518,14 @@ export function DocumentsPane({
       reloadFiles()
         .then((next) => {
           const fidFromEvent = typeof payload?.file_id === "string" ? payload.file_id : null;
+          const pendingId = pendingActiveFileIdRef.current;
+          if (pendingId) {
+            if (next.some((f) => f.file_id === pendingId)) {
+              setActiveFileId(pendingId);
+              setPendingActiveFileId(null);
+            }
+            return;
+          }
 
           if (reason === "files-changed" && fidFromEvent) {
             if (
@@ -576,6 +611,14 @@ export function DocumentsPane({
       setIsLoadingFiles(false);
 
       const current = isControlled ? (activeFileId ?? null) : internalActiveFileId;
+      const pendingId = pendingActiveFileIdRef.current;
+      if (pendingId) {
+        if (next.some((f) => f.file_id === pendingId)) {
+          setActiveFileId(pendingId);
+          setPendingActiveFileId(null);
+        }
+        return;
+      }
       const currentStillExists = current ? next.some((f) => f.file_id === current) : false;
       if (!currentStillExists) setActiveFileId(next.length ? next[0].file_id : null);
       if (!current && next.length) setActiveFileId(next[0].file_id);

@@ -69,7 +69,7 @@ pub fn resolve_project_root() -> Result<PathBuf> {
 }
 
 pub struct EngineProcess {
-    child: Child,
+    child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     state: Arc<RouterState>,
 }
@@ -133,7 +133,7 @@ impl EngineProcess {
         spawn_stdout_router(BufReader::new(stdout), state.clone());
 
         Ok(Self {
-            child,
+            child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             state,
         })
@@ -253,14 +253,29 @@ impl EngineProcess {
         stdin.flush()?;
         Ok(())
     }
+
+    pub fn shutdown(&self) {
+        if let Ok(mut stdin) = self.stdin.lock() {
+            let _ = writeln!(stdin, r#"{{"cmd":"shutdown"}}"#);
+            let _ = stdin.flush();
+        }
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Drop for EngineProcess {
     fn drop(&mut self) {
         if let Ok(mut stdin) = self.stdin.lock() {
             let _ = writeln!(stdin, r#"{{"cmd":"shutdown"}}"#);
+            let _ = stdin.flush();
         }
-        let _ = self.child.kill();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

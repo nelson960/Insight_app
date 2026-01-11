@@ -46,6 +46,8 @@ type ContextStatus = {
   last_gen_tps?: number;
   last_ttft_ms?: number;
   last_gen_tokens?: number;
+  input_budget_tokens?: number;
+  input_budget_reserved?: number;
 };
 
 type MarkdownStreamState = {
@@ -197,6 +199,7 @@ export function ChatWindow({
   const branchPopoverRef = useRef<HTMLDivElement | null>(null);
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
   const [ingestProgress, setIngestProgress] = useState<IngestProgressState | null>(null);
+  const [showPrestream, setShowPrestream] = useState(false);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
   const [localSelection, setLocalSelection] = useState<{ text: string; file_id?: string } | null>(
     null
@@ -214,6 +217,9 @@ export function ChatWindow({
   const INPUT_MAX_HEIGHT_PX = 120;
   const chatPopoverTimerRef = useRef<number | null>(null);
   const toastTimerRef = useRef<number | null>(null);
+  const prestreamTimerRef = useRef<number | null>(null);
+  const prestreamRequestIdRef = useRef<string | null>(null);
+  const prestreamStartedRef = useRef(false);
 
   // Scroll state: stick-to-bottom pattern with refs
   const stickToBottomRef = useRef<boolean>(true);
@@ -263,6 +269,29 @@ export function ChatWindow({
       toastTimerRef.current = null;
       setToast(null);
     }, 4200);
+  }
+
+  function clearPrestream() {
+    if (prestreamTimerRef.current != null) {
+      window.clearTimeout(prestreamTimerRef.current);
+      prestreamTimerRef.current = null;
+    }
+    prestreamRequestIdRef.current = null;
+    prestreamStartedRef.current = false;
+    setShowPrestream(false);
+  }
+
+  function startPrestream(requestId: string) {
+    clearPrestream();
+    prestreamRequestIdRef.current = requestId;
+    prestreamStartedRef.current = false;
+    prestreamTimerRef.current = window.setTimeout(() => {
+      prestreamTimerRef.current = null;
+      if (prestreamRequestIdRef.current !== requestId) return;
+      if (prestreamStartedRef.current) return;
+      if (chatId && getChatUiSnapshot(chatId).activeRequestId !== requestId) return;
+      setShowPrestream(true);
+    }, 500);
   }
 
   useEffect(() => {
@@ -558,6 +587,7 @@ export function ChatWindow({
     setPendingChatSelection(null);
     setIngestProgress(null);
     setIsSending(false);
+    clearPrestream();
 
     setChatUi(getChatUiSnapshot(chatId));
 
@@ -596,6 +626,10 @@ export function ChatWindow({
           if (delta) _ingestMarkdownChunk(entry.st, delta);
           entry.seen = content.length;
           mdStreamRef.current.set(rid, entry);
+          if (rid === prestreamRequestIdRef.current && delta) {
+            prestreamStartedRef.current = true;
+            setShowPrestream(false);
+          }
         }
       }
 
@@ -628,6 +662,7 @@ export function ChatWindow({
     const prev = prevRequestIdRef.current;
     prevRequestIdRef.current = activeRequestId;
     if (prev && !activeRequestId) {
+      clearPrestream();
       waitForStreamToFinish(prev)
         .then(() => {
           if (chatId) refreshContextStatus(chatId).catch(() => {});
@@ -884,6 +919,7 @@ export function ChatWindow({
       attachments: attachedNames.length ? attachedNames : undefined,
       selection: selectionPayload,
     });
+    startPrestream(requestId);
 
     setInput("");
     setAttachedPaths([]);
@@ -914,12 +950,13 @@ export function ChatWindow({
           const msg = formatIngestFailure(ingestRes as any);
           showToast(msg);
           setError(msg);
-          rollbackStreamTurn(chatId, requestId);
-          setInput(inputBeforeSend);
-          setAttachedPaths(attachedBeforeSend);
-          if (selectionBeforeSend) setSelectionValue(selectionBeforeSend);
-          return;
-        }
+        rollbackStreamTurn(chatId, requestId);
+        setInput(inputBeforeSend);
+        setAttachedPaths(attachedBeforeSend);
+        if (selectionBeforeSend) setSelectionValue(selectionBeforeSend);
+        clearPrestream();
+        return;
+      }
         const files = Array.isArray(ingestRes.data?.files) ? ingestRes.data.files : [];
         docIdsForTurn = files.map((f) => f.file_id).filter((s) => typeof s === "string" && s);
         const names = files.map((f) => f.filename).filter((s) => typeof s === "string" && s);
@@ -1033,8 +1070,10 @@ export function ChatWindow({
             waitIds = [latestChatId];
           }
         }
-        for (const fid of docIdsForTurn) {
-          if (!waitIds.includes(fid)) waitIds.push(fid);
+        if (!docPaneOpen) {
+          for (const fid of docIdsForTurn) {
+            if (!waitIds.includes(fid)) waitIds.push(fid);
+          }
         }
         // Only wait for files that are not completed.
         waitIds = waitIds.filter((fid) => {
@@ -1044,7 +1083,15 @@ export function ChatWindow({
 
         if (!waitIds.length) return;
 
-        setIngestProgress({ fileIds: waitIds, total: waitIds.length, done: 0, failed: 0 });
+        const progressIds = Array.from(
+          new Set((docIdsForTurn.length ? docIdsForTurn : waitIds).filter(Boolean))
+        );
+        setIngestProgress({
+          fileIds: progressIds,
+          total: progressIds.length,
+          done: 0,
+          failed: 0,
+        });
 
         while (true) {
           // Cancelled (Stop clicked) or superseded by another send.
@@ -1055,7 +1102,7 @@ export function ChatWindow({
           let done = 0;
           let failed = 0;
           let pending = 0;
-          for (const fid of waitIds) {
+          for (const fid of progressIds) {
             const st = stMap.get(fid) || "";
             if (st === "completed") done += 1;
             else if (st === "failed") {
@@ -1063,8 +1110,14 @@ export function ChatWindow({
               failed += 1;
             } else pending += 1;
           }
-          setIngestProgress({ fileIds: waitIds, total: waitIds.length, done, failed });
-          if (pending === 0) break;
+          setIngestProgress({ fileIds: progressIds, total: progressIds.length, done, failed });
+
+          let pendingWait = 0;
+          for (const fid of waitIds) {
+            const st = stMap.get(fid) || "";
+            if (st !== "completed" && st !== "failed") pendingWait += 1;
+          }
+          if (pendingWait === 0) break;
 
           if (Date.now() - start > maxWaitMs) {
             throw new Error("Timed out waiting for document indexing to complete");
@@ -1095,6 +1148,7 @@ export function ChatWindow({
       showToast(msg);
       setError(msg);
       setIngestProgress(null);
+      clearPrestream();
       // Ensure UI returns to Send state even if the stream failed to start.
       if (chatId && getChatUiSnapshot(chatId).activeRequestId === requestId) {
         cancelStreamTurn(chatId);
@@ -1114,6 +1168,7 @@ export function ChatWindow({
     cancelStreamTurn(chatId);
     setIngestProgress(null);
     setIsSending(false);
+    clearPrestream();
 
     // Scroll to bottom and set stickToBottom to true
     stickToBottomRef.current = true;
@@ -1219,6 +1274,17 @@ export function ChatWindow({
           <div key={m.id} className={`chat-message chat-message-${m.role}`}>
             <div className="chat-message-role">
               {m.role === "user" ? "You" : "Insight"}
+              {showPrestream &&
+              isStreaming &&
+              activeRequestId &&
+              m.role === "assistant" &&
+              m.request_id === activeRequestId ? (
+                <div className="chat-prestream chat-prestream-inline" role="status" aria-label="Preparing response">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              ) : null}
             </div>
             <div className="chat-message-content">
               {m.role === "assistant" ? (
@@ -1397,26 +1463,6 @@ export function ChatWindow({
         </div>
       )}
 
-      {ingestProgress ? (
-        <div className="chat-ingest-progress" role="status" aria-label="Indexing documents">
-          <div className="chat-ingest-progress-bar">
-            <div
-              className="chat-ingest-progress-fill"
-              style={{
-                width:
-                  ingestProgress.total > 0
-                    ? `${Math.round((ingestProgress.done / ingestProgress.total) * 100)}%`
-                    : "0%",
-              }}
-            />
-          </div>
-          <div className="chat-ingest-progress-text">
-            Indexing {ingestProgress.done}/{ingestProgress.total}
-            {ingestProgress.failed ? ` · ${ingestProgress.failed} failed` : ""}
-          </div>
-        </div>
-      ) : null}
-
       <div className="chat-input-row">
         <div className="chat-input-shell">
           {effectiveSelection?.text ? (
@@ -1492,12 +1538,16 @@ export function ChatWindow({
               const cap = Number(contextStatus.capacity_tokens || 0);
               const pctUsed = Math.max(0, Math.min(100, Number(contextStatus.percent || 0)));
               const left = Math.max(0, cap - used);
+              const inputBudget = Number(contextStatus.input_budget_tokens || 0);
               const tps =
                 typeof contextStatus.last_gen_tps === "number" && Number.isFinite(contextStatus.last_gen_tps)
                   ? contextStatus.last_gen_tps
                   : null;
               const speedLine = tps ? `\nSpeed ~${tps.toFixed(1)} tok/s` : "";
-              const tooltip = `Used ${pctUsed}%\nRemaining ${formatInt(left)} / ${formatInt(cap)} tokens${speedLine}`;
+              const inputLine = inputBudget
+                ? `\nMax input ~${formatInt(inputBudget)} tokens`
+                : "\nMax input n/a";
+              const tooltip = `Used ${pctUsed}%\nRemaining ${formatInt(left)} / ${formatInt(cap)} tokens${inputLine}${speedLine}`;
               const r = 16;
               const cx = 18;
               const cy = 18;
@@ -1535,6 +1585,7 @@ export function ChatWindow({
                         <div>
                           Used {pctUsed}% · Remaining {formatInt(left)} / {formatInt(cap)} tokens
                         </div>
+                        <div>Max input ~{inputBudget ? formatInt(inputBudget) : "n/a"} tokens</div>
                         {tps ? <div>Speed ~{tps.toFixed(1)} tok/s</div> : null}
                       </div>
                     </div>

@@ -13,7 +13,6 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Fo
 from fastapi.responses import StreamingResponse
 
 from backend.services.planner import PlannerRequest
-from backend.services.planner.summarizer import summarize_text as do_summarize_text
 from backend.api.deps import AppDependencies
 from backend.services.ipc_events import emit_event
 from pathlib import Path
@@ -361,20 +360,6 @@ def context_status(chat_id: str):
     except ValueError:
         raise HTTPException(status_code=404, detail="Chat not found")
     return status
-
-@router.post("/summarize_text")
-def summarize_text(payload: Dict[str, Any] = Body(...)):
-    """
-    Summarize arbitrary text without persisting any session state.
-    """
-    text = payload.get("text")
-    if not text:
-        raise HTTPException(status_code=400, detail="Field 'text' is required")
-    max_tokens = payload.get("max_tokens", 512)
-
-    mgr = AppDependencies.session_manager()
-    summary = do_summarize_text(text, mgr, max_tokens=max_tokens)
-    return {"summary": summary}
 
 @router.post("/branch")
 def branch_chat(payload: Dict[str, Any] = Body(...)):

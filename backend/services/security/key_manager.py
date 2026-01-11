@@ -15,13 +15,15 @@ logger = logging.getLogger(__name__)
 class KeyManager:
     """Provides access to a master encryption key stored in the workspace."""
 
-    KEY_FILENAME = "master.key"
+    KEY_FILENAME = ".insight_master.key"
+    LEGACY_KEY_FILENAME = "master.key"
     KEYCHAIN_SERVICE = "insight-master-key"
     KEYCHAIN_ACCOUNT = "default"
 
     def __init__(self, workspace=None) -> None:
         self.workspace = workspace or get_workspace()
-        self.key_path = self.workspace.keys / self.KEY_FILENAME
+        self.key_path = self.workspace.base / self.KEY_FILENAME
+        self.legacy_key_path = self.workspace.base / "keys" / self.LEGACY_KEY_FILENAME
         self._key: bytes | None = None
 
     def _read_keychain(self) -> bytes | None:
@@ -98,9 +100,40 @@ class KeyManager:
                         self.key_path.unlink()
                         logger.info("Migrated master key to Keychain and removed %s", self.key_path)
                     except Exception:
-                        logger.warning("Failed to remove legacy key file %s", self.key_path, exc_info=True)
+                        logger.warning("Failed to remove key file %s", self.key_path, exc_info=True)
                 else:
                     logger.warning("Using legacy key file at %s", self.key_path)
+            elif self.legacy_key_path.exists():
+                self._key = self.legacy_key_path.read_bytes()
+                if self._write_keychain(self._key):
+                    try:
+                        self.legacy_key_path.unlink()
+                        if self.legacy_key_path.parent.exists() and not any(self.legacy_key_path.parent.iterdir()):
+                            self.legacy_key_path.parent.rmdir()
+                        logger.info(
+                            "Migrated legacy master key to Keychain and removed %s",
+                            self.legacy_key_path,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to remove legacy key file %s",
+                            self.legacy_key_path,
+                            exc_info=True,
+                        )
+                else:
+                    self.key_path.write_bytes(self._key)
+                    os.chmod(self.key_path, 0o600)
+                    try:
+                        self.legacy_key_path.unlink()
+                        if self.legacy_key_path.parent.exists() and not any(self.legacy_key_path.parent.iterdir()):
+                            self.legacy_key_path.parent.rmdir()
+                    except Exception:
+                        logger.warning(
+                            "Failed to remove legacy key file %s",
+                            self.legacy_key_path,
+                            exc_info=True,
+                        )
+                    logger.warning("Migrated legacy key file to %s", self.key_path)
             else:
                 self._key = os.urandom(32)
                 if self._write_keychain(self._key):

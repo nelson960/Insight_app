@@ -40,6 +40,10 @@ class LlamaSessionManager:
     _SNAPSHOT_DEBOUNCE_SEC = 0.35
     _STATE_KIND_COMPACT = "llama_state_compact_v1"
     _KV_FILE_FORMAT = "raw_llama_state_v1"
+    _OUTPUT_RESERVE_PCT = 0.10
+    _CONTEXT_MARGIN_PCT = 0.02
+    _MAX_INPUT_PCT = 0.65
+    _COMPACT_PCT = 0.70
     """
     Single-model, multi-session manager using llama_cpp KV snapshots.
 
@@ -736,6 +740,8 @@ class LlamaSessionManager:
                     int(hard_total),
                     int(self.ctx_size or 0),
                 )
+                session["last_output_budget"] = int(hard_total)
+                session["last_reserved_output"] = int(max_tokens)
 
                 out = self._create_completion_from_state(
                     prompt_tokens=run_tokens,
@@ -900,6 +906,8 @@ class LlamaSessionManager:
                         int(hard_total),
                         int(self.ctx_size or 0),
                     )
+                    session["last_output_budget"] = int(hard_total)
+                    session["last_reserved_output"] = int(max_tokens)
 
                     stream = self._create_completion_from_state(
                         prompt_tokens=run_tokens,
@@ -1061,21 +1069,15 @@ class LlamaSessionManager:
         if not self.ctx_size:
             return context_pack
 
-        margin = 128
-        # Hard cap to keep the "context pack" bounded even on empty chats.
-        #
-        # For large-context models (e.g. 32k), we want enough headroom to include
-        # multi-file RAG evidence (scope=all) without truncating away entire files.
-        #
-        # The orchestrator already budgets evidence; this is the final safety net.
         try:
             ctx_size = int(self.ctx_size)
         except Exception:
             ctx_size = 0
-        dynamic_cap = int(ctx_size * 0.35) if ctx_size > 0 else 2400
-        # Keep some headroom above the orchestrator's doc-evidence cap so scope headers,
-        # LTM snippets, and formatting don't force a trim that drops an entire file.
-        ephemeral_cap = max(2400, min(12_000, dynamic_cap))
+        if ctx_size <= 0:
+            return context_pack
+
+        margin = int(ctx_size * self._CONTEXT_MARGIN_PCT)
+        reserved_output = int(ctx_size * self._OUTPUT_RESERVE_PCT)
 
         # Compact if the clean session is already near full.
         self._maybe_compact(session_id, session, force=False)
@@ -1091,16 +1093,16 @@ class LlamaSessionManager:
             except Exception:
                 base_tokens = self._estimate_tokens(probe)
 
-            available = int(self.ctx_size) - int(base_tokens) - int(reserved_max_tokens) - int(margin)
-            available = min(available, ephemeral_cap)
-            if available > 0:
-                break
-            if attempt == 0:
-                self._maybe_compact(session_id, session, force=True)
-                continue
-            return ""
+            available = int(ctx_size) - int(base_tokens) - int(reserved_output) - int(margin)
+            if available <= 0:
+                if attempt == 0:
+                    self._maybe_compact(session_id, session, force=True)
+                    continue
+                return ""
+            break
 
-        trimmed = self._truncate_text_head_to_tokens(context_pack, max(1, available))
+        max_ephemeral = max(1, int(available * self._MAX_INPUT_PCT))
+        trimmed = self._truncate_text_head_to_tokens(context_pack, max(1, max_ephemeral))
         # Validate and shrink further if the template overhead makes it spill.
         for _ in range(3):
             history = list(session.get("messages", []))
@@ -1113,7 +1115,7 @@ class LlamaSessionManager:
                     prompt_tokens = self._count_chat_prompt_tokens(candidate_msgs)
             except Exception:
                 prompt_tokens = self._estimate_tokens(candidate_msgs)
-            if prompt_tokens + margin < self.ctx_size:
+            if prompt_tokens + reserved_output + margin <= self.ctx_size:
                 return trimmed
             available = max(1, int(available * 0.7))
             trimmed = self._truncate_text_head_to_tokens(trimmed, available)
@@ -1617,6 +1619,17 @@ class LlamaSessionManager:
         last_tokens = session.get("last_gen_tokens")
         if isinstance(last_tokens, (int, float)) and math.isfinite(float(last_tokens)) and float(last_tokens) >= 0:
             status["last_gen_tokens"] = int(float(last_tokens))
+        # Expose a best-effort "input budget" for the current context state.
+        # This reflects how much ephemeral context could fit BEFORE adding a new user turn.
+        try:
+            reserved_output = int(capacity * self._OUTPUT_RESERVE_PCT)
+            margin = int(capacity * self._CONTEXT_MARGIN_PCT)
+            available = max(0, int(capacity) - int(used_tokens) - int(reserved_output) - int(margin))
+            max_input = max(0, int(available * self._MAX_INPUT_PCT))
+            status["input_budget_tokens"] = int(max_input)
+            status["input_budget_reserved"] = int(reserved_output)
+        except Exception:
+            pass
         return status
 
     def fork_session(self, session_id: str) -> str:
@@ -2617,7 +2630,7 @@ class LlamaSessionManager:
                     used = self._count_chat_prompt_tokens(messages)
             except Exception:
                 used = self._estimate_tokens(messages)
-            if used < 0.9 * self.ctx_size:
+            if used < self._COMPACT_PCT * self.ctx_size:
                 return
 
         system_msgs = [m for m in messages if m.get("role") == "system"]

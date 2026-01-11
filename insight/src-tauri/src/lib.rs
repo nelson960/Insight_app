@@ -5,13 +5,18 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use rusqlite::Connection;
 
 type SharedEngine = Arc<EngineProcess>;
 
 fn ipc_debug() -> bool {
     std::env::var("INSIGHT_IPC_DEBUG").is_ok()
+}
+
+fn shutdown_engine(app: &tauri::AppHandle) {
+    let engine = app.state::<SharedEngine>();
+    engine.shutdown();
 }
 
 fn _extract_title_from_content_json(content_json: &str) -> Option<String> {
@@ -600,7 +605,7 @@ fn spawn_kv_watcher(app: tauri::AppHandle, kv_dir: PathBuf) -> notify::Result<Re
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python3".into());
@@ -621,6 +626,12 @@ pub fn run() {
             }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { .. } = event {
+                shutdown_engine(&window.app_handle());
+                window.app_handle().exit(0);
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             engine_request,
             list_sessions,
@@ -633,6 +644,12 @@ pub fn run() {
             engine_stream_request,
             engine_cancel_request
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error running Tauri application");
+
+    app.run(|app_handle, event| {
+        if let RunEvent::ExitRequested { .. } = event {
+            shutdown_engine(app_handle);
+        }
+    });
 }

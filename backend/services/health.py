@@ -214,7 +214,7 @@ def run_startup_health() -> Dict[str, Any]:
         keychain_key = km._read_keychain()
         if keychain_key:
             checks["key_storage"] = "keychain"
-        elif km.key_path.exists():
+        elif km.key_path.exists() or km.legacy_key_path.exists():
             checks["key_storage"] = "file"
             issues.append(
                 _issue(

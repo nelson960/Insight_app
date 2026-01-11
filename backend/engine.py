@@ -92,7 +92,6 @@ _IPC_ALLOWED_ENDPOINTS: Dict[str, List[str]] = {
     ],
     "POST": [
         "/chat",
-        "/chat/summarize_text",
         "/chat/branch",
         "/files/upload",
         "/files/ingest_path",

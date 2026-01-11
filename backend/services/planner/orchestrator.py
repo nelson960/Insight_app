@@ -19,16 +19,12 @@ from backend.services.storage.sqlite_store import SQLiteMetadataStore
 
 logger = logging.getLogger(__name__)
 
-# RAG budgeting defaults (backend-owned; no config system yet).
-#
-# Keep this conservative: the session manager has a hard safety net that will
-# clamp the final "context pack" to the remaining context window. These values
-# primarily control how much *document evidence* we try to retrieve/pack.
-RAG_CONTEXT_FRACTION = 0.35
-RAG_CONTEXT_MAX_TOKENS_SINGLE = 3000
-RAG_CONTEXT_MAX_TOKENS_MULTI = 10_000
-SMALL_DOC_MAX_TOKENS = 10_000
-SMALL_DOC_MARGIN_TOKENS = 256
+# RAG budgeting defaults (percentage-only; no fixed token constants).
+# These ratios scale with the active context window.
+RESERVE_OUTPUT_PCT = 0.10
+CONTEXT_MARGIN_PCT = 0.02
+MAX_INPUT_PCT = 0.65
+SMALL_DOC_PCT = 0.90
 
 # Retrieval policy (UI-driven focus/scope).
 RAG_PRIMARY_K = 12
@@ -38,16 +34,7 @@ RAG_ALL_K_TOTAL = 14
 # Focused mode should hard-scope retrieval to the focused file only.
 # Cross-file mixing is allowed only in scope=all.
 RAG_SECONDARY_K_TOTAL = 0
-# Output budgeting (dynamic; avoids hard-coded long generations).
-#
-# NOTE: The previous defaults (120 words → ~244 tokens) were frequently too small and
-# caused the model to hit max_tokens on normal queries (truncated answers). These
-# settings bias toward more complete "chat-sized" answers while still keeping a hard
-# ceiling for local compute.
-OUTPUT_MIN_TOKENS = 128
-OUTPUT_MAX_TOKENS = 1024
-OUTPUT_TOKENS_PER_WORD = 2.0
-OUTPUT_TOKENS_BUFFER = 96
+ # Output budgeting (percentage-only; no fixed token constants).
 
 
 def build_context_pack(
@@ -426,26 +413,23 @@ class InsightOrchestrator:
             return 0
         return max(1, len(text) // 4)
 
-    def _compute_output_max_tokens(self, analysis: Dict[str, Any]) -> int:
+    def _compute_output_max_tokens(self) -> int:
         """
-        Dynamic output budget based on the user's requested/implicit target length.
+        Dynamic output budget based purely on context window percentage.
 
         This controls the model's *maximum* generated tokens. The model may stop earlier.
         """
-        try:
-            target_words = int(analysis.get("target_words") or 120)
-        except Exception:
-            target_words = 120
-        target_words = max(20, min(1200, target_words))
-        est = int(target_words * OUTPUT_TOKENS_PER_WORD) + int(OUTPUT_TOKENS_BUFFER)
-        return max(int(OUTPUT_MIN_TOKENS), min(int(OUTPUT_MAX_TOKENS), int(est)))
+        ctx_size = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
+        if ctx_size <= 0:
+            return 1
+        reserved_output = int(ctx_size * RESERVE_OUTPUT_PCT)
+        return max(1, int(reserved_output))
 
     def _compute_rag_budget_tokens(
         self,
         chat_id: str,
         *,
         files_in_scope: int,
-        reserved_output_tokens: int,
     ) -> int:
         """
         Compute a doc-evidence token budget for this turn.
@@ -455,7 +439,7 @@ class InsightOrchestrator:
         - clean session history (already in KV)
         - the user's turn
         - LTM / scope headers
-        - model output (reserved_output_tokens)
+        - model output (reserved_output_pct)
 
         The session manager enforces the real hard limit; this is a best-effort
         allocator that tries to keep multi-file answers coherent (enough text per file).
@@ -477,16 +461,17 @@ class InsightOrchestrator:
             used = 0
             capacity = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
 
-        margin = 256
-        remaining = max(0, capacity - used - int(reserved_output_tokens) - margin)
+        if capacity <= 0:
+            return 0
+
+        reserved_output = int(capacity * RESERVE_OUTPUT_PCT)
+        margin = int(capacity * CONTEXT_MARGIN_PCT)
+        remaining = max(0, capacity - used - reserved_output - margin)
         if remaining <= 0:
             return 0
 
-        cap = RAG_CONTEXT_MAX_TOKENS_SINGLE if files_in_scope <= 1 else RAG_CONTEXT_MAX_TOKENS_MULTI
-        # Keep a stable fraction of remaining capacity for doc evidence; leave the rest for
-        # the rest of the prompt (LTM, scope lines, tool-safe instructions, etc).
-        budget = min(int(remaining * RAG_CONTEXT_FRACTION), int(cap))
-        return max(0, int(budget))
+        max_input = int(remaining * MAX_INPUT_PCT)
+        return max(0, int(max_input))
 
     @staticmethod
     def _sanitize_filename_for_prompt(name: str) -> str:
@@ -690,6 +675,28 @@ class InsightOrchestrator:
                 "latest_doc_id": latest_doc_id,
             }
 
+        # If the docs pane is closed, always use scope=all across chat files.
+        if not doc_pane_open_bool:
+            if chat_doc_ids:
+                return {
+                    "doc_pane_open": doc_pane_open_bool,
+                    "scope": "all",
+                    "focus": None,
+                    "scope_doc_ids": chat_doc_ids,
+                    "secondary_doc_ids": [],
+                    "chat_doc_ids": chat_doc_ids,
+                    "latest_doc_id": latest_doc_id,
+                }
+            return {
+                "doc_pane_open": doc_pane_open_bool,
+                "scope": "focused",
+                "focus": None,
+                "scope_doc_ids": [],
+                "secondary_doc_ids": [],
+                "chat_doc_ids": chat_doc_ids,
+                "latest_doc_id": latest_doc_id,
+            }
+
         # Default: focused mode with a primary focus file.
         focus: Optional[str] = None
         if doc_pane_open_bool and isinstance(focus_document_id, str) and focus_document_id.strip():
@@ -804,7 +811,6 @@ class InsightOrchestrator:
             budget_tokens = self._compute_rag_budget_tokens(
                 chat_id,
                 files_in_scope=inferred_files,
-                reserved_output_tokens=OUTPUT_MAX_TOKENS,
             )
 
         try:
@@ -864,7 +870,6 @@ class InsightOrchestrator:
             budget_tokens = self._compute_rag_budget_tokens(
                 chat_id,
                 files_in_scope=inferred_files,
-                reserved_output_tokens=OUTPUT_MAX_TOKENS,
             )
         try:
             budget_tokens = int(budget_tokens)
@@ -1058,8 +1063,7 @@ class InsightOrchestrator:
                 except Exception:
                     continue
 
-        analysis = self._analyze_query(user_message, has_docs=bool(documents))
-        max_tokens = self._compute_output_max_tokens(analysis)
+        max_tokens = self._compute_output_max_tokens()
         summary_request = self._is_summary_request(user_message)
         compare_request = self._is_compare_request(user_message)
 
@@ -1157,37 +1161,48 @@ class InsightOrchestrator:
                     small_doc_reason = "missing_text"
                 else:
                     doc_tokens = int(pack_info.get("token_estimate") or 0)
-                    if doc_tokens > SMALL_DOC_MAX_TOKENS:
-                        small_doc_reason = "over_candidate_budget"
-                    else:
-                        try:
-                            status = self.session_mgr.get_context_status(chat_id)
-                            used_tokens = int(status.get("used_tokens") or 0)
-                            ctx_size = int(status.get("capacity_tokens") or 0)
-                        except Exception:
-                            used_tokens = 0
-                            ctx_size = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
+                    try:
+                        status = self.session_mgr.get_context_status(chat_id)
+                        used_tokens = int(status.get("used_tokens") or 0)
+                        ctx_size = int(status.get("capacity_tokens") or 0)
+                    except Exception:
+                        used_tokens = 0
+                        ctx_size = int(getattr(self.session_mgr, "ctx_size", 0) or 0)
 
-                        dirty_user = (
-                            build_dirty_user_turn(user_message, selection=selection_for_prompt)
-                            if has_selection_text
-                            else None
+                    dirty_user = (
+                        build_dirty_user_turn(user_message, selection=selection_for_prompt)
+                        if has_selection_text
+                        else None
+                    )
+                    user_tokens = self._approx_token_count(dirty_user or user_message)
+                    if ctx_size <= 0:
+                        small_doc_reason = "no_ctx"
+                    else:
+                        reserved_output = int(ctx_size * RESERVE_OUTPUT_PCT)
+                        margin = int(ctx_size * CONTEXT_MARGIN_PCT)
+                        available = max(0, int(ctx_size) - int(used_tokens) - reserved_output - margin)
+                        max_input = int(available * MAX_INPUT_PCT)
+                        small_doc_cap = int(max_input * SMALL_DOC_PCT)
+                        final_fit = (
+                            int(used_tokens)
+                            + int(doc_tokens)
+                            + int(user_tokens)
+                            + int(reserved_output)
+                            + int(margin)
+                            <= int(ctx_size)
                         )
-                        user_tokens = self._approx_token_count(dirty_user or user_message)
-                        fits = (
-                            used_tokens
-                            + doc_tokens
-                            + user_tokens
-                            + int(max_tokens)
-                            + SMALL_DOC_MARGIN_TOKENS
-                            <= ctx_size
-                        )
-                        if fits:
+                        if available <= 0:
+                            small_doc_reason = "no_available"
+                        elif doc_tokens > small_doc_cap:
+                            small_doc_reason = "over_small_doc_cap"
+                        elif not final_fit:
+                            small_doc_reason = "over_fit"
+                        else:
                             small_doc_mode = True
                             small_doc_pack = str(pack_info.get("pack") or "")
-                            scope_files = pack_info.get("file_names") if isinstance(pack_info.get("file_names"), list) else None
-                        else:
-                            small_doc_reason = "fit_failed"
+                            scope_files = (
+                                pack_info.get("file_names") if isinstance(pack_info.get("file_names"), list) else None
+                            )
 
                 logger.info(
                     "Small-doc check chat=%s scope=%s files=%d doc_tokens=%s max_tokens=%d ctx=%s used=%s reason=%s enabled=%s request_id=%s",
@@ -1242,7 +1257,6 @@ class InsightOrchestrator:
                     rag_budget_tokens = self._compute_rag_budget_tokens(
                         chat_id,
                         files_in_scope=len(doc_ids_in_scope),
-                        reserved_output_tokens=max_tokens,
                     )
                     # Keep per-file retrieval stable (fair) by scaling total_k with file count.
                     total_k = max(RAG_ALL_K_TOTAL, 7 * len(doc_ids_in_scope))
@@ -1280,7 +1294,6 @@ class InsightOrchestrator:
                 rag_budget_tokens = self._compute_rag_budget_tokens(
                     chat_id,
                     files_in_scope=1,
-                    reserved_output_tokens=max_tokens,
                 )
                 focus_anchors = self.agent_tools.hybrid_search(
                     user_message,
@@ -1316,7 +1329,6 @@ class InsightOrchestrator:
                     rag_budget_tokens = self._compute_rag_budget_tokens(
                         chat_id,
                         files_in_scope=len(doc_ids),
-                        reserved_output_tokens=max_tokens,
                     )
                     anchors: List[ChunkAnchor] = []
                     for fid in doc_ids:
@@ -1361,7 +1373,6 @@ class InsightOrchestrator:
             rag_budget_tokens = self._compute_rag_budget_tokens(
                 chat_id,
                 files_in_scope=max(1, len(doc_ids_in_scope)),
-                reserved_output_tokens=max_tokens,
             )
             total_k = max(RAG_ALL_K_TOTAL, 7 * max(1, len(doc_ids_in_scope)))
             selected_rag = self._rebalance_hits_by_file(selected_rag, max_hits=total_k)
@@ -1376,7 +1387,6 @@ class InsightOrchestrator:
             rag_budget_tokens = self._compute_rag_budget_tokens(
                 chat_id,
                 files_in_scope=max(1, inferred_files),
-                reserved_output_tokens=max_tokens,
             )
             selected_rag = self._apply_rag_budget_with_tokens(chat_id, selected_rag, budget_tokens=rag_budget_tokens)
 
@@ -1526,31 +1536,5 @@ class InsightOrchestrator:
             seen.add(key)
             deduped.append(h)
         return deduped
-
-    def _analyze_query(self, query: str, has_docs: bool) -> Dict[str, Any]:
-        q = query.lower()
-        # Default target length for a "normal" chat answer.
-        target_words = 180
-        m = re.search(r"(\d+)\s*words", q)
-        if m:
-            try:
-                target_words = int(m.group(1))
-            except Exception:
-                target_words = 280
-        # Prefer "detailed/long" over "brief/summary" if both appear (e.g. "detailed summary").
-        elif any(k in q for k in ["detailed", "long", "full"]):
-            target_words = 350
-        elif any(k in q for k in ["short", "brief", "summary"]):
-            target_words = 100
-
-        if has_docs and self._is_compare_request(query):
-            target_words = max(target_words, 260)
-
-        hint_doc = has_docs or any(k in q for k in ["document", "file", "pdf", "upload"])
-        return {
-            "target_words": target_words,
-            "hint_doc": hint_doc,
-        }
-
 
 __all__ = ["InsightOrchestrator"]

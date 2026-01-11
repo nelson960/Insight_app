@@ -9,7 +9,7 @@ from typing import Iterable, Optional, Sequence
 
 from ..extraction import FileExtractionService, create_extraction_service
 from .chunker import ChunkerConfig, BlockChunker
-from ..connectors import NomicEmbedTextConnector, NomicOnnxEmbedTextConnector, NomicOnnxConfig
+from typing import TYPE_CHECKING, Any
 from .embedder import EmbeddingClient, EmbeddingConfig, EmbeddingConnector
 from .index_writer import ChunkStore, VectorIndex, VectorIndexWriter
 from .models import (
@@ -114,6 +114,19 @@ __all__ = [
 ]
 
 
+if TYPE_CHECKING:
+    # Only for type checking; loaded lazily at runtime to avoid circular imports.
+    from ..connectors import NomicEmbedTextConnector, NomicOnnxEmbedTextConnector, NomicOnnxConfig  # noqa: F401
+
+
+def __getattr__(name: str) -> Any:
+    if name in ("NomicEmbedTextConnector", "NomicOnnxEmbedTextConnector", "NomicOnnxConfig"):
+        from .. import connectors
+
+        return getattr(connectors, name)
+    raise AttributeError(name)
+
+
 def _default_embedding_connectors(
     *,
     nomic_model_dir: Optional[Path],
@@ -123,6 +136,7 @@ def _default_embedding_connectors(
     """
     Provide default embedding connectors (currently Nomic embed text only).
     """
+    from ..connectors import NomicEmbedTextConnector, NomicOnnxConfig, NomicOnnxEmbedTextConnector
 
     model_dir = nomic_model_dir or Path("backend/models/nomic-embed-text")
     if use_onnx:
