@@ -17,6 +17,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.spec
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -36,6 +37,8 @@ dist/
 # ---- Rust / Tauri ----
 target/
 **/target/
+build/
+**/bin/
 
 # ---- Editor / OS ----
 .DS_Store
@@ -43,7 +46,6 @@ target/
 .vscode/
 
 # ---- Misc ----
-*.md
 .env
 .env.*
 

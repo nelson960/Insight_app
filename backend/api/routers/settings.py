@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import threading
 import shutil
 from pathlib import Path
@@ -27,6 +28,21 @@ from backend.services.raw_engine_server.manager import raw_engine_manager
 router = APIRouter(prefix="/settings", tags=["Settings"])
 
 ALLOWED_CTX_SIZES = {8192, 32768}
+RAW_ENGINE_DEFAULTS = {
+    "raw_engine_host": "127.0.0.1",
+    "raw_engine_port": 11435,
+    "raw_engine_model_path": "",
+    "raw_engine_ctx": None,
+    "raw_engine_threads": None,
+    "raw_engine_gpu_layers": None,
+    "raw_engine_max_tokens": 1024,
+    "raw_engine_embedding_model": "nomic-embed-text-v1.5",
+    "raw_engine_embedding_auto_download": True,
+    "raw_engine_log_preview_chars": 400,
+    "raw_engine_log_prompts": False,
+    "raw_engine_log_completions": False,
+}
+RAW_ENGINE_SETTING_KEYS = set(RAW_ENGINE_DEFAULTS.keys())
 
 
 def _ensure_bool(v: Any, default: bool = False) -> bool:
@@ -41,6 +57,37 @@ def _safe_int(v: Any, default: int) -> int:
         return x
     except Exception:
         return default
+
+
+def _optional_int(v: Any) -> Optional[int]:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _positive_int(v: Any) -> Optional[int]:
+    out = _optional_int(v)
+    if out is None:
+        return None
+    return out if out > 0 else None
+
+
+def _non_negative_int(v: Any) -> Optional[int]:
+    out = _optional_int(v)
+    if out is None:
+        return None
+    return out if out >= 0 else None
+
+
+def _port_available(host: str, port: int) -> tuple[bool, Optional[str]]:
+    try:
+        with socket.create_server((host, port)):
+            return True, None
+    except OSError as exc:
+        return False, str(exc)
 
 
 def _normalize_ctx_size(v: Any, default: int = 32768) -> int:
