@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -116,6 +116,56 @@ impl EngineProcess {
             .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| format!("failed to spawn engine.py at {}", engine_path.display()))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("missing stdin for engine"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("missing stdout for engine"))?;
+
+        let state = Arc::new(RouterState {
+            pending: Mutex::new(std::collections::HashMap::new()),
+            streams: Mutex::new(std::collections::HashMap::new()),
+            app: Mutex::new(None),
+        });
+
+        // Single stdout reader thread that demuxes all responses/tokens by request_id.
+        // This is required to support /chat streaming + concurrent /files/* requests.
+        spawn_stdout_router(BufReader::new(stdout), state.clone());
+
+        write_pid(&pid_path, child.id());
+
+        Ok(Self {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            state,
+            pid_path,
+        })
+    }
+
+    /// Spawn the bundled sidecar binary (for production builds).
+    ///
+    /// This is used when the app is bundled - the sidecar binary is already
+    /// compiled and included in the .app bundle. We just need to execute it
+    /// and set the INSIGHT_WORKSPACE_DIR environment variable.
+    pub fn spawn_from_binary(binary_path: &Path) -> Result<Self> {
+        let workspace_dir = dirs::home_dir()
+            .ok_or_else(|| anyhow!("couldn't find home dir"))?
+            .join(".insight");
+
+        let pid_path = workspace_dir.join("engine.pid");
+        cleanup_stale_engine(&pid_path);
+
+        let mut child = Command::new(binary_path)
+            .env("INSIGHT_WORKSPACE_DIR", &workspace_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("failed to spawn engine binary at {}", binary_path.display()))?;
 
         let stdin = child
             .stdin

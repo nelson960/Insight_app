@@ -49,6 +49,15 @@ From the repo root:
 - `pnpm install`
 - `pnpm tauri build --bundles dmg --config src-tauri/tauri.conf.bundle.json`
 
+"""
+pyinstaller --noconfirm --clean --onefile \
+  --name insight-engine \
+  --collect-all onnxruntime \
+  --collect-all llama_cpp \
+  backend/engine.py
+
+"""
+
 Notes:
 - Don’t use `TAURI_CONFIG=...` to point at a file: `TAURI_CONFIG` is an inline JSON *merge patch* used internally by the Tauri CLI/build script.
 - `src-tauri/tauri.conf.json` is kept sidecar-free so `tauri dev` works without requiring the bundled engine binary.

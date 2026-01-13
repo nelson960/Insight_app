@@ -166,7 +166,6 @@ export function Canvas({
   onOpenCard,
   onOpenSettings,
   onDeleteChat,
-  onDeleteChatTree,
   confirmDeleteChatId,
   onResetConfirmDelete,
   loadingSessions,

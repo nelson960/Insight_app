@@ -9,13 +9,6 @@
     "core:window:allow-set-theme",
     "core:window:allow-set-background-color",
     "core:window:allow-set-title-bar-style",
-    "opener:default",
-    {
-      "identifier": "opener:allow-open-path",
-      "allow": [
-        { "path": "$HOME/py/insight/insight_app/storage/cache/view_*" },
-        { "path": "$HOME/py/insight/insight_app/storage/cache/view_*.*" }
-      ]
-    }
+    "opener:default"
   ]
 }

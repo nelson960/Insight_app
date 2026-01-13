@@ -1,5 +1,3 @@
-import React from "react";
-
 export type HealthIssue = {
   code: string;
   severity: "error" | "warning";

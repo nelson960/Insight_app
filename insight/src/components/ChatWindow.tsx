@@ -198,7 +198,7 @@ export function ChatWindow({
   const [branchError, setBranchError] = useState<string | null>(null);
   const branchPopoverRef = useRef<HTMLDivElement | null>(null);
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
-  const [ingestProgress, setIngestProgress] = useState<IngestProgressState | null>(null);
+  const [_ingestProgress, setIngestProgress] = useState<IngestProgressState | null>(null);
   const [showPrestream, setShowPrestream] = useState(false);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
   const [localSelection, setLocalSelection] = useState<{ text: string; file_id?: string } | null>(

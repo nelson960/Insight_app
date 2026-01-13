@@ -11,30 +11,42 @@
 - Built-in safeguards: **RAG-ready gating (HTTP 409)** + **ephemeral "CONTEXT PACK" injection** to prevent context pollution
 - Fast resume: **KV-cache snapshots** persisted per chat to avoid prompt replay
 
+
+
 ## Tech Stack
 
 Tauri (Rust) • React/TypeScript • FastAPI (IPC-only) • llama.cpp (GGUF) • Qdrant • ONNX Runtime (Nomic embeddings) • SQLite • Local HTTP inference API (llama.cpp-based, optional)
 
-## Highlights (Hiring Signals)
+## Highlights 
 
 - **Systems + ML:** retrieval quality ↔ latency/memory tradeoffs, context budgeting, multi-session KV cache
 - **Applied research:** failure modes + mitigation (scope control, compaction drift, large-file fallback)
 - **Production awareness:** isolation across chats/files (chat_id/file_id scoping), IPC-only backend, cancellation via native aborts
 
+## Demo
+
+<p align="center">
+  <img src="pics/Screenshot 2026-01-13 at 5.58.45 PM.png" width="900" alt="Compare & explain across two documents with scope control" />
+</p>
+
+<p align="center">
+  <img src="pics/Screenshot 2026-01-13 at 6.04.35 PM.png" width="900" alt="Canvas workspace with linked cards" />
+</p>
+
+<p align="center">
+  <img src="pics/Screenshot 2026-01-13 at 6.05.55 PM.png" width="900" alt="Settings: local Raw API server running on localhost" />
+</p>
+
+## Product Features
+
+- Selection-first + document-grounded QA: highlight text from files or model responses to ask follow-ups with precise grounding; supports focused/all-doc scope and compare mode.
+
+- Transparent performance + trust HUD: real-time context window usage, remaining input budget, tok/s, TTFT, retrieval/context-pack visibility, and reliable streaming cancel.
+
+- Canvas workspace + memory: branching/linkable cards with optional per-card attachments + export/share, plus KV snapshot/compaction and optional LTM-style recall to stay coherent in long chats.
+
 ---
 
-## Problem Statement
-
-Large language models demonstrate strong performance on general-purpose queries but struggle with domain-specific questions without external knowledge augmentation. Cloud-based RAG systems introduce privacy concerns, ongoing costs, and network latency that make them unsuitable for sensitive document analysis or offline workflows.
-
-**This project investigates:**
-
-- Whether acceptable question-answering performance can be achieved using **purely local** LLM inference on consumer hardware
-- How retrieval quality and context budgeting impact downstream generation quality
-- What architectural tradeoffs arise when operating under strict memory (**8K context window**) and latency (<500ms TTFT) constraints
-- How to design a RAG system that remains responsive during document ingestion and embedding
-
----
 
 ## Results (Local Hardware)
 
@@ -42,8 +54,8 @@ Large language models demonstrate strong performance on general-purpose queries 
 
 | Metric | Target | Hardware | Model | Notes |
 |--------|--------|----------|-------|------|
-| TTFT | <500ms | Apple M1/M2 | Qwen2.5 7B Q4_K_M | GPU layers enabled, 8K ctx |
-| tok/s | >20 | Apple M1/M2 | Qwen2.5 7B Q4_K_M | batch size / threads tuned |
+| TTFT | sub-second TTFT (tuning-dependent)| Apple M1/M2 | Qwen2.5 7B Q4_K_M | GPU layers enabled, 8K ctx |
+| tok/s | >35 | Apple M1/M2 | Qwen2.5 7B Q4_K_M | batch size / threads tuned |
 
 **Repro notes:** `--ctx-size 8192`, `--n-gpu-layers <N>`, `--threads <T>`, Qwen2.5 7B (GGUF Q4_K_M).
 
@@ -200,16 +212,6 @@ Both paths share the same GGUF model layer, enabling **hot-swappable models** vi
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Key Architecture Insights
-
-**Swappable model layer:** Both interfaces (IPC and HTTP) access the same underlying llama.cpp instance, making models hot-swappable without code changes.
-
-**Path 1 (IPC with RAG):** Full-featured path with document retrieval, context assembly, multi-session management, and KV cache snapshotting.
-
-**Path 2 (HTTP API):** Lightweight OpenAI-compatible interface for external tools, no RAG, single-chat stateless.
-
-**Model agnostic:** System works with any GGUF format model (Qwen, Llama, Mistral, CodeLlama, etc.) - chat templates auto-detected from GGUF metadata.
-
 ---
 
 ### Core Components
@@ -287,20 +289,11 @@ export INSIGHT_ENGINE_MODEL_PATH=/path/to/qwen2.5-7b.gguf
 
 ---
 
-## Data & Setup
-
-### Corpus Support
-
-- **File formats**: PDF (with pytesseract OCR for scanned documents), plaintext (.txt, .md), code files
-- **Chunking strategy**: Fixed-size token chunks with overlap (configurable, default ~512 tokens)
-- **Embedding model**: Nomic Embed Text v1.5 (768 dimensions, downloaded on first run to `~/.insight/em_models/`)
-
 ### Model Requirements
 
 - **Supported LLMs** (GGUF format):
   - Qwen2.5 7B Instruct (recommended)
   - Llama 3.1 8B Instruct
-- **Context window**: 8192 tokens (default), adjustable via `--ctx-size` flag
 - **Memory**: Minimum 16GB RAM recommended for 8B models
 
 <details>
@@ -316,71 +309,6 @@ All data is stored under `~/.insight/`:
 
 </details>
 
----
-
-## Limitations & Mitigations
-
-- **Model capacity (7–8B vs frontier models):**
-  Local 7–8B models underperform cloud frontier LLMs on complex reasoning.
-  *Why:* explicit tradeoff for offline privacy + predictable latency.
-  *Mitigation/next:* evaluate larger (13B+) models on higher-memory machines; explore 4-bit quantization and better prompt-grounding.
-
-- **Multi-document intent requires explicit scope switch:**
-  Users must switch between focused vs all-docs mode for cross-document queries.
-  *Why:* prioritizes precision and avoids unintended cross-document contamination.
-  *Mitigation/next:* add lightweight intent detection + auto-suggest scope changes; optional query rewriting for multi-doc queries.
-
-- **Large-document fallback uses keyword/substring search:**
-  For very large files, keyword/substring passage selection may miss semantic matches.
-  *Why:* dense retrieval over extremely large texts can be slow or exceed context budget.
-  *Mitigation/next:* add keyword scoring + reranking (e.g., BM25-style); consider hierarchical chunking for very large docs.
-
-- **Summarization drift during context compaction:**
-  Automatic compaction can lose nuance or introduce small factual drift.
-  *Why:* long chats exceed the 8K context budget, requiring compression.
-  *Mitigation/next:* retain last K turns verbatim + summary; citation-aware summarization; store structured "facts" separately from narrative summaries.
-
-- **OCR quality varies on scanned PDFs:**
-  OCR output can be noisy for complex layouts or low-quality scans.
-  *Why:* depends on document quality and OCR engine limits.
-  *Mitigation/next:* alternative OCR backends (PaddleOCR/EasyOCR) and layout-aware parsing for PDFs.
-
-- **Hardware-dependent performance:**
-  TTFT/throughput varies across CPU/GPU; Apple Silicon benefits from Metal acceleration.
-  *Why:* backend acceleration differs by platform.
-  *Mitigation/next:* expose runtime tuning (threads/GPU layers/batch size) and ship presets per hardware tier.
-
----
-
-## Lessons Learned
-
-1. **Retrieval quality matters more than model size**: A 7B model with high-quality retrieved context often outperforms a larger model with weak or no context
-2. **RAG-ready enforcement is critical**: Early prototypes that allowed generation during ingestion produced confusingly wrong answers; gating on ingestion status dramatically improved user trust
-3. **Ephemeral context prevents pollution**: Persisting retrieved chunks into chat history caused the model to "hallucinate" citations in subsequent turns; keeping RAG context ephemeral solved this
-4. **KV snapshotting enables instant resume**: Serializing llama.cpp state to disk allows chats to resume in milliseconds without replaying the entire prompt history
-5. **Compaction strategies are essential**: Even with 8K context, long conversations require summarization; keeping the last 4 turns + a summary preserves most conversational continuity
-6. **LTM integration improves continuity**: Long-term memory (LTM) retrieval based on query embeddings helps surface relevant conversation summaries during compaction, maintaining context across compressed history
-7. **Scope control as a feature, not limitation**: Tying retrieval scope to UI state (focused document vs. all-documents) gives users precise control over retrieval granularity and dramatically improves multi-document query accuracy
-8. **Local inference has different priorities**: Latency (TTFT) becomes more important than throughput; users notice the delay before the first token more than generation speed
-9. **Streaming cancellation requires native aborts**: Stopping generation in llama.cpp requires abort callbacks; attempting to terminate at the Python level leaves tokens buffering
-10. **Raw file server enables massive file support**: ripgrep-based search with contextual windows avoids ingestion overhead for large text/log files (100MB+) without chunking
-
----
-
-## Future Work
-
-- **Automatic scope inference**: Detect multi-document intent from query phrasing and auto-suggest all-documents mode
-- **Query rewriting**: Expand user queries into multiple retrieval queries to improve multi-hop coverage
-- **Re-ranking**: Cross-encoder re-ranking of retrieved chunks to improve precision before context assembly
-- **Improved OCR**: Evaluate alternative OCR engines (PaddleOCR, EasyOCR) for better accuracy on scanned documents
-- **Quantization exploration**: Evaluate 4-bit quantization for larger models (13B+) on higher-memory machines
-- **Cross-platform support**: Extend beyond macOS to Windows and Linux with appropriate bundling
-
----
-
-## Context
-
-This system was developed to explore the feasibility of fully local, privacy-preserving AI assistants for document-centric workflows. While not currently commercialized, the project provides practical insights into deploying RAG systems under real-world constraints including memory limits, latency requirements, and user expectations around responsiveness and correctness.
 
 ---
 
@@ -388,7 +316,7 @@ This system was developed to explore the feasibility of fully local, privacy-pre
 
 - `insight/` — Tauri + React desktop app
 - `backend/` — FastAPI IPC engine, retrieval + llama.cpp orchestration
-  - `services/raw_engine_server/` — Standalone OpenAI-compatible HTTP API server
+  - `services/raw_engine_server/` — Standalone local HTTP inference server (SSE)
 - `docs/` — build notes, packaging
 
 ---

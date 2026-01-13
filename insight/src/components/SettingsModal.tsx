@@ -111,7 +111,7 @@ export function SettingsModal(props: {
   const [storage, setStorage] = useState<StorageUsage | null>(null);
   const [restartRequired, setRestartRequired] = useState(false);
   const [modelValidation, setModelValidation] = useState<{ ok: boolean; msg: string } | null>(null);
-  const [cleanResult, setCleanResult] = useState<string | null>(null);
+  const [_cleanResult, setCleanResult] = useState<string | null>(null);
   const [resetOpen, setResetOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [engineBusy, setEngineBusy] = useState<BusyState | null>(null);
@@ -400,22 +400,6 @@ export function SettingsModal(props: {
     setCleanResult("Model settings applied and workspace cleared. Restart the app/engine to reload the model.");
   }
 
-  async function cleanCache(trimLogs: boolean) {
-    if (engineBusy?.busy) {
-      setCleanResult("Background work is running. Wait for it to finish before cleaning.");
-      return;
-    }
-    setCleanResult(null);
-    const res = await engine<any>("/settings/storage/clean_cache", { trim_logs: trimLogs }, "POST");
-    if (!res.ok) {
-      setCleanResult(getErrorText(res, "Failed to clean cache"));
-      return;
-    }
-    const freed = (res.data as any)?.freed_bytes ?? 0;
-    setCleanResult(`Freed ${formatBytes(freed)}`);
-    await refreshStorage();
-  }
-
   async function resetAll() {
     if (engineBusy?.busy) {
       setCleanResult("Background work is running. Wait for it to finish before resetting.");
@@ -618,7 +602,7 @@ export function SettingsModal(props: {
                   }}
                   onBlur={async () => {
                     if (!settings.llm_model_path) return;
-                    const ok = await validateModel(settings.llm_model_path);
+                    await validateModel(settings.llm_model_path);
                   }}
                 />
                 <button

@@ -29,4 +29,9 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+  // 4. Build directly into src-tauri so Tauri can find the files when bundled
+  build: {
+    outDir: "./src-tauri/dist",
+    emptyOutDir: true,
+  },
 }));

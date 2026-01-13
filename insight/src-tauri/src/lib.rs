@@ -14,6 +14,24 @@ fn ipc_debug() -> bool {
     std::env::var("INSIGHT_IPC_DEBUG").is_ok()
 }
 
+/// Get the workspace directory for the current build type.
+///
+/// - Dev/debug builds: returns `<project_root>/storage`
+/// - Release builds: returns `~/.insight`
+fn get_workspace_dir() -> Result<PathBuf, String> {
+    if cfg!(debug_assertions) {
+        // Dev mode: use project-local storage
+        let root = resolve_project_root()
+            .map_err(|e| format!("Failed to resolve project root: {}", e))?;
+        Ok(root.join("storage"))
+    } else {
+        // Release mode: use ~/.insight
+        Ok(dirs::home_dir()
+            .ok_or_else(|| String::from("couldn't find home dir"))?
+            .join(".insight"))
+    }
+}
+
 fn shutdown_engine(app: &tauri::AppHandle) {
     let engine = app.state::<SharedEngine>();
     engine.shutdown();
@@ -69,12 +87,12 @@ fn engine_request(
 
 #[tauri::command]
 fn list_sessions() -> Result<Value, String> {
-    let root = resolve_project_root().map_err(|e| e.to_string())?;
+    let workspace = get_workspace_dir()?;
     let mut sessions = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     // Prefer SQLite transcript store for session listing (clean UI chats).
-    let db_path = root.join("storage").join("db.sqlite");
+    let db_path = workspace.join("db.sqlite");
     if db_path.exists() {
         if let Ok(conn) = Connection::open(db_path) {
             // Query for chats with messages, including last message timestamp and content
@@ -247,7 +265,7 @@ fn list_sessions() -> Result<Value, String> {
     }
 
     // Fallback: include any KV sessions that may not have a transcript yet.
-    let kv_dir = root.join("storage").join("kv_sessions");
+    let kv_dir = workspace.join("kv_sessions");
     if kv_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(kv_dir) {
             for entry in entries.flatten() {
@@ -326,8 +344,8 @@ fn engine_cancel_request(
 
 #[tauri::command]
 fn get_session_messages(chat_id: String) -> Result<Value, String> {
-    let root = resolve_project_root().map_err(|e| e.to_string())?;
-    let db_path = root.join("storage").join("db.sqlite");
+    let workspace = get_workspace_dir()?;
+    let db_path = workspace.join("db.sqlite");
     if !db_path.exists() {
         return Ok(serde_json::json!({ "messages": [] }));
     }
@@ -608,18 +626,55 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python3".into());
-            let engine = EngineProcess::spawn(&python_bin)
-                .map_err(|e| format!("Failed to spawn Python engine: {}", e))?;
+            // Try to detect and use the bundled sidecar binary first.
+            // This checks if we're running from a bundled .app build.
+            let engine = if cfg!(debug_assertions) {
+                // Dev build: use Python with backend/engine.py
+                let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python3".into());
+                EngineProcess::spawn(&python_bin)
+                    .map_err(|e| format!("Failed to spawn Python engine: {}", e))?
+            } else {
+                // Release build: try to use the bundled sidecar binary
+                use tauri::path::BaseDirectory;
+                match app.path().resolve("bin/insight-engine-aarch64-apple-darwin", BaseDirectory::Resource)
+                    .or_else(|_| app.path().resolve("bin/insight-engine-x86_64-apple-darwin", BaseDirectory::Resource))
+                {
+                    Ok(sidecar_path) => {
+                        EngineProcess::spawn_from_binary(&sidecar_path)
+                            .map_err(|e| format!("Failed to spawn bundled engine: {}", e))?
+                    }
+                    Err(_) => {
+                        // Fallback: try Python (useful for testing release builds locally)
+                        let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python3".into());
+                        EngineProcess::spawn(&python_bin)
+                            .map_err(|e| format!("Failed to spawn Python engine: {}", e))?
+                    }
+                }
+            };
+
             // Allow the stdout router thread to emit out-of-band backend events
             // (e.g. files_changed / file_text_ready) to the frontend.
             engine.set_app_handle(app.app_handle().clone());
             app.manage(Arc::new(engine));
 
+            // Determine workspace directory based on build type
+            let workspace_dir = if cfg!(debug_assertions) {
+                // Dev mode: use project-local storage
+                resolve_project_root()
+                    .map_err(|e| format!("Failed to resolve project root: {}", e))?
+                    .join("storage")
+            } else {
+                // Release mode: use ~/.insight
+                dirs::home_dir()
+                    .ok_or_else(|| String::from("couldn't find home dir"))?
+                    .join(".insight")
+            };
+
+            std::fs::create_dir_all(&workspace_dir)
+                .map_err(|e| format!("Failed to create workspace directory: {}", e))?;
+
             // Watch KV sessions for real-time updates.
-            let root = resolve_project_root().map_err(|e| format!("{e}"))?;
-            let kv_dir = root.join("storage").join("kv_sessions");
-            std::fs::create_dir_all(&kv_dir).ok();
+            let kv_dir = workspace_dir.join("kv_sessions");
             if let Ok(watcher) = spawn_kv_watcher(app.app_handle().clone(), kv_dir) {
                 // Keep watcher alive in state
                 app.manage(Mutex::new(watcher));

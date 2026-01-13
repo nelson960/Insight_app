@@ -9,6 +9,12 @@ from typing import Optional
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DIR = _PROJECT_ROOT / "storage"
 
+# Check for workspace directory override (used in bundled builds)
+# The Rust sidecar sets INSIGHT_WORKSPACE_DIR=~/.insight when bundled
+_WORKSPACE_FROM_ENV = os.getenv("INSIGHT_WORKSPACE_DIR")
+if _WORKSPACE_FROM_ENV:
+    DEFAULT_DIR = Path(_WORKSPACE_FROM_ENV)
+
 
 class Workspace:
     """Resolves Insight storage paths under a single workspace root."""
