@@ -28,14 +28,22 @@ Tauri (Rust) • React/TypeScript • FastAPI (IPC-only) • llama.cpp (GGUF) �
 <p align="center">
   <img src="pics/Screenshot 2026-01-13 at 5.58.45 PM.png" width="900" alt="Compare & explain across two documents with scope control" />
 </p>
+<p align="center"><b>Compare & explain across two documents with scope control</b></p>
+
+<br/>
 
 <p align="center">
   <img src="pics/Screenshot 2026-01-13 at 6.04.35 PM.png" width="900" alt="Canvas workspace with linked cards" />
 </p>
+<p align="center"><b>Canvas workspace with linked cards</b></p>
+
+<br/>
 
 <p align="center">
   <img src="pics/Screenshot 2026-01-13 at 6.05.55 PM.png" width="900" alt="Settings: local Raw API server running on localhost" />
 </p>
+<p align="center"><b>Settings: local Raw API server running on localhost</b></p>
+
 
 ## Product Features
 
