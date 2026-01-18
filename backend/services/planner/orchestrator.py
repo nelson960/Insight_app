@@ -1439,16 +1439,12 @@ class InsightOrchestrator:
                 )
             context_pack = (task_hint + "\n" + (context_pack or "")).strip()
 
-        # UI-only sources (never model-visible). Only show for true multi-file scope=all.
+        # UI-only sources (never model-visible). Show for both focused and all modes.
         ui_sources: List[Dict[str, Any]] = []
-        if scope_mode == "all":
-            try:
-                ui_sources = build_ui_sources_from_rag_hits(selected_rag)
-                # Only show sources when at least 2 distinct docs contributed evidence.
-                if len(ui_sources) < 2:
-                    ui_sources = []
-            except Exception:
-                ui_sources = []
+        try:
+            ui_sources = build_ui_sources_from_rag_hits(selected_rag)
+        except Exception:
+            ui_sources = []
 
         def generator():
             tokens: List[str] = []

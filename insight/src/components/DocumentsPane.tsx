@@ -488,9 +488,9 @@ export function DocumentsPane({
     return next;
   }
 
-  async function reloadActiveDoc(fileId: string) {
+  async function reloadActiveDoc(fileId: string, forceReload = false) {
     setIsLoadingDoc(true);
-    const res = await loadDocPage(chatId, fileId);
+    const res = await loadDocPage(chatId, fileId, forceReload);
     setIsLoadingDoc(false);
     if (!res.ok) {
       setError(res.error || `Failed to load document (${res.status})`);
@@ -580,7 +580,7 @@ export function DocumentsPane({
             return;
           }
           if (fid === activeFid && !editingFileIdRef.current) {
-            reloadActiveDoc(fid).catch(() => {
+            reloadActiveDoc(fid, true).catch(() => {
               // ignore
             });
           }

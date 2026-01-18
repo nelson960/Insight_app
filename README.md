@@ -129,10 +129,10 @@ All inference, embeddings, and retrieval run locally. No document contents are s
 
 ## Project Status
 
-**Current state:** Working local-only prototype, actively developed
+**Current state:** Production-ready onedir build for macOS (Apple Silicon)
 
-**Supported:** macOS (Apple Silicon)
-**Not yet:** signed distribution / Windows/Linux bundles
+**Supported:** macOS (Apple Silicon ARM64)
+**Distribution:** Standalone .app bundle (no installer required)
 
 **Demo:** [Add GIF/Loom/screenshot here showing chat streaming + doc focus switch]
 
@@ -331,6 +331,16 @@ All data is stored under `~/.insight/`:
 
 ## Quick Start
 
+### Production Build (macOS Onedir)
+
+For production builds, use the automated build script:
+
+```bash
+./scripts/build_onedir_prod.sh
+```
+
+See [ONEDIR_BUILD_GUIDE.md](ONEDIR_BUILD_GUIDE.md) for detailed build instructions, troubleshooting, and distribution guidelines.
+
 ### Development Mode
 
 ```bash
@@ -346,18 +356,8 @@ pip install -r requirements.txt
 INSIGHT_WORKSPACE_DIR=~/.insight-dev python backend/engine.py
 ```
 
-See [BUILD_MACOS_DMG.md](BUILD_MACOS_DMG.md) for detailed build instructions.
-
 ---
 
-## Resume-Style Bullets (Ready to Copy)
-
-- Built a privacy-first desktop RAG system with **local llama.cpp inference**, **dense retrieval + lexical fallback**, and **Qdrant** vector database; **delivers offline, privacy-preserving document QA** without cloud APIs.
-- Implemented **KV-cache session snapshotting** and **streaming cancellation via native abort callbacks**, improving chat resume latency and interaction control.
-- Designed **RAG-ready gating (HTTP 409)** and **ephemeral context injection** to reduce low-quality answers during ingestion and prevent cross-turn context pollution.
-- Engineered scope-aware retrieval (focused vs all-documents) + context budgeting/compaction to balance **accuracy vs latency** under constrained context windows.
-
----
 
 ## License
 

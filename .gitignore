@@ -17,12 +17,15 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.spec
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .pyre/
 .pycache_tmp/
+
+# Note: PyInstaller spec files are source code and should be tracked
+# Only ignore auto-generated spec files
+# *.spec  <-- REMOVED: We track backend/insight_engine_portable.spec
 
 # ---- Node / frontend ----
 node_modules/
@@ -42,12 +45,46 @@ build/
 
 # ---- Editor / OS ----
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+
+# ---- Backup and temporary files ----
+*.bak
+*backup*
+*.tmp
+*.old
+icon_old.*
+icon_pre_update*
+icon_original*
+icon_working_backup*
+*_backup.*
 
 # ---- Misc ----
 .env
 .env.*
+*.session
+*.pickle
+*.pkl
 
 samples/
 *.pdf
+
+# ---- Test coverage ----
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/

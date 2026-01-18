@@ -133,9 +133,15 @@ def _normalize_raw_engine_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _raw_engine_mgr():
-    from backend.services.raw_engine_server.manager import raw_engine_manager
-
-    return raw_engine_manager()
+    try:
+        from backend.services.raw_engine_server.manager import raw_engine_manager
+        return raw_engine_manager()
+    except ImportError:
+        # Raw engine server not available in production builds
+        raise RuntimeError(
+            "Raw engine mode is not available in this build. "
+            "This feature requires development mode with Python source files."
+        )
 
 
 def _normalize_ctx_size(v: Any, default: int = 32768) -> int:

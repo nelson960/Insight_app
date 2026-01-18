@@ -1325,7 +1325,7 @@ export function ChatWindow({
               </div>
             )}
 
-            {m.role === "assistant" && Array.isArray((m as any).sources) && (m as any).sources.length >= 2 ? (
+            {m.role === "assistant" && Array.isArray((m as any).sources) && (m as any).sources.length >= 1 ? (
               <div className="chat-message-sources" aria-label="Sources">
                 {(m as any).sources.map((s: any, i: number) => {
                   const filename = typeof s?.filename === "string" ? s.filename : "Document";
