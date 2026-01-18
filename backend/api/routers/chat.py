@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, List, Annotated
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Form, UploadFile, File, Request, Body
 from fastapi.responses import StreamingResponse
 
-from backend.services.planner import PlannerRequest
+from backend.services.planner.models import PlannerRequest
 from backend.api.deps import AppDependencies
 from backend.services.ipc_events import emit_event
 from pathlib import Path

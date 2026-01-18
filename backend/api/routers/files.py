@@ -11,12 +11,6 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Body
 
 from backend.api.deps import AppDependencies
-from backend.services.ingestion import IngestionRequest, FilePolicy
-from backend.services.extraction.detector import detect_mime_type
-from backend.services.security import encrypt_bytes
-from backend.services.extraction.service import blocks_from_text
-from backend.services.ipc_events import emit_event, is_ipc_mode
-from backend.services.docs import blocks_to_plain_text, prosemirror_doc_to_blocks
 
 import logging
 
@@ -170,6 +164,11 @@ async def upload_files(
     user_id: str = Form("default"),
     files: List[UploadFile] = File(...),
 ):
+    from backend.services.extraction.detector import detect_mime_type
+    from backend.services.ingestion import FilePolicy, IngestionRequest
+    from backend.services.ipc_events import emit_event
+    from backend.services.security import encrypt_bytes
+
     workspace = AppDependencies.workspace()
     scheduler = AppDependencies.ingestion_scheduler()
     key = AppDependencies.key_manager().get_key()
@@ -263,6 +262,11 @@ async def ingest_paths(payload: Dict[str, Any] = Body(...)):
 
     Reads each path locally, encrypts + stores it under workspace uploads, and schedules ingestion.
     """
+    from backend.services.extraction.detector import detect_mime_type
+    from backend.services.ingestion import FilePolicy, IngestionRequest
+    from backend.services.ipc_events import emit_event, is_ipc_mode
+    from backend.services.security import encrypt_bytes
+
     if not is_ipc_mode():
         # Reading arbitrary local filesystem paths is a desktop-only feature. In HTTP
         # server mode, callers must upload bytes instead.
@@ -418,6 +422,8 @@ async def delete_file_from_chat(chat_id: str, file_id: str):
     If this was the last chat referencing the file_id, this also deletes the underlying
     file record, extracted text, chunks, jobs, and encrypted bytes on disk.
     """
+    from backend.services.ipc_events import emit_event
+
     if not chat_id:
         raise HTTPException(status_code=400, detail="chat_id is required")
     if not file_id:
@@ -540,6 +546,9 @@ async def get_extracted_view(file_id: str):
 
     The desktop UI should render these blocks instead of attempting to embed PDFs/DOCX directly.
     """
+    from backend.services.docs import blocks_to_plain_text, prosemirror_doc_to_blocks
+    from backend.services.extraction.service import blocks_from_text
+
     store = AppDependencies.sqlite_store()
     record = store.get_file(file_id)
     if not record:

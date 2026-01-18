@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,10 @@ DEFAULT_DIR = _PROJECT_ROOT / "storage"
 _WORKSPACE_FROM_ENV = os.getenv("INSIGHT_WORKSPACE_DIR")
 if _WORKSPACE_FROM_ENV:
     DEFAULT_DIR = Path(_WORKSPACE_FROM_ENV)
+elif getattr(sys, 'frozen', False):
+    # Packaged mode: NEVER use _MEIPASS as workspace
+    # Fall back to ~/.insight (stable, writable, persists across runs)
+    DEFAULT_DIR = Path.home() / ".insight"
 
 
 class Workspace:
@@ -21,6 +26,17 @@ class Workspace:
 
     def __init__(self, base_dir: Optional[Path | str] = None) -> None:
         self.base = Path(base_dir or DEFAULT_DIR).expanduser()
+
+        # Guardrail: In packaged mode, NEVER allow _MEIPASS as workspace
+        if getattr(sys, 'frozen', False):
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass and str(self.base).startswith(meipass):
+                raise RuntimeError(
+                    f"INVALID WORKSPACE: Workspace path {self.base} is inside PyInstaller temp directory ({meipass}). "
+                    f"This causes crashes and data loss. Set INSIGHT_WORKSPACE_DIR to a stable location "
+                    f"(e.g., ~/.insight) before starting the engine."
+                )
+
         self._ensure_structure()
         self._ensure_permissions()
 

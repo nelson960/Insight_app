@@ -1,8 +1,12 @@
 """
-ASGI-only Engine IPC wrapper (integrated).
+ASGI-only Engine IPC wrapper (integrated) — SAFE FOR PyInstaller + macOS spawn.
 
-Reads newline-delimited JSON from stdin and routes requests directly to FastAPI via ASGI.
-Supports concurrent requests, streaming, cancellation, request_id passthrough, and session binding.
+Key fixes vs previous version:
+- NO heavy imports / NO create_app() at module import time.
+- multiprocessing.freeze_support() is called early.
+- App is created lazily inside main_async() via get_app().
+- INSIGHT_SMOKETEST=1 (or --smoketest) runs checks and EXITS (no IPC loop, no downloads/warmups).
+- Optional import profiling via INSIGHT_PROFILE_IMPORTS=1 (enabled only when we actually import backend).
 
 IPC request schema (from Rust):
 {
@@ -40,31 +44,95 @@ Streaming errors:
 
 from __future__ import annotations
 
+import anyio
 import codecs
 import json
 import logging
+import multiprocessing as mp
+import os
 import sys
 import threading
+import time
 import uuid
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 
-import anyio
+# ---------------------------------------------------------------------------
+# Multiprocessing safety for PyInstaller
+# ---------------------------------------------------------------------------
 
-# --- Ensure project root is importable ---
-try:
-    import pathlib
-
-    PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
-except Exception:
-    pass
-
-from backend.api.app import create_app  # noqa: E402
+# Must be safe to run in spawned child contexts.
+mp.freeze_support()
 
 
-# --- Logging ---
+# ---------------------------------------------------------------------------
+# Minimal boot trace helpers (lazy import so children don't boot the world)
+# ---------------------------------------------------------------------------
+
+_BOOT_TRACE_AVAILABLE = False
+
+
+def _try_enable_boot_trace() -> None:
+    global _BOOT_TRACE_AVAILABLE
+    if _BOOT_TRACE_AVAILABLE:
+        return
+    try:
+        # Lazy import: should be lightweight; if it isn't, it will still only happen in real main path.
+        from backend.services.boot_trace import init_boot_trace  # type: ignore
+
+        init_boot_trace()
+        _BOOT_TRACE_AVAILABLE = True
+    except Exception:
+        _BOOT_TRACE_AVAILABLE = False
+
+
+def boot_step(name: str, *, status: str | None = None, **fields: Any) -> None:
+    """
+    Best-effort boot trace logging.
+    Never raises. Prints to stderr if boot_trace isn't importable.
+    """
+    try:
+        _try_enable_boot_trace()
+        if _BOOT_TRACE_AVAILABLE:
+            from backend.services.boot_trace import log_boot_step  # type: ignore
+
+            log_boot_step(name, status=status, **fields)
+            return
+    except Exception:
+        pass
+
+    # Fallback: stderr breadcrumb (kept minimal)
+    try:
+        msg = f"[BOOT] {name}"
+        if status:
+            msg += f" [{status}]"
+        if fields:
+            msg += " " + " ".join(f"{k}={fields[k]}" for k in fields.keys())
+        print(msg, file=sys.stderr)
+    except Exception:
+        pass
+
+
+def boot_error(stage: str, exc: BaseException) -> None:
+    try:
+        _try_enable_boot_trace()
+        if _BOOT_TRACE_AVAILABLE:
+            from backend.services.boot_trace import log_boot_error  # type: ignore
+
+            log_boot_error(stage, exc)
+            return
+    except Exception:
+        pass
+    try:
+        print(f"[BOOT ERROR] {stage}: {exc}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] engine %(message)s",
@@ -72,7 +140,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-APP = create_app()
+
+# ---------------------------------------------------------------------------
+# IPC allowlist
+# ---------------------------------------------------------------------------
 
 _IPC_ALLOWED_ENDPOINTS: Dict[str, List[str]] = {
     "GET": [
@@ -91,6 +162,9 @@ _IPC_ALLOWED_ENDPOINTS: Dict[str, List[str]] = {
         "/files/extracted/",
         "/docs/page/",
         "/search/doc/",
+        # Diagnostics endpoints
+        "/diagnostics/packaging",
+        "/diagnostics/smoketest",
     ],
     "POST": [
         "/chat",
@@ -122,7 +196,6 @@ def _is_allowed_ipc_endpoint(method: str, endpoint: str) -> bool:
     path = parsed.path or ""
     if not path.startswith("/"):
         return False
-    # Basic traversal hardening even though these are IPC-only paths.
     if ".." in path:
         return False
 
@@ -137,9 +210,9 @@ def _is_allowed_ipc_endpoint(method: str, endpoint: str) -> bool:
     return False
 
 
-# -----------------------------------------------------------------------------
-# Output (stdout) helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# stdout helpers
+# ---------------------------------------------------------------------------
 
 class StdoutWriter:
     """Serialize writes to stdout to avoid mixed JSON lines."""
@@ -150,22 +223,97 @@ class StdoutWriter:
     def emit(self, obj: Dict[str, Any]) -> None:
         line = json.dumps(obj, ensure_ascii=False) + "\n"
         with self._lock:
-            # Keep sync write inside lock; ensures whole line is written atomically
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except BrokenPipeError:
+                return
+            except OSError as e:
+                if getattr(e, "errno", None) == 32 or "Broken pipe" in str(e):
+                    return
+                raise
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Lazy app creation (NO heavy imports at module import time)
+# ---------------------------------------------------------------------------
+
+_APP = None
+
+
+def _enable_import_profiling_if_requested() -> bool:
+    """
+    Enables your backend import profiler only if requested.
+    This is called immediately before importing backend.api.app.
+    """
+    if os.environ.get("INSIGHT_PROFILE_IMPORTS") != "1":
+        return False
+    try:
+        from backend import import_profiler  # type: ignore
+
+        import_profiler.enable_import_profiling()
+        boot_step("import_profiler_enabled", status="OK")
+        return True
+    except Exception as e:
+        boot_step("import_profiler_enabled", status="FAILED", error=str(e))
+        return False
+
+
+def get_app():
+    """
+    Lazily import/create the FastAPI app.
+    Safe for PyInstaller + spawn: nothing heavy happens until this is called.
+    """
+    global _APP
+    if _APP is not None:
+        return _APP
+
+    boot_step("engine_import", status="START")
+    boot_step("before_backend_import")
+
+    prof_enabled = _enable_import_profiling_if_requested()
+
+    t0 = time.time()
+    try:
+        # HEAVY import happens only here
+        from backend.api.app import create_app  # type: ignore
+    except Exception as e:
+        boot_error("backend_import", e)
+        raise
+
+    dt = time.time() - t0
+    print(f"[IMPORT TIMING] backend.api.app import took {dt:.2f} seconds", file=sys.stderr)
+    boot_step("after_backend_import", status="SUCCESS", elapsed_seconds=f"{dt:.2f}")
+
+    if prof_enabled:
+        try:
+            from backend import import_profiler  # type: ignore
+
+            print(import_profiler.get_import_report(), file=sys.stderr)
+        except Exception:
+            pass
+
+    boot_step("before_app_creation")
+    try:
+        _APP = create_app()
+        boot_step("after_app_creation", status="OK")
+    except Exception as e:
+        boot_error("app_creation", e)
+        raise
+
+    return _APP
+
+
+# ---------------------------------------------------------------------------
 # ASGI invocation
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _build_headers(headers: Dict[str, Any]) -> List[Tuple[bytes, bytes]]:
     out: List[Tuple[bytes, bytes]] = []
-    # Ensure JSON body is treated correctly unless caller overrides
+
     if not any(str(k).lower() == "content-type" for k in headers.keys()):
         out.append((b"content-type", b"application/json"))
 
-    # Mark requests as IPC-internal so the FastAPI app can reject external HTTP.
     if not any(str(k).lower() == "x-insight-ipc" for k in headers.keys()):
         out.append((b"x-insight-ipc", b"1"))
 
@@ -185,23 +333,10 @@ async def _invoke_asgi(
     request_id: str,
     writer: StdoutWriter,
 ) -> Dict[str, Any] | None:
-    """
-    Invoke FastAPI via raw ASGI.
-
-    If stream=True:
-      - Emits stream_* lines to stdout
-      - Returns None
-
-    If stream=False:
-      - Buffers full response and returns dict for a single JSON line.
-    """
     parsed = urlparse(endpoint)
     body_bytes = json.dumps(payload or {}).encode("utf-8")
+
     sent_body = False
-    # Starlette's StreamingResponse runs a disconnect listener that awaits receive()
-    # until it gets an "http.disconnect". If receive() returns immediately in a loop,
-    # it can starve the streaming task; if it never yields control, the call can hang.
-    # We block on this event after the first body, and signal disconnect at stream end.
     disconnect_event = anyio.Event()
 
     scope = {
@@ -213,14 +348,6 @@ async def _invoke_asgi(
         "query_string": parsed.query.encode("utf-8"),
         "headers": _build_headers(headers),
     }
-    logger.debug(
-        "ASGI scope request_id=%s stream=%s method=%s path=%s query=%s",
-        request_id,
-        stream,
-        method,
-        parsed.path,
-        parsed.query,
-    )
 
     response_status: int | None = None
     response_headers: Dict[str, str] = {}
@@ -228,33 +355,25 @@ async def _invoke_asgi(
     error_body = bytearray()
     is_error_response = False
 
-    # Robust against multi-byte splits across chunks
     decoder = codecs.getincrementaldecoder("utf-8")()
 
-    # For streaming, use a bounded queue to prevent unbounded buffering if consumer is slow.
-    # This also provides natural backpressure.
-    stream_queue: anyio.abc.ObjectSendStream[Dict[str, Any]] | None = None
-    stream_recv: anyio.abc.ObjectReceiveStream[Dict[str, Any]] | None = None
+    stream_send = None
+    stream_recv = None
     stream_end_emitted = False
 
     if stream:
         stream_send, stream_recv = anyio.create_memory_object_stream(200)
-        stream_queue = stream_send
 
     async def receive() -> Dict[str, Any]:
         nonlocal sent_body
         if not sent_body:
             sent_body = True
             return {"type": "http.request", "body": body_bytes, "more_body": False}
-        # After request body is delivered, block until we decide to "disconnect".
-        # This yields control to the event loop so StreamingResponse can run.
         await disconnect_event.wait()
         return {"type": "http.disconnect"}
 
     async def send(message: Dict[str, Any]) -> None:
-        nonlocal response_status
-        nonlocal stream_end_emitted
-        nonlocal is_error_response
+        nonlocal response_status, stream_end_emitted, is_error_response
 
         if message["type"] == "http.response.start":
             response_status = int(message.get("status", 200))
@@ -263,17 +382,10 @@ async def _invoke_asgi(
                 try:
                     response_headers[k.decode("utf-8")] = v.decode("utf-8")
                 except Exception:
-                    # best-effort decoding
                     response_headers[str(k)] = str(v)
 
-            logger.info(
-                "ASGI response.start request_id=%s status=%s stream=%s",
-                request_id,
-                response_status,
-                stream,
-            )
-            if stream and stream_queue is not None:
-                await stream_queue.send(
+            if stream and stream_send is not None:
+                await stream_send.send(
                     {
                         "request_id": request_id,
                         "stream_start": {"status": response_status, "headers": response_headers},
@@ -288,12 +400,9 @@ async def _invoke_asgi(
         more_body = bool(message.get("more_body", False))
 
         if stream:
-            if stream_queue is None:
+            if stream_send is None:
                 return
 
-            # If the ASGI app returns a non-2xx response in "stream mode" (e.g. 409 ingestion_not_ready),
-            # do NOT pass the body through as model tokens. Instead, buffer the body and emit a single
-            # stream_error so the frontend can handle it cleanly.
             if is_error_response:
                 if chunk:
                     error_body.extend(chunk)
@@ -301,142 +410,91 @@ async def _invoke_asgi(
                 if not more_body:
                     if not stream_end_emitted:
                         stream_end_emitted = True
+                        raw = bytes(error_body).decode("utf-8", errors="replace").strip()
+                        msg = raw or f"HTTP {response_status or 500}"
+
+                        # best-effort: improve a common error shape
                         try:
-                            raw = bytes(error_body).decode("utf-8", errors="replace").strip()
-                            msg = raw or f"HTTP {response_status or 500}"
-                            try:
-                                parsed = json.loads(raw) if raw else None
-                                if isinstance(parsed, dict):
-                                    detail = parsed.get("detail")
-                                    if isinstance(detail, dict):
-                                        if detail.get("error") == "ingestion_not_ready":
-                                            progress = detail.get("progress") if isinstance(detail.get("progress"), dict) else None
-                                            if progress:
-                                                done = progress.get("done", 0)
-                                                total = progress.get("total", 0)
-                                                percent = progress.get("percent", None)
-                                                if percent is not None:
-                                                    msg = f"Indexing documents… {done}/{total} ({percent}%)."
-                                                else:
-                                                    msg = f"Indexing documents… {done}/{total}."
+                            parsed_err = json.loads(raw) if raw else None
+                            if isinstance(parsed_err, dict):
+                                detail = parsed_err.get("detail")
+                                if isinstance(detail, dict):
+                                    if detail.get("error") == "ingestion_not_ready":
+                                        progress = detail.get("progress") if isinstance(detail.get("progress"), dict) else None
+                                        if progress:
+                                            done = progress.get("done", 0)
+                                            total = progress.get("total", 0)
+                                            percent = progress.get("percent", None)
+                                            if percent is not None:
+                                                msg = f"Indexing documents… {done}/{total} ({percent}%)."
                                             else:
-                                                msg = "Indexing documents… please wait."
+                                                msg = f"Indexing documents… {done}/{total}."
                                         else:
-                                            msg = str(detail.get("error") or detail.get("message") or msg)
-                                    elif isinstance(detail, str) and detail.strip():
-                                        msg = detail.strip()
-                            except Exception:
-                                pass
+                                            msg = "Indexing documents… please wait."
+                                    else:
+                                        msg = str(detail.get("error") or detail.get("message") or msg)
+                                elif isinstance(detail, str) and detail.strip():
+                                    msg = detail.strip()
+                        except Exception:
+                            pass
 
-                            await stream_queue.send({"request_id": request_id, "stream_error": msg})
-                        except Exception as exc:
-                            await stream_queue.send({"request_id": request_id, "stream_error": str(exc)})
-
-                        logger.info("ASGI stream_end request_id=%s (error status=%s)", request_id, response_status)
-                        await stream_queue.send({"request_id": request_id, "stream_end": True})
-                        await stream_queue.aclose()
+                        await stream_send.send({"request_id": request_id, "stream_error": msg})
+                        await stream_send.send({"request_id": request_id, "stream_end": True})
+                        await stream_send.aclose()
                         disconnect_event.set()
                 return
 
             if chunk:
-                logger.debug(
-                    "ASGI response.body request_id=%s bytes=%d more_body=%s",
-                    request_id,
-                    len(chunk),
-                    more_body,
-                )
                 text = decoder.decode(chunk)
                 if text:
-                    await stream_queue.send({"request_id": request_id, "stream_token": text})
+                    await stream_send.send({"request_id": request_id, "stream_token": text})
 
             if not more_body:
-                # Some Starlette paths emit the final body chunk and then return; this is the
-                # canonical end-of-stream. Ensure we only emit once.
                 if not stream_end_emitted:
                     stream_end_emitted = True
-                    # Flush any remaining decoder state
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        await stream_queue.send({"request_id": request_id, "stream_token": tail})
-                    logger.info("ASGI stream_end request_id=%s", request_id)
-                    await stream_queue.send({"request_id": request_id, "stream_end": True})
-                    await stream_queue.aclose()
-                    # Let Starlette's disconnect watcher exit cleanly.
+                        await stream_send.send({"request_id": request_id, "stream_token": tail})
+                    await stream_send.send({"request_id": request_id, "stream_end": True})
+                    await stream_send.aclose()
                     disconnect_event.set()
         else:
             response_body.extend(chunk)
 
-    async def _stream_writer_task(recv_stream: anyio.abc.ObjectReceiveStream[Dict[str, Any]]) -> None:
+    async def _stream_writer_task(recv_stream) -> None:
         async with recv_stream:
             async for item in recv_stream:
-                rid = item.get("request_id", "-")
-                if "stream_start" in item:
-                    logger.info("Emit stream_start request_id=%s", rid)
-                elif "stream_token" in item:
-                    tok = item.get("stream_token") or ""
-                    logger.debug(
-                        "Emit stream_token request_id=%s chars=%d",
-                        rid,
-                        len(str(tok)),
-                    )
-                elif item.get("stream_error"):
-                    logger.warning(
-                        "Emit stream_error request_id=%s error=%s",
-                        rid,
-                        item.get("stream_error"),
-                    )
-                elif item.get("stream_end"):
-                    logger.info("Emit stream_end request_id=%s", rid)
                 writer.emit(item)
 
     if stream:
         assert stream_recv is not None
+        assert stream_send is not None
         async with anyio.create_task_group() as tg:
             tg.start_soon(_stream_writer_task, stream_recv)
-            logger.info(
-                "ASGI call begin request_id=%s stream=true %s %s",
-                request_id,
-                method,
-                endpoint,
-            )
             try:
                 await app(scope, receive, send)
-                logger.info("ASGI call done request_id=%s stream=true", request_id)
             finally:
-                # Defensive: some disconnect/cancel paths can cause the ASGI app to return
-                # without ever sending the terminal `http.response.body` with more_body=False.
-                # If that happens, the Rust side will block forever waiting for stream_end.
-                if stream_queue is not None and not stream_end_emitted:
-                    stream_end_emitted = True
+                # Ensure terminal stream_end is always emitted
+                if not stream_end_emitted:
                     try:
                         tail = decoder.decode(b"", final=True)
                         if tail:
-                            await stream_queue.send({"request_id": request_id, "stream_token": tail})
-                    except Exception:
-                        pass
-                    logger.warning("ASGI forcing stream_end request_id=%s (missing final body)", request_id)
-                    try:
-                        await stream_queue.send({"request_id": request_id, "stream_end": True})
+                            await stream_send.send({"request_id": request_id, "stream_token": tail})
                     except Exception:
                         pass
                     try:
-                        await stream_queue.aclose()
+                        await stream_send.send({"request_id": request_id, "stream_end": True})
+                    except Exception:
+                        pass
+                    try:
+                        await stream_send.aclose()
                     except Exception:
                         pass
                 disconnect_event.set()
         return None
 
-    # Non-streaming
-    logger.info(
-        "ASGI call begin request_id=%s stream=false %s %s",
-        request_id,
-        method,
-        endpoint,
-    )
     await app(scope, receive, send)
-    logger.info("ASGI call done request_id=%s stream=false", request_id)
 
-    # Decode and parse
     status = response_status or 500
     try:
         text = response_body.decode("utf-8")
@@ -456,9 +514,9 @@ async def _invoke_asgi(
     }
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Dispatcher with concurrency + cancellation
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 class RequestManager:
     def __init__(self, app) -> None:
@@ -495,21 +553,10 @@ class RequestManager:
         headers = req.get("headers") or {}
         stream = bool(req.get("stream", False))
 
-        logger.info(
-            "Dispatch request_id=%s stream=%s %s %s payload_keys=%d",
-            request_id,
-            stream,
-            method,
-            endpoint,
-            len(payload) if isinstance(payload, dict) else 0,
-        )
-
-        # Session binding convenience: forward session_id as header if provided
         session_id = req.get("session_id")
         if session_id and not any(str(k).lower() == "x-session-id" for k in headers.keys()):
             headers["x-session-id"] = str(session_id)
 
-        # Basic validation
         if not endpoint or not isinstance(endpoint, str) or not endpoint.startswith("/"):
             self.writer.emit(
                 {
@@ -522,25 +569,14 @@ class RequestManager:
             return
 
         if not _is_allowed_ipc_endpoint(method, endpoint):
-            logger.warning("IPC rejected endpoint=%s method=%s request_id=%s", endpoint, method, request_id)
             self.writer.emit(
-                {
-                    "request_id": request_id,
-                    "ok": False,
-                    "status": 403,
-                    "error": "endpoint_not_allowed",
-                }
+                {"request_id": request_id, "ok": False, "status": 403, "error": "endpoint_not_allowed"}
             )
             return
 
         if not isinstance(payload, dict):
             self.writer.emit(
-                {
-                    "request_id": request_id,
-                    "ok": False,
-                    "status": 400,
-                    "error": "payload must be a JSON object",
-                }
+                {"request_id": request_id, "ok": False, "status": 400, "error": "payload must be a JSON object"}
             )
             return
 
@@ -575,38 +611,20 @@ class RequestManager:
                         )
                         assert result is not None
                         self.writer.emit(result)
+
             except anyio.get_cancelled_exc_class():
-                # Cancellation: always produce a clean terminal message
                 if stream:
-                    self.writer.emit(
-                        {"request_id": request_id, "stream_error": "cancelled"}
-                    )
+                    self.writer.emit({"request_id": request_id, "stream_error": "cancelled"})
                     self.writer.emit({"request_id": request_id, "stream_end": True})
                 else:
-                    self.writer.emit(
-                        {
-                            "request_id": request_id,
-                            "ok": False,
-                            "status": 499,
-                            "error": "cancelled",
-                        }
-                    )
+                    self.writer.emit({"request_id": request_id, "ok": False, "status": 499, "error": "cancelled"})
             except Exception as exc:
                 logger.exception("Request failed request_id=%s", request_id)
                 if stream:
-                    self.writer.emit(
-                        {"request_id": request_id, "stream_error": str(exc)}
-                    )
+                    self.writer.emit({"request_id": request_id, "stream_error": str(exc)})
                     self.writer.emit({"request_id": request_id, "stream_end": True})
                 else:
-                    self.writer.emit(
-                        {
-                            "request_id": request_id,
-                            "ok": False,
-                            "status": 500,
-                            "error": str(exc),
-                        }
-                    )
+                    self.writer.emit({"request_id": request_id, "ok": False, "status": 500, "error": str(exc)})
             finally:
                 async with self._active_lock:
                     self._active.pop(request_id, None)
@@ -614,58 +632,144 @@ class RequestManager:
         self._tg.start_soon(_run_one)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # stdin reader -> async dispatcher bridge
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 async def _stdin_producer(send: anyio.abc.ObjectSendStream[str]) -> None:
-    """
-    Reads lines from sys.stdin in a worker thread and pushes them to an async channel.
-    """
     def _read_loop() -> None:
         for line in sys.stdin:
             try:
-                logger.debug("stdin recv bytes=%d", len(line))
+                anyio.from_thread.run(send.send, line)
             except Exception:
-                pass
-            anyio.from_thread.run(send.send, line)
-        anyio.from_thread.run(send.aclose)
+                break
+        try:
+            anyio.from_thread.run(send.aclose)
+        except Exception:
+            pass
 
     await anyio.to_thread.run_sync(_read_loop)
 
 
+def _is_smoketest() -> bool:
+    if os.environ.get("INSIGHT_SMOKETEST") == "1":
+        return True
+    if "--smoketest" in sys.argv:
+        return True
+    return False
+
+
+async def _run_smoketest_and_exit() -> None:
+    """
+    Smoketest should NOT start IPC loop and should NOT trigger downloads/warmups.
+    It should run checks and exit.
+    """
+    boot_step("smoketest_start", status="START")
+
+    exit_code = 0
+    try:
+        # Keep this import inside smoketest path.
+        from backend.smoke_test import run_smoke_tests  # type: ignore
+
+        exit_code = int(run_smoke_tests())
+        boot_step("smoketest_done", status="OK" if exit_code == 0 else "FAILED", exit_code=exit_code)
+    except Exception as e:
+        boot_error("smoketest", e)
+        exit_code = 2
+
+    # Ensure process exits even if background threads exist
+    os._exit(exit_code)
+
+
 async def main_async() -> None:
-    manager = RequestManager(APP)
+    boot_step("main_async_start", status="START")
+
+    if _is_smoketest():
+        await _run_smoketest_and_exit()
+        return  # unreachable, but keeps type checkers happy
+
+    # Create app lazily here (NOT at module import)
+    app = get_app()
+
+    manager = RequestManager(app)
     await manager.start()
+    boot_step("manager_started", status="OK")
 
     logger.info("ASGI engine ready; waiting for IPC on stdin")
 
-    # Enable out-of-band events (files_changed, file_text_ready, etc.) in IPC mode.
-    # This is intentionally a no-op in HTTP server mode.
+    # Enable out-of-band events in IPC mode.
     try:
-        from backend.services.ipc_events import set_ipc_emitter  # local import
+        from backend.services.ipc_events import set_ipc_emitter  # type: ignore
 
         set_ipc_emitter(manager.writer.emit)
     except Exception:
         pass
 
-    # Emit startup health report once (for UI startup modal).
-    try:
-        from backend.services.health import run_startup_health  # local import
-        from backend.services.ipc_events import emit_event  # local import
-
-        report = run_startup_health()
-        emit_event("startup_health", report=report)
-    except Exception:
-        logger.warning("Startup health check failed", exc_info=True)
-
-    # Bridge stdin (thread) -> async dispatcher.
-    # Use a bounded channel to avoid unbounded buffering if Rust sends fast.
-    # Note: don't subscript at runtime; keep typing via variable annotations if needed.
+    # Bridge stdin -> async dispatcher.
     send, recv = anyio.create_memory_object_stream(200)
+
+    async def _startup_tasks() -> None:
+        def _run_sync() -> None:
+            # Emit startup health report once (for UI startup modal).
+            try:
+                boot_step("startup_health_check_start", status="START")
+                from backend.services.health import run_startup_health_fast  # type: ignore
+                from backend.services.ipc_events import emit_event  # type: ignore
+
+                # Fast health first so the UI can show setup blocking quickly.
+                report_fast = run_startup_health_fast()
+                emit_event("startup_health", report=report_fast, phase="fast")
+                boot_step(
+                    "startup_health_check",
+                    status="OK",
+                    report_keys=str(getattr(report_fast, "keys", lambda: [])()),
+                )
+            except Exception as e:
+                boot_error("startup_health_check", e)
+
+            # Write boot summary JSON for user support.
+            try:
+                from backend.services.boot_summary import write_boot_summary  # type: ignore
+
+                summary_path = write_boot_summary()
+                logger.info("Boot summary written to: %s", summary_path)
+            except Exception as e:
+                logger.warning("Failed to write boot summary: %s", e)
+
+            # Background warm-up (non-blocking) — keep it AFTER app is ready.
+            def _warmup_worker() -> None:
+                time.sleep(1.0)
+                try:
+                    import tokenizers  # noqa
+
+                    _ = tokenizers.__version__
+                    logger.info("Tokenizers warm-up complete")
+                except Exception as e:
+                    logger.warning("Tokenizers warm-up failed: %s", e)
+                try:
+                    import onnxruntime  # noqa
+
+                    _ = onnxruntime.__version__
+                    logger.info("ONNX Runtime warm-up complete")
+                except Exception as e:
+                    logger.warning("ONNX Runtime warm-up failed: %s", e)
+
+            threading.Thread(target=_warmup_worker, daemon=True, name="warmup-worker").start()
+            logger.info("Background warm-up started (non-blocking)")
+
+            # Background-load the chat router after health checks (if a model is configured).
+            try:
+                from backend.api.chat_router_loader import maybe_start_chat_router_load  # type: ignore
+
+                maybe_start_chat_router_load("startup")
+            except Exception:
+                pass
+
+        await anyio.to_thread.run_sync(_run_sync)
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(_stdin_producer, send)
+        tg.start_soon(_startup_tasks)
 
         async with recv:
             async for raw_line in recv:
@@ -673,28 +777,16 @@ async def main_async() -> None:
                 if not line:
                     continue
 
-                # Parse JSON
                 try:
                     msg = json.loads(line)
                     if not isinstance(msg, dict):
                         raise ValueError("IPC message must be a JSON object")
                 except Exception as exc:
-                    # request_id may not exist; include a generated id
                     rid = str(uuid.uuid4())
-                    manager.writer.emit(
-                        {"request_id": rid, "ok": False, "status": 400, "error": f"Invalid JSON: {exc}"}
-                    )
+                    manager.writer.emit({"request_id": rid, "ok": False, "status": 400, "error": f"Invalid JSON: {exc}"})
                     continue
 
-                # Commands
                 cmd = msg.get("cmd")
-                logger.info(
-                    "IPC recv request_id=%s cmd=%s endpoint=%s stream=%s",
-                    msg.get("request_id") or "-",
-                    cmd or "-",
-                    msg.get("endpoint") or "-",
-                    bool(msg.get("stream", False)),
-                )
                 if cmd == "shutdown":
                     manager.writer.emit(
                         {"request_id": msg.get("request_id") or str(uuid.uuid4()), "ok": True, "status": 200, "data": {"detail": "shutdown"}}
@@ -705,38 +797,24 @@ async def main_async() -> None:
                 if cmd == "cancel":
                     rid = str(msg.get("request_id") or "")
                     if not rid:
-                        # Cancel is best-effort; don't emit on stdout to avoid polluting
-                        # the request/response stream (especially while a stream thread is reading).
                         logger.warning("cancel missing request_id")
                         continue
-                    # IMPORTANT:
-                    # Do NOT cancel the ASGI request scope here.
-                    #
-                    # If we cancel the ASGI scope while a StreamingResponse is mid-flight,
-                    # Starlette may return without emitting the terminal response body
-                    # (`more_body=False`). That would prevent us from emitting `stream_end`,
-                    # leaving the Rust side blocked forever waiting for stream termination.
-                    #
-                    # We only cancel llama.cpp compute; the stream will then naturally
-                    # complete and emit `stream_end` (or `_invoke_asgi` will force it).
-                    ok_scope = False
-                    # Cancel llama.cpp compute (stops model generation)
-                    ok_model = False
-                    try:
-                        from backend.api.deps import AppDependencies  # local import to avoid eager init
 
-                        ok_model = AppDependencies.session_manager().cancel_request(rid)
+                    # Best-effort: cancel model generation only (avoid ASGI mid-stream teardown races)
+                    try:
+                        from backend.api.deps import AppDependencies  # type: ignore
+
+                        _ = AppDependencies.session_manager().cancel_request(rid)
                     except Exception as exc:
                         logger.warning("Model cancel failed request_id=%s err=%s", rid, exc)
-                    logger.info("Cancel request_id=%s ok_scope=%s ok_model=%s", rid, ok_scope, ok_model)
                     continue
 
-                # Normal request
                 await manager.submit(msg)
 
     await manager.stop()
+
     try:
-        from backend.services.ipc_events import set_ipc_emitter  # local import
+        from backend.services.ipc_events import set_ipc_emitter  # type: ignore
 
         set_ipc_emitter(None)
     except Exception:

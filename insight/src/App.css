@@ -349,7 +349,7 @@ body {
   position: absolute;
   display: flex;
   flex-direction: column;
-  border-radius: 16px;
+  border-radius: 10px;
   border: none;
   background: transparent;
   box-shadow: none;
@@ -373,7 +373,7 @@ body {
   width: 100%;
   display: flex;
   flex-direction: column;
-  border-radius: 16px;
+  border-radius: 10px;
   border: 1px solid var(--card-border, var(--border));
   background: var(--surface-2);
   box-shadow: var(--shadow-md);
@@ -619,7 +619,7 @@ body {
 .canvas-note-stack {
   position: absolute;
   inset: 0;
-  border-radius: 16px;
+  border-radius: 10px;
   border: 2px solid var(--card-stack, var(--border-subtle));
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0) 55%),
@@ -636,7 +636,7 @@ body {
   right: 0;
   width: 28px;
   height: 28px;
-  border-top-right-radius: 16px;
+  border-top-right-radius: 10px;
   background: linear-gradient(
     135deg,
     rgba(255, 255, 255, 0) 0%,
@@ -3723,7 +3723,7 @@ html[data-theme="light"] .chat-branch-popover {
   flex-direction: column;
   gap: 6px;
   padding: 8px 10px 8px 8px;
-  border-radius: 14px;
+  border-radius: 8px;
   border: 1px solid var(--border-strong);
   background: var(--surface-input);
   min-width: 0;
@@ -3738,7 +3738,7 @@ html[data-theme="light"] .chat-branch-popover {
   align-items: center;
   gap: 10px;
   padding: 6px 8px;
-  border-radius: 10px;
+  border-radius: 6px;
   border: 1px solid var(--border-subtle);
   background: var(--surface-4);
   cursor: text;
@@ -4414,13 +4414,9 @@ html[data-theme="light"] .chat-branch-popover {
   scrollbar-color: transparent transparent;
 }
 
-.settings-body:hover {
-  scrollbar-color: rgba(59, 130, 246, 0.45) transparent;
-}
-
 .settings-body::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 4px;
+  height: 4px;
 }
 
 .settings-body::-webkit-scrollbar-thumb {
@@ -4428,7 +4424,26 @@ html[data-theme="light"] .chat-branch-popover {
   border-radius: 999px;
 }
 
-.settings-body:hover::-webkit-scrollbar-thumb {
+.settings-scrollable {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.settings-scrollable::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.settings-scrollable::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+
+.settings-scrollable.is-scrolling {
+  scrollbar-color: rgba(59, 130, 246, 0.45) transparent;
+}
+
+.settings-scrollable.is-scrolling::-webkit-scrollbar-thumb {
   background: rgba(59, 130, 246, 0.45);
 }
 
@@ -4685,6 +4700,21 @@ html[data-theme="light"] .chat-branch-popover {
   border: 1px solid var(--border);
   background: rgba(0, 0, 0, 0.18);
   color: inherit;
+  box-sizing: border-box;
+}
+
+.settings-input:focus,
+.settings-select:focus {
+  outline: none;
+  border-color: rgba(59, 130, 246, 0.6);
+}
+
+.settings-input-compact {
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-width: 140px;
+  max-width: 260px;
+  flex: 1 1 220px;
 }
 
 .settings-select-compact {
@@ -4703,7 +4733,7 @@ html[data-theme="light"] .chat-branch-popover {
   background: rgba(255, 255, 255, 0.06);
   color: inherit;
   cursor: pointer;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
 }
@@ -4806,7 +4836,21 @@ html[data-theme="light"] .chat-branch-popover {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 11px;
   line-height: 1.5;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  overscroll-behavior: auto;
 }
+
+.settings-raw-console::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.settings-raw-console::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+
 
 .settings-raw-line {
   display: flex;
@@ -4827,6 +4871,30 @@ html[data-theme="light"] .chat-branch-popover {
 
 .settings-raw-text {
   color: var(--app-fg);
+}
+
+.settings-raw-config {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.settings-raw-config .settings-btn {
+  margin-left: 6px;
+}
+
+.settings-raw-advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.settings-raw-hint,
+.settings-raw-dropdown {
+  width: 100%;
+  flex: 0 0 100%;
 }
 
 .settings-raw-meta {
@@ -4880,13 +4948,9 @@ html[data-theme="light"] .chat-branch-popover {
   scrollbar-color: transparent transparent;
 }
 
-.settings-breakdown:hover {
-  scrollbar-color: rgba(59, 130, 246, 0.4) transparent;
-}
-
 .settings-breakdown::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 4px;
+  height: 4px;
 }
 
 .settings-breakdown::-webkit-scrollbar-thumb {
@@ -4894,9 +4958,6 @@ html[data-theme="light"] .chat-branch-popover {
   border-radius: 999px;
 }
 
-.settings-breakdown:hover::-webkit-scrollbar-thumb {
-  background: rgba(59, 130, 246, 0.4);
-}
 
 .settings-dropdown {
   margin-top: 10px;
@@ -4957,6 +5018,28 @@ html[data-theme="light"] .chat-branch-popover {
   transform: translateY(0);
   margin-top: 8px;
   pointer-events: auto;
+}
+
+.settings-raw-panel {
+  overflow: auto;
+  overscroll-behavior: auto;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.settings-raw-panel::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.settings-raw-panel::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+
+
+.settings-dropdown[open] .settings-raw-panel {
+  max-height: 520px;
 }
 
 .settings-dropdown-panel .settings-breakdown {

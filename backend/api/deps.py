@@ -1,34 +1,29 @@
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
 
 from backend.core.workspace import get_workspace, Workspace
-from backend.services.ingestion import (
-    IngestionPipeline,
-    IngestionPipelineConfig,
-    create_ingestion_pipeline,
-)
-from backend.services.ingestion.scheduler import IngestionScheduler
-from backend.services.planner import PlannerService
-from backend.services.planner.orchestrator import InsightOrchestrator
-from backend.services.memory.ltm_store import LongTermMemoryStore
-from backend.services.memory.ltm_qdrant_store import LtmQdrantStore
-from backend.services.retrieval.rag_store import RagStore
-from backend.services.retrieval import RetrievalService
-from backend.services.security import KeyManager
-from backend.services.storage import (
-    SQLiteConfig,
-    QdrantConfig,
-    SQLiteMetadataStore,
-    QdrantVectorIndex,
-    create_sqlite_store,
-    create_qdrant_index,
-)
-from backend.services.connectors import NomicOnnxConfig, NomicOnnxEmbedTextConnector, LlamaSessionManager
-from backend.services.search import DocSearchService, FileSearchService
+
+# Boot trace (optional import)
+try:
+    from backend.services.boot_trace import log_boot_step, log_boot_error
+    _boot_trace_available = True
+except Exception:
+    _boot_trace_available = False
+if TYPE_CHECKING:
+    from backend.services.ingestion import IngestionPipeline
+    from backend.services.ingestion.scheduler import IngestionScheduler
+    from backend.services.planner.service import PlannerService
+    from backend.services.memory.ltm_store import LongTermMemoryStore
+    from backend.services.retrieval.rag_store import RagStore
+    from backend.services.security.key_manager import KeyManager
+    from backend.services.storage import SQLiteMetadataStore, QdrantVectorIndex
+    from backend.services.connectors.llama_session_manager import LlamaSessionManager
+    from backend.services.search.service import DocSearchService, FileSearchService
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +56,8 @@ class AppDependencies:
         if cls._sqlite_store is None:
             with cls._storage_lock:
                 if cls._sqlite_store is None:
+                    from backend.services.storage.sqlite_store import SQLiteConfig, create_sqlite_store
+
                     cls._sqlite_store = create_sqlite_store(cls.workspace().db, config=SQLiteConfig())
         return cls._sqlite_store
 
@@ -70,6 +67,8 @@ class AppDependencies:
             # Protect local Qdrant initialization from concurrent calls.
             with cls._storage_lock:
                 if cls._vector_index is None:
+                    from backend.services.storage import QdrantConfig, create_qdrant_index
+
                     cls._vector_index = create_qdrant_index(
                         config=QdrantConfig(
                             collection_name="insight_chunks",
@@ -85,6 +84,11 @@ class AppDependencies:
     @classmethod
     def ingestion_pipeline(cls) -> IngestionPipeline:
         if cls._ingestion_pipeline is None:
+            from backend.services.ingestion import (
+                IngestionPipelineConfig,
+                create_ingestion_pipeline,
+            )
+
             sqlite_store = cls.sqlite_store()
             vector_index = cls.vector_index()
             cls._ingestion_pipeline = create_ingestion_pipeline(
@@ -95,13 +99,15 @@ class AppDependencies:
                 # to the bundled repo directory during development.
                 nomic_model_dir=cls.nomic_model_dir(),
                 use_onnx_embeddings=True,
-                nomic_auto_download=True,
+                nomic_auto_download=False,
             )
         return cls._ingestion_pipeline
 
     @classmethod
     def ingestion_scheduler(cls) -> IngestionScheduler:
         if cls._ingestion_scheduler is None:
+            from backend.services.ingestion.scheduler import IngestionScheduler
+
             sqlite_store = cls.sqlite_store()
             cls._ingestion_scheduler = IngestionScheduler(cls.ingestion_pipeline(), sqlite_store)
         return cls._ingestion_scheduler
@@ -109,6 +115,9 @@ class AppDependencies:
     @classmethod
     def planner_service(cls) -> PlannerService:
         if cls._planner_service is None:
+            from backend.services.planner.orchestrator import InsightOrchestrator
+            from backend.services.planner.service import PlannerService
+
             sqlite_store = cls.sqlite_store()
             orchestrator = InsightOrchestrator(
                 session_mgr=cls.session_manager(),
@@ -122,20 +131,42 @@ class AppDependencies:
     @classmethod
     def session_manager(cls) -> LlamaSessionManager:
         if cls._session_manager is None:
+            from backend.services.connectors.llama_session_manager import LlamaSessionManager
+
+            if _boot_trace_available:
+                try:
+                    log_boot_step("session_manager_init_start")
+                except Exception:
+                    pass
+
             sqlite_store = cls.sqlite_store()
 
             model_path_raw = sqlite_store.get_setting("llm_model_path", "")
             model_path_raw = model_path_raw if isinstance(model_path_raw, str) else ""
             if not model_path_raw.strip():
-                raise FileNotFoundError(
-                    "No GGUF model configured. Update Settings → Model to select a valid .gguf file."
-                )
+                error = "No GGUF model configured. Update Settings → Model to select a valid .gguf file."
+                if _boot_trace_available:
+                    try:
+                        log_boot_step("session_manager_error", error="no_model_configured")
+                    except Exception:
+                        pass
+                raise FileNotFoundError(error)
 
             model_path = Path(model_path_raw).expanduser()
             if not model_path.exists():
-                raise FileNotFoundError(
-                    f"Model not found at {model_path}. Update Settings → Model to select a valid .gguf file."
-                )
+                error = f"Model not found at {model_path}. Update Settings → Model to select a valid .gguf file."
+                if _boot_trace_available:
+                    try:
+                        log_boot_step("session_manager_error", error="model_not_found", model_path=str(model_path))
+                    except Exception:
+                        pass
+                raise FileNotFoundError(error)
+
+            if _boot_trace_available:
+                try:
+                    log_boot_step("session_manager_loading", model_path=str(model_path))
+                except Exception:
+                    pass
 
             # Context length can be configured via Settings (8k/32k).
             ctx_raw = sqlite_store.get_setting("llm_ctx_size", 32768)
@@ -153,19 +184,36 @@ class AppDependencies:
                 gpu_layers = 99
 
             persist_dir = Path(get_workspace().base) / "kv_sessions"
-            cls._session_manager = LlamaSessionManager(
-                str(model_path),
-                ctx_size=ctx_size,
-                gpu_layers=gpu_layers,
-                persist_dir=persist_dir,
-                ltm_store=AppDependencies.ltm_store(),
-                metadata_store=sqlite_store,
-            )
+
+            try:
+                cls._session_manager = LlamaSessionManager(
+                    str(model_path),
+                    ctx_size=ctx_size,
+                    gpu_layers=gpu_layers,
+                    persist_dir=persist_dir,
+                    ltm_store=AppDependencies.ltm_store(),
+                    metadata_store=sqlite_store,
+                )
+                if _boot_trace_available:
+                    try:
+                        log_boot_step("session_manager_loaded", status="OK")
+                    except Exception:
+                        pass
+            except Exception as e:
+                if _boot_trace_available:
+                    try:
+                        log_boot_error("session_manager_init", e)
+                    except Exception:
+                        pass
+                raise
         return cls._session_manager
 
     @classmethod
     def rag_store(cls) -> RagStore:
         if cls._rag_store is None:
+            from backend.services.retrieval import RetrievalService
+            from backend.services.retrieval.rag_store import RagStore
+
             sqlite_store = cls.sqlite_store()
             vector_index = cls.vector_index()
             retrieval = RetrievalService(
@@ -179,6 +227,9 @@ class AppDependencies:
     @classmethod
     def ltm_store(cls) -> LongTermMemoryStore:
         if cls._ltm_store is None:
+            from backend.services.memory.ltm_qdrant_store import LtmQdrantStore
+            from backend.services.memory.ltm_store import LongTermMemoryStore
+
             try:
                 client = cls.vector_index().client  # reuse same Qdrant client to avoid lock conflicts
                 cls._ltm_store = LtmQdrantStore(client=client, embedder=cls.query_embedder())
@@ -193,12 +244,16 @@ class AppDependencies:
     @classmethod
     def key_manager(cls) -> KeyManager:
         if cls._key_manager is None:
+            from backend.services.security.key_manager import KeyManager
+
             cls._key_manager = KeyManager(cls.workspace())
         return cls._key_manager
 
     @classmethod
     def search_service(cls) -> FileSearchService:
         if cls._search_service is None:
+            from backend.services.search.service import FileSearchService
+
             sqlite_store = cls.sqlite_store()
             cls._search_service = FileSearchService(sqlite_store)
         return cls._search_service
@@ -206,6 +261,8 @@ class AppDependencies:
     @classmethod
     def doc_search_service(cls) -> DocSearchService:
         if cls._doc_search_service is None:
+            from backend.services.search.doc_search import DocSearchService
+
             sqlite_store = cls.sqlite_store()
             cls._doc_search_service = DocSearchService(sqlite_store)
         return cls._doc_search_service
@@ -214,14 +271,45 @@ class AppDependencies:
     def query_embedder(cls) -> Optional[Callable[[str], Sequence[float]]]:
         if cls._query_embedder is not None:
             return cls._query_embedder
+
+        if _boot_trace_available:
+            try:
+                log_boot_step("query_embedder_init_start")
+            except Exception:
+                pass
+
         try:
-            connector = NomicOnnxEmbedTextConnector(
-                model_dir=cls.nomic_model_dir(),
-                config=NomicOnnxConfig(),
-                auto_download=True,
+            from backend.services.connectors.nomic_onnx import (
+                NomicOnnxConfig,
+                NomicOnnxEmbedTextConnector,
             )
+
+            if _boot_trace_available:
+                try:
+                    model_dir = cls.nomic_model_dir()
+                    log_boot_step("onnx_connector_init", model_dir=str(model_dir))
+                except Exception:
+                    model_dir = cls.nomic_model_dir()
+
+            connector = NomicOnnxEmbedTextConnector(
+                model_dir=model_dir,
+                config=NomicOnnxConfig(),
+                # Keep downloads manual; embeddings must be installed via Settings.
+                auto_download=False,
+            )
+
+            if _boot_trace_available:
+                try:
+                    log_boot_step("onnx_connector_loaded", status="OK")
+                except Exception:
+                    pass
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to initialize local query embedder: %s", exc)
+            if _boot_trace_available:
+                try:
+                    log_boot_error("onnx_connector_init", exc)
+                except Exception:
+                    pass
             cls._query_embedder = None
             return cls._query_embedder
 
@@ -244,7 +332,7 @@ class AppDependencies:
         Preference order:
         1) previously resolved value (cached)
         2) workspace-local (writable) model dir, if it contains required assets
-        3) bundled repo model dir under `backend/em_models`, if it contains required assets
+        3) bundled repo model dir under `backend/em_models`, if it contains required assets (NEVER _MEIPASS in packaged mode)
         4) workspace-local model dir (will be auto-downloaded on first use)
         """
         if cls._nomic_model_dir is not None:
@@ -254,15 +342,48 @@ class AppDependencies:
         project_root = Path(__file__).resolve().parents[2]
         bundled_dir = project_root / "backend" / "em_models" / "nomic-embed-text"
 
+        # Guardrail: In packaged mode, NEVER use bundled_dir if it's under _MEIPASS
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass and str(bundled_dir).startswith(meipass):
+            # Ignore bundled models in _MEIPASS - they're ephemeral
+            bundled_dir = None
+
         def _has_required_assets(base: Path) -> bool:
+            if base is None:
+                return False
             return bool((base / "tokenizer.json").exists() and (base / "onnx" / "model.onnx").exists())
+
+        if _boot_trace_available:
+            try:
+                log_boot_step("nomic_model_dir_resolve",
+                              workspace_dir=str(workspace_dir),
+                              bundled_dir=str(bundled_dir) if bundled_dir else "None",
+                              workspace_exists=str(_has_required_assets(workspace_dir)),
+                              bundled_exists=str(_has_required_assets(bundled_dir) if bundled_dir else False))
+            except Exception:
+                pass
 
         if _has_required_assets(workspace_dir):
             cls._nomic_model_dir = workspace_dir
-        elif _has_required_assets(bundled_dir):
+            if _boot_trace_available:
+                try:
+                    log_boot_step("nomic_model_dir_selected", source="workspace", path=str(workspace_dir))
+                except Exception:
+                    pass
+        elif bundled_dir and _has_required_assets(bundled_dir):
             cls._nomic_model_dir = bundled_dir
+            if _boot_trace_available:
+                try:
+                    log_boot_step("nomic_model_dir_selected", source="bundled", path=str(bundled_dir))
+                except Exception:
+                    pass
         else:
             cls._nomic_model_dir = workspace_dir
+            if _boot_trace_available:
+                try:
+                    log_boot_step("nomic_model_dir_selected", source="workspace_will_download", path=str(workspace_dir))
+                except Exception:
+                    pass
 
         return cls._nomic_model_dir
 
@@ -272,6 +393,8 @@ class AppDependencies:
         Best-effort activity check used to block destructive operations (reset/clean)
         while background work is running (ingestion, streaming, KV snapshot/persist).
         """
+        from backend.services.storage.sqlite_store import SQLiteConfig, SQLiteMetadataStore
+
         store = cls._sqlite_store
         close_store = False
         if store is None:

@@ -3,6 +3,10 @@ import react from "@vitejs/plugin-react";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+// Allow port override via environment variable (defaults to 1420)
+const port = Number(process.env.TAURI_DEV_PORT) || 1420;
+// Allow strict port to be disabled if needed (useful when port is in use)
+const strictPort = process.env.TAURI_STRICT_PORT !== "false";
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -12,16 +16,16 @@ export default defineConfig(async () => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
+  // 2. tauri expects a fixed port, but can fall back to alternative port if configured
   server: {
-    port: 1420,
-    strictPort: true,
+    port,
+    strictPort,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: port + 1,
         }
       : undefined,
     watch: {

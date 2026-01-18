@@ -43,6 +43,7 @@ class KeyManager:
                 check=False,
                 capture_output=True,
                 text=True,
+                timeout=1.0,
             )
             if proc.returncode != 0:
                 return None
@@ -50,6 +51,9 @@ class KeyManager:
             if not raw:
                 return None
             return base64.b64decode(raw.encode("utf-8"))
+        except subprocess.TimeoutExpired:
+            logger.warning("Keychain read timed out")
+            return None
         except Exception:
             logger.warning("Keychain read failed", exc_info=True)
             return None

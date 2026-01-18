@@ -14,11 +14,12 @@
       {
         "title": "insight",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "devtools": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://ipc.localhost https://ipc.localhost; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' https:; object-src 'none'; frame-src 'none'; form-action 'self';"
     }
   },
   "bundle": {

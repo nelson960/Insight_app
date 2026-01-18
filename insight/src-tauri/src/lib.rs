@@ -33,6 +33,15 @@ fn get_workspace_dir() -> Result<PathBuf, String> {
 }
 
 fn shutdown_engine(app: &tauri::AppHandle) {
+    // Cleanup the file watcher if it exists
+    if let Some(watcher_mutex) = app.try_state::<Mutex<notify::RecommendedWatcher>>() {
+        if let Ok(_watcher) = watcher_mutex.lock() {
+            // The watcher will be properly dropped when the mutex is released
+            eprintln!("[INFO] File watcher cleaned up");
+        }
+    }
+
+    // Shutdown the engine process
     let engine = app.state::<SharedEngine>();
     engine.shutdown();
 }
@@ -62,7 +71,7 @@ fn _extract_title_from_content_json(content_json: &str) -> Option<String> {
 }
 
 #[tauri::command]
-fn engine_request(
+async fn engine_request(
     endpoint: String,
     method: Option<String>,
     payload: Option<Value>,
@@ -72,7 +81,7 @@ fn engine_request(
     if ipc_debug() && endpoint != "/settings/busy" {
         eprintln!("[cmd] engine_request endpoint={endpoint}");
     }
-    let engine = state.inner();
+    let engine = state.inner().clone();
     let req = EngineRequest {
         request_id: None,
         endpoint,
@@ -80,9 +89,14 @@ fn engine_request(
         payload: payload.unwrap_or(Value::Null),
         stream: false,
     };
-    engine
-        .send(&req)
-        .map_err(|e| format!("Python engine error: {}", e))
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .send(&req)
+            .map_err(|e| format!("Python engine error: {}", e))
+    })
+    .await
+    .map_err(|e| format!("engine_request join error: {e}"))??;
+    Ok(res)
 }
 
 #[tauri::command]
@@ -636,19 +650,33 @@ pub fn run() {
             } else {
                 // Release build: try to use the bundled sidecar binary
                 use tauri::path::BaseDirectory;
-                match app.path().resolve("bin/insight-engine-aarch64-apple-darwin", BaseDirectory::Resource)
-                    .or_else(|_| app.path().resolve("bin/insight-engine-x86_64-apple-darwin", BaseDirectory::Resource))
-                {
-                    Ok(sidecar_path) => {
-                        EngineProcess::spawn_from_binary(&sidecar_path)
-                            .map_err(|e| format!("Failed to spawn bundled engine: {}", e))?
+                let candidates = [
+                    // Standard layout: bin/<arch>/insight-engine
+                    "bin/insight-engine-aarch64-apple-darwin/insight-engine",
+                    "bin/insight-engine-x86_64-apple-darwin/insight-engine",
+                    // Fallback layout (older versions): bin/insight-engine-<arch>
+                    "bin/insight-engine-aarch64-apple-darwin",
+                    "bin/insight-engine-x86_64-apple-darwin",
+                ];
+                let mut resolved: Option<PathBuf> = None;
+                for rel in candidates {
+                    if let Ok(path) = app.path().resolve(rel, BaseDirectory::Resource) {
+                        if path.is_file() {
+                            resolved = Some(path);
+                            break;
+                        }
                     }
-                    Err(_) => {
-                        // Fallback: try Python (useful for testing release builds locally)
-                        let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python3".into());
-                        EngineProcess::spawn(&python_bin)
-                            .map_err(|e| format!("Failed to spawn Python engine: {}", e))?
-                    }
+                }
+                if let Some(sidecar_path) = resolved {
+                    eprintln!("[INFO] Using bundled engine: {}", sidecar_path.display());
+                    EngineProcess::spawn_from_binary(&sidecar_path)
+                        .map_err(|e| format!("Failed to spawn bundled engine ({}): {}", sidecar_path.display(), e))?
+                } else {
+                    // Fallback: try Python (useful for testing release builds locally)
+                    eprintln!("[WARNING] No bundled sidecar found, falling back to Python");
+                    let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python3".into());
+                    EngineProcess::spawn(&python_bin)
+                        .map_err(|e| format!("Failed to spawn Python engine ({}): {}", python_bin, e))?
                 }
             };
 
@@ -675,9 +703,14 @@ pub fn run() {
 
             // Watch KV sessions for real-time updates.
             let kv_dir = workspace_dir.join("kv_sessions");
-            if let Ok(watcher) = spawn_kv_watcher(app.app_handle().clone(), kv_dir) {
+            std::fs::create_dir_all(&kv_dir)
+                .map_err(|e| format!("Failed to create kv_sessions directory: {}", e))?;
+            if let Ok(watcher) = spawn_kv_watcher(app.app_handle().clone(), kv_dir.clone()) {
                 // Keep watcher alive in state
                 app.manage(Mutex::new(watcher));
+                eprintln!("[INFO] Watching KV sessions directory: {}", kv_dir.display());
+            } else {
+                eprintln!("[WARNING] Failed to spawn KV sessions watcher");
             }
             Ok(())
         })

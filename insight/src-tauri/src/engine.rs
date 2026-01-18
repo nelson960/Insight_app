@@ -1,13 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs;
+use std::collections::VecDeque;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 
@@ -41,6 +43,132 @@ fn default_stream() -> bool {
     false
 }
 
+/// Get the path to the engine stderr log file.
+///
+/// In production, this is ~/.insight/logs/backend_stderr_<timestamp>.log
+/// In development, this is storage/logs/backend_stderr_<timestamp>.log
+fn stderr_log_path() -> PathBuf {
+    if let Some(home) = dirs::home_dir() {
+        let workspace = home.join(".insight");
+        let logs_dir = workspace.join("logs");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_millis(0))
+            .as_secs();
+        logs_dir.join(format!("backend_stderr_{}.log", timestamp))
+    } else {
+        // Fallback for dev
+        let project_root = resolve_project_root().unwrap_or_else(|_| PathBuf::from("."));
+        let logs_dir = project_root.join("storage").join("logs");
+        let _ = fs::create_dir_all(&logs_dir);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_millis(0))
+            .as_secs();
+        logs_dir.join(format!("backend_stderr_{}.log", timestamp))
+    }
+}
+
+/// Read the last N lines from a file efficiently.
+///
+/// Returns an empty string if the file doesn't exist or cannot be read.
+/// Uses a circular buffer to avoid storing all lines in memory.
+fn read_last_n_lines(path: &Path, n: usize) -> String {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+
+    let reader = BufReader::new(file);
+    let mut lines: VecDeque<String> = VecDeque::with_capacity(n);
+
+    // Use circular buffer to only keep last N lines
+    for line in reader.lines().filter_map(|l| l.ok()) {
+        if lines.len() == n {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    lines.into_iter().collect::<Vec<_>>().join("\n")
+}
+
+fn should_wait_for_engine_ready() -> bool {
+    // Environment variable override (0/false/no = disable waiting, anything else = enable)
+    if let Ok(value) = std::env::var("INSIGHT_ENGINE_WAIT_READY") {
+        let normalized = value.trim().to_ascii_lowercase();
+        return normalized != "0" && normalized != "false" && normalized != "no";
+    }
+    // Default to always waiting - both dev and production need engine ready
+    true
+}
+
+fn get_engine_ready_timeout_secs() -> u64 {
+    if let Ok(value) = std::env::var("INSIGHT_ENGINE_READY_TIMEOUT_SECS") {
+        if let Ok(secs) = value.trim().parse::<u64>() {
+            return secs.max(5); // Minimum 5 seconds
+        }
+    }
+    30 // Default: 30 seconds (faster than old 60s)
+}
+
+/// Wait for the engine to become ready by polling the stdout stream.
+///
+/// This checks for the "ASGI engine ready" message in stderr.
+/// Uses a 30-second default timeout (configurable via INSIGHT_ENGINE_READY_TIMEOUT_SECS).
+/// Optimized to only read new content from the log file each iteration.
+fn wait_for_engine_ready(stderr_log_path: &Path, timeout_secs: u64) -> Result<()> {
+    let start = SystemTime::now();
+    let timeout = Duration::from_secs(timeout_secs);
+    let mut last_size = 0u64;
+    let mut file_ready_found = false;
+
+    loop {
+        let elapsed = start.elapsed().unwrap_or(Duration::from_millis(0));
+        if elapsed > timeout {
+            // Timeout: surface the last 50 lines of stderr for debugging
+            let last_lines = read_last_n_lines(stderr_log_path, 50);
+            return Err(anyhow!(
+                "Engine failed to become ready within {}s\n\n\
+                 Last 50 lines of stderr log ({}):\n\
+                 ---\n{}\n---",
+                timeout_secs,
+                stderr_log_path.display(),
+                if last_lines.is_empty() {
+                    "(log file empty or missing)"
+                } else {
+                    &last_lines
+                }
+            ));
+        }
+
+        // Efficiently check only new content in the log file
+        let metadata = match fs::metadata(stderr_log_path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+
+        let current_size = metadata.len();
+
+        // Only read if file has grown (avoid re-reading entire file)
+        if current_size > last_size || !file_ready_found {
+            if let Ok(content) = fs::read_to_string(stderr_log_path) {
+                if content.contains("ASGI engine ready") || content.contains("startup_health_check") {
+                    eprintln!("[INFO] Engine ready in {:.1}s", elapsed.as_secs_f64());
+                    return Ok(());
+                }
+                file_ready_found = true; // File exists, check it again
+            }
+            last_size = current_size;
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Resolve the project root.
 ///
 /// When running dev, cwd is usually insight/src-tauri. The project root is two levels up.
@@ -67,6 +195,48 @@ pub fn resolve_project_root() -> Result<PathBuf> {
     }
 
     Err(anyhow!("Could not resolve project root from cwd={}", std::env::current_dir()?.display()))
+}
+
+/// Helper function to retry an operation with exponential backoff
+fn retry_with_backoff<T, E>(
+    operation: impl Fn() -> Result<T, E>,
+    max_retries: u32,
+    initial_delay_ms: u64,
+    context: &str,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+{
+    let mut delay = initial_delay_ms;
+
+    for attempt in 0..=max_retries {
+        match operation() {
+            Ok(result) => {
+                if attempt > 0 {
+                    eprintln!("[INFO] {} succeeded on attempt {}", context, attempt + 1);
+                }
+                return Ok(result);
+            }
+            Err(e) => {
+                if attempt < max_retries {
+                    eprintln!(
+                        "[WARNING] {} failed (attempt {}/{}), retrying in {}ms: {}",
+                        context,
+                        attempt + 1,
+                        max_retries + 1,
+                        delay,
+                        e
+                    );
+                    thread::sleep(Duration::from_millis(delay));
+                    delay = (delay * 2).min(5000); // Exponential backoff, max 5s
+                } else {
+                    eprintln!("[ERROR] {} failed after {} attempts: {}", context, max_retries + 1, e);
+                    return Err(e);
+                }
+            }
+        }
+    }
+    unreachable!()
 }
 
 pub struct EngineProcess {
@@ -106,16 +276,56 @@ impl EngineProcess {
         let project_root = resolve_project_root()?;
         let pid_path = project_root.join("storage").join("engine.pid");
         cleanup_stale_engine(&pid_path);
-        let engine_path = project_root.join("backend").join("engine.py");
 
-        let mut child = Command::new(python_bin)
-            .arg(&engine_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Python engine logs to stderr, so inherit it for debugging
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to spawn engine.py at {}", engine_path.display()))?;
+        // Create logs directory and open stderr log file
+        let logs_dir = project_root.join("storage").join("logs");
+        fs::create_dir_all(&logs_dir)?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_millis(0))
+            .as_secs();
+        let stderr_path = logs_dir.join(format!("backend_stderr_{}.log", timestamp));
+
+        // IMPORTANT:
+        // Run as a module from project_root so `import backend.*` works.
+        // Also force unbuffered output for reliable IPC.
+        // Use retry logic with exponential backoff for transient failures
+        let python_bin = python_bin.to_string();
+        let project_root_clone = project_root.clone();
+        let stderr_path_clone = stderr_path.clone();
+
+        let mut child = retry_with_backoff(
+            || {
+                let stderr_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&stderr_path_clone)
+                    .with_context(|| format!("failed to open stderr log at {}", stderr_path_clone.display()))?;
+
+                Command::new(&python_bin)
+                    .current_dir(&project_root_clone)
+                    .env("PYTHONPATH", project_root_clone.to_string_lossy().to_string())
+                    .env("PYTHONUNBUFFERED", "1")
+                    .arg("-u")
+                    .arg("-m")
+                    .arg("backend.engine")
+                    .env("INSIGHT_WORKSPACE_DIR", project_root_clone.join("storage"))
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::from(stderr_file))
+                    .spawn()
+                    .with_context(|| {
+                        format!(
+                            "failed to spawn python engine (python_bin={}, cwd={})",
+                            python_bin,
+                            project_root_clone.display()
+                        )
+                    })
+            },
+            2, // Max 2 retries (3 total attempts)
+            500, // Start with 500ms delay
+            "Python engine spawn"
+        )?;
 
         let stdin = child
             .stdin
@@ -132,11 +342,14 @@ impl EngineProcess {
             app: Mutex::new(None),
         });
 
-        // Single stdout reader thread that demuxes all responses/tokens by request_id.
-        // This is required to support /chat streaming + concurrent /files/* requests.
         spawn_stdout_router(BufReader::new(stdout), state.clone());
 
         write_pid(&pid_path, child.id());
+
+        // Wait for engine to become ready (default 30s, configurable via INSIGHT_ENGINE_READY_TIMEOUT_SECS)
+        if should_wait_for_engine_ready() {
+            wait_for_engine_ready(&stderr_path, get_engine_ready_timeout_secs())?;
+        }
 
         Ok(Self {
             child: Mutex::new(child),
@@ -159,13 +372,34 @@ impl EngineProcess {
         let pid_path = workspace_dir.join("engine.pid");
         cleanup_stale_engine(&pid_path);
 
-        let mut child = Command::new(binary_path)
-            .env("INSIGHT_WORKSPACE_DIR", &workspace_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to spawn engine binary at {}", binary_path.display()))?;
+        // Create logs directory and open stderr log file
+        let logs_dir = workspace_dir.join("logs");
+        fs::create_dir_all(&logs_dir)?;
+        let stderr_path = stderr_log_path();
+        let binary_path_clone = binary_path.to_path_buf();
+        let workspace_dir_clone = workspace_dir.clone();
+        let stderr_path_clone = stderr_path.clone();
+
+        let mut child = retry_with_backoff(
+            || {
+                let stderr_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&stderr_path_clone)
+                    .with_context(|| format!("failed to open stderr log at {}", stderr_path_clone.display()))?;
+
+                Command::new(&binary_path_clone)
+                    .env("INSIGHT_WORKSPACE_DIR", &workspace_dir_clone)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::from(stderr_file))
+                    .spawn()
+                    .with_context(|| format!("failed to spawn engine binary at {}", binary_path_clone.display()))
+            },
+            2, // Max 2 retries (3 total attempts)
+            500, // Start with 500ms delay
+            "Bundled engine spawn"
+        )?;
 
         let stdin = child
             .stdin
@@ -187,6 +421,11 @@ impl EngineProcess {
         spawn_stdout_router(BufReader::new(stdout), state.clone());
 
         write_pid(&pid_path, child.id());
+
+        // Wait for engine to become ready (default 30s, configurable via INSIGHT_ENGINE_READY_TIMEOUT_SECS)
+        if should_wait_for_engine_ready() {
+            wait_for_engine_ready(&stderr_path, get_engine_ready_timeout_secs())?;
+        }
 
         Ok(Self {
             child: Mutex::new(child),
@@ -234,13 +473,16 @@ impl EngineProcess {
         match rx.recv_timeout(Duration::from_secs(120)) {
             Ok(res) => Ok(res),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Clean up so future responses don't leak.
+                // Clean up pending entry so future responses don't leak.
+                // The channel sender (tx) will be dropped when this function returns.
+                eprintln!("[ERROR] Engine request timeout: request_id={request_id}");
                 if let Ok(mut pending) = self.state.pending.lock() {
                     pending.remove(&request_id);
                 }
                 Err(anyhow!("timeout waiting for engine response request_id={request_id}"))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("[ERROR] Engine channel disconnected: request_id={request_id}");
                 if let Ok(mut pending) = self.state.pending.lock() {
                     pending.remove(&request_id);
                 }
@@ -326,14 +568,22 @@ impl EngineProcess {
 
 impl Drop for EngineProcess {
     fn drop(&mut self) {
-        if let Ok(mut stdin) = self.stdin.lock() {
+        // Use try_lock to avoid potential deadlocks during shutdown
+        // If another thread holds the lock, we'll gracefully skip cleanup
+        if let Ok(mut stdin) = self.stdin.try_lock() {
             let _ = writeln!(stdin, r#"{{"cmd":"shutdown"}}"#);
             let _ = stdin.flush();
+        } else {
+            eprintln!("[WARNING] Failed to acquire stdin lock during drop, skipping shutdown command");
         }
-        if let Ok(mut child) = self.child.lock() {
+
+        if let Ok(mut child) = self.child.try_lock() {
             let _ = child.kill();
             let _ = child.wait();
+        } else {
+            eprintln!("[WARNING] Failed to acquire child lock during drop, process may not be killed cleanly");
         }
+
         let _ = fs::remove_file(&self.pid_path);
     }
 }
@@ -350,11 +600,10 @@ fn cleanup_stale_engine(pid_path: &PathBuf) {
         Ok(raw) => raw.trim().parse::<u32>().ok(),
         Err(_) => None,
     };
-    if pid.is_none() {
+    let Some(pid) = pid else {
         let _ = fs::remove_file(pid_path);
         return;
-    }
-    let pid = pid.unwrap();
+    };
     if !pid_is_engine(pid) {
         let _ = fs::remove_file(pid_path);
         return;
@@ -393,10 +642,20 @@ fn pid_is_engine(pid: u32) -> bool {
         if let Ok(output) = output {
             if output.status.success() {
                 let cmd = String::from_utf8_lossy(&output.stdout);
-                return cmd.contains("backend/engine.py") || cmd.contains("engine.py");
+                // Check for Python engine processes
+                if cmd.contains("backend/engine.py")
+                    || cmd.contains("engine.py")
+                    || cmd.contains("backend.engine")
+                {
+                    return true;
+                }
+                // Check for bundled binary (insight-engine or insight-engine-<arch>)
+                if cmd.contains("insight-engine") && !cmd.contains("grep") {
+                    return true;
+                }
             }
         }
-        return false;
+        false
     }
     #[cfg(windows)]
     {
@@ -404,6 +663,7 @@ fn pid_is_engine(pid: u32) -> bool {
         true
     }
 }
+
 
 fn spawn_stdout_router(mut stdout: BufReader<ChildStdout>, state: Arc<RouterState>) {
     std::thread::spawn(move || {
@@ -430,22 +690,40 @@ fn spawn_stdout_router(mut stdout: BufReader<ChildStdout>, state: Arc<RouterStat
             // Out-of-band events from the Python engine (not tied to a request_id).
             if parsed.get("type").and_then(|v| v.as_str()) == Some("event") {
                 let app = {
-                    let slot = state.app.lock().ok();
-                    slot.and_then(|s| s.clone())
+                    match state.app.lock() {
+                        Ok(guard) => guard.as_ref().cloned(),
+                        Err(poisoned) => {
+                            eprintln!("[WARNING] App mutex poisoned, recovering...");
+                            // Recover from poisoned mutex - the data is still valid
+                            poisoned.into_inner().as_ref().cloned()
+                        }
+                    }
                 };
                 if let Some(app) = app {
                     let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let _ = app.emit("engine-event", parsed.clone());
+                    if let Err(e) = app.emit("engine-event", parsed.clone()) {
+                        eprintln!("[ERROR] Failed to emit engine-event: {}", e);
+                    }
                     if name == "files_changed" {
-                        let _ = app.emit("files-changed", parsed.clone());
+                        if let Err(e) = app.emit("files-changed", parsed.clone()) {
+                            eprintln!("[ERROR] Failed to emit files-changed: {}", e);
+                        }
                     } else if name == "file_text_ready" {
-                        let _ = app.emit("file-text-ready", parsed.clone());
+                        if let Err(e) = app.emit("file-text-ready", parsed.clone()) {
+                            eprintln!("[ERROR] Failed to emit file-text-ready: {}", e);
+                        }
                     } else if name == "file_status" {
-                        let _ = app.emit("file-status", parsed.clone());
+                        if let Err(e) = app.emit("file-status", parsed.clone()) {
+                            eprintln!("[ERROR] Failed to emit file-status: {}", e);
+                        }
                     } else if name == "llm_stream_end" {
-           				let _ = app.emit("llm_stream_end", parsed.clone());
+                        if let Err(e) = app.emit("llm_stream_end", parsed.clone()) {
+                            eprintln!("[ERROR] Failed to emit llm_stream_end: {}", e);
+                        }
                     } else if name == "chat_sources" {
-                        let _ = app.emit("chat-sources", parsed.clone());
+                        if let Err(e) = app.emit("chat-sources", parsed.clone()) {
+                            eprintln!("[ERROR] Failed to emit chat-sources: {}", e);
+                        }
                     }
                 }
                 continue;
@@ -480,34 +758,40 @@ fn spawn_stdout_router(mut stdout: BufReader<ChildStdout>, state: Arc<RouterStat
                 let Some(sink) = sink else { continue };
 
                 if let Some(err) = parsed.get("stream_error").and_then(|v| v.as_str()) {
-                    let _ = sink.app.emit(
+                    if let Err(e) = sink.app.emit(
                         "llm-error",
                         serde_json::json!({
                             "request_id": rid,
                             "chat_id": sink.chat_id,
                             "error": err,
                         }),
-                    );
+                    ) {
+                        eprintln!("[ERROR] Failed to emit llm-error for {}: {}", rid, e);
+                    }
                 }
 
                 if let Some(token) = parsed.get("stream_token").and_then(|v| v.as_str()) {
                     if !token.contains("[DONE]") && !token.is_empty() {
-                        let _ = sink.app.emit(
+                        if let Err(e) = sink.app.emit(
                             "llm-token",
                             serde_json::json!({
                                 "token": token,
                                 "chat_id": sink.chat_id,
                                 "request_id": rid,
                             }),
-                        );
+                        ) {
+                            eprintln!("[ERROR] Failed to emit llm-token for {}: {}", rid, e);
+                        }
                     }
                 }
 
                 if parsed.get("stream_end").is_some() {
-                    let _ = sink.app.emit(
+                    if let Err(e) = sink.app.emit(
                         "llm-done",
                         serde_json::json!({ "request_id": rid, "chat_id": sink.chat_id }),
-                    );
+                    ) {
+                        eprintln!("[ERROR] Failed to emit llm-done for {}: {}", rid, e);
+                    }
                     if let Ok(mut streams) = state.streams.lock() {
                         streams.remove(&rid);
                     }

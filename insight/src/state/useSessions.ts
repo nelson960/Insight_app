@@ -71,7 +71,9 @@ export function useSessions() {
     reload();
     const unlistenPromise = listen("sessions_updated", () => reload());
     return () => {
-      unlistenPromise.then((unsub) => unsub()).catch(() => {});
+      unlistenPromise
+        .then((unsub) => unsub())
+        .catch((err) => console.warn("[useSessions] Failed to unsubscribe from sessions_updated:", err));
     };
   }, []);
 

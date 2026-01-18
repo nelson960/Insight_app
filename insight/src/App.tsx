@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { Canvas, CanvasLink, CanvasNote } from "./components/Canvas";
 import type { CardLayout } from "./components/Canvas";
@@ -23,6 +23,29 @@ const DEFAULT_CARD_LAYOUT: CardLayout = {
   chatOnRight: true,
   splitRatio: 0.5,
 };
+const STARTUP_BLOCKING_CODES = new Set([
+  "model_not_configured",
+  "model_missing",
+  "model_not_file",
+  "model_wrong_extension",
+  "model_invalid",
+  "embedding_missing",
+  "embedding_downloading",
+  "embedding_download_failed",
+  "chat_router_failed",
+]);
+
+function pickBlockingIssues(
+  report: HealthReport | null | undefined,
+  blockingCodes: Set<string>
+) {
+  if (!report) return null;
+  const issues = Array.isArray(report.issues)
+    ? report.issues.filter((issue) => blockingCodes.has(issue.code))
+    : [];
+  if (!issues.length) return null;
+  return { ...report, ok: false, issues };
+}
 
 function coerceCardLayout(raw: unknown): CardLayout | null {
   if (!raw || typeof raw !== "object") return null;
@@ -97,9 +120,17 @@ function loadPersistedNotes(): CanvasNote[] | null {
 
 function persistNotes(notes: CanvasNote[]) {
   try {
-    localStorage.setItem(NOTES_STORAGE_KEY, JSON.stringify(notes));
-  } catch {
-    // ignore
+    const serialized = JSON.stringify(notes);
+    // Check if we're about to exceed quota (rough estimate: 2 bytes per character + overhead)
+    if (serialized.length > 4_000_000) { // 4MB safety limit (localStorage is typically 5-10MB)
+      throw new Error("Notes data too large to save");
+    }
+    localStorage.setItem(NOTES_STORAGE_KEY, serialized);
+  } catch (err) {
+    // Log to console for debugging
+    console.error("[Storage] Failed to save notes:", err);
+    // Return error message for display
+    throw err;
   }
 }
 
@@ -130,9 +161,15 @@ function loadPersistedLinks(): CanvasLink[] | null {
 
 function persistLinks(links: CanvasLink[]) {
   try {
-    localStorage.setItem(LINKS_STORAGE_KEY, JSON.stringify(links));
-  } catch {
-    // ignore
+    const serialized = JSON.stringify(links);
+    // Check if we're about to exceed quota
+    if (serialized.length > 4_000_000) {
+      throw new Error("Links data too large to save");
+    }
+    localStorage.setItem(LINKS_STORAGE_KEY, serialized);
+  } catch (err) {
+    console.error("[Storage] Failed to save links:", err);
+    throw err;
   }
 }
 
@@ -152,35 +189,54 @@ function App() {
   );
   const [startupHealth, setStartupHealth] = useState<HealthReport | null>(null);
   const [startupHealthOpen, setStartupHealthOpen] = useState(false);
+  const startupHealthPromptedRef = useRef(false);
+  const [storageError, setStorageError] = useState<string | null>(null);
 
-  const pickBlockingHealthIssues = useCallback((report?: HealthReport | null) => {
-    if (!report) return null;
-    const blockingCodes = new Set([
-      "model_not_configured",
-      "model_missing",
-      "model_not_file",
-      "model_wrong_extension",
-      "model_invalid",
-      "embedding_missing",
-      "embedding_downloading",
-      "embedding_download_failed",
-    ]);
-    const issues = Array.isArray(report.issues)
-      ? report.issues.filter((issue) => blockingCodes.has(issue.code))
-      : [];
-    if (!issues.length) return null;
-    return { ...report, ok: false, issues };
+  const pickStartupIssues = useCallback(
+    (report?: HealthReport | null) => pickBlockingIssues(report, STARTUP_BLOCKING_CODES),
+    []
+  );
+
+  const showStartupHealthOnce = useCallback((report: HealthReport | null) => {
+    if (!report) {
+      setStartupHealth(null);
+      setStartupHealthOpen(false);
+      return true;
+    }
+    setStartupHealth(report);
+    if (!startupHealthPromptedRef.current) {
+      startupHealthPromptedRef.current = true;
+      setStartupHealthOpen(true);
+    }
+    return false;
+  }, []);
+
+  const showStartupHealthNow = useCallback((report: HealthReport | null) => {
+    if (!report) {
+      setStartupHealth(null);
+      setStartupHealthOpen(false);
+      return true;
+    }
+    startupHealthPromptedRef.current = true;
+    setStartupHealth(report);
+    setStartupHealthOpen(true);
+    return false;
   }, []);
 
   const ensureModelReady = useCallback(async () => {
     const res = await engine<HealthReport>("/settings/health", undefined, "GET");
     if (!res.ok) return true;
-    const trimmed = pickBlockingHealthIssues(res.data as any);
-    if (!trimmed) return true;
-    setStartupHealth(trimmed);
-    setStartupHealthOpen(true);
-    return false;
-  }, [pickBlockingHealthIssues]);
+    const trimmed = pickStartupIssues(res.data as any);
+    if (trimmed) return showStartupHealthNow(trimmed);
+    const checks = (res.data as any)?.checks || {};
+    const chatReady = checks.chat_router_ready;
+    const chatLoading = checks.chat_router_loading;
+    const chatError = checks.chat_router_error;
+    if (chatReady === false || chatLoading || chatError) {
+      return false;
+    }
+    return true;
+  }, [pickStartupIssues, showStartupHealthNow]);
 
   // Load persisted app settings (theme) from backend.
   useEffect(() => {
@@ -207,14 +263,8 @@ function App() {
     let cancelled = false;
     const handleReport = (report?: HealthReport | null) => {
       if (cancelled) return;
-      const trimmed = pickBlockingHealthIssues(report);
-      if (!trimmed) {
-        setStartupHealth(null);
-        setStartupHealthOpen(false);
-        return;
-      }
-      setStartupHealth(trimmed);
-      setStartupHealthOpen(true);
+      const trimmed = pickStartupIssues(report);
+      showStartupHealthOnce(trimmed);
     };
 
     (async () => {
@@ -231,7 +281,9 @@ function App() {
 
     return () => {
       cancelled = true;
-      unlistenPromise.then((unsub) => unsub()).catch(() => {});
+      unlistenPromise
+        .then((unsub) => unsub())
+        .catch((err) => console.warn("[App] Failed to unsubscribe from engine events:", err));
     };
   }, []);
 
@@ -252,13 +304,17 @@ function App() {
         const titleBarBg = effectiveTheme === "dark" ? "#0f172a" : "#ffffff";
         const win = getCurrentWindow();
         // Ensure the title bar uses our window background color (macOS).
-        void win.setTitleBarStyle("transparent").catch(() => {});
+        void win.setTitleBarStyle("transparent").catch((err) => {
+          console.warn("[theme] setTitleBarStyle failed (may not be supported on this platform):", err);
+        });
         // On macOS, theme is app-wide; use `null` to follow system.
         const tauriTheme = mode === "system" ? null : effectiveTheme;
         void win.setTheme(tauriTheme).catch((e) => {
           console.warn("[theme] window.setTheme failed", e);
         });
-        void win.setBackgroundColor(titleBarBg).catch(() => {});
+        void win.setBackgroundColor(titleBarBg).catch((err) => {
+          console.warn("[theme] setBackgroundColor failed (may not be supported on this platform):", err);
+        });
         void setAppTheme(tauriTheme).catch((e) => {
           console.warn("[theme] app.setTheme failed", e);
         });
@@ -296,13 +352,27 @@ function App() {
 
   // Persist notes as they change (debounced).
   useEffect(() => {
-    const t = window.setTimeout(() => persistNotes(notes), 250);
+    const t = window.setTimeout(() => {
+      try {
+        persistNotes(notes);
+        setStorageError(null); // Clear error on successful save
+      } catch (err) {
+        setStorageError("Failed to save canvas notes. Your data may not persist.");
+      }
+    }, 250);
     return () => window.clearTimeout(t);
   }, [notes]);
 
   // Persist links as they change (debounced).
   useEffect(() => {
-    const t = window.setTimeout(() => persistLinks(links), 250);
+    const t = window.setTimeout(() => {
+      try {
+        persistLinks(links);
+        setStorageError(null); // Clear error on successful save
+      } catch (err) {
+        setStorageError("Failed to save canvas links. Your data may not persist.");
+      }
+    }, 250);
     return () => window.clearTimeout(t);
   }, [links]);
 
@@ -699,6 +769,43 @@ function App() {
               setSettingsOpen(true);
             }}
           />
+          {storageError && (
+            <div
+              style={{
+                position: "fixed",
+                top: 10,
+                left: "50%",
+                transform: "translateX(-50%)",
+                zIndex: 9999,
+                backgroundColor: "#f59e0b",
+                color: "#000",
+                padding: "12px 20px",
+                borderRadius: "8px",
+                boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+                display: "flex",
+                alignItems: "center",
+                gap: "12px",
+                maxWidth: "90vw",
+              }}
+            >
+              <span style={{ fontSize: "14px", fontWeight: 500 }}>
+                ⚠️ {storageError}
+              </span>
+              <button
+                onClick={() => setStorageError(null)}
+                style={{
+                  background: "rgba(0,0,0,0.1)",
+                  border: "none",
+                  borderRadius: "4px",
+                  padding: "4px 8px",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                }}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           {overlayCardId ? (
             <OverlayBoundary title="Card UI crashed" onClose={closeOverlayCard}>
               {(() => {

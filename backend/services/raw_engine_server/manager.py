@@ -91,6 +91,7 @@ class RawEngineServerManager:
                 "pid": pid,
                 "host": self._host,
                 "port": self._port,
+                "requested_host": self._requested_host,
                 "requested_port": self._requested_port,
                 "log_dir": str(self._log_dir),
                 "command": self._command,
@@ -105,7 +106,7 @@ class RawEngineServerManager:
         with self._lock:
             return list(self._logs)[-limit:]
 
-    def start(self) -> Dict[str, Any]:
+    def start(self, env_overrides: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         with self._lock:
             if self._process and self._process.poll() is None:
                 return self.status()
@@ -117,6 +118,11 @@ class RawEngineServerManager:
 
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
+            if env_overrides:
+                for key, val in env_overrides.items():
+                    if val is None:
+                        continue
+                    env[str(key)] = str(val)
             requested_host = env.get("INSIGHT_ENGINE_HOST", "127.0.0.1")
             try:
                 requested_port = int(env.get("INSIGHT_ENGINE_PORT", "11435"))

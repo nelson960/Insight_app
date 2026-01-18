@@ -25,7 +25,8 @@ from backend.services.ingestion import (
     create_ingestion_pipeline,
 )
 from backend.services.logging_config import configure_logging
-from backend.services.storage import QdrantConfig, SQLiteConfig
+from backend.services.storage.qdrant_index import QdrantConfig
+from backend.services.storage.sqlite_store import SQLiteConfig
 
 logger = logging.getLogger(__name__)
 

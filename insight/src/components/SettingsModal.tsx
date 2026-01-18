@@ -9,6 +9,18 @@ type SettingsState = {
   llm_model_path: string;
   llm_gpu_layers: number;
   llm_ctx_size: number;
+  raw_engine_host: string;
+  raw_engine_port: number;
+  raw_engine_model_path: string;
+  raw_engine_ctx: number | null;
+  raw_engine_threads: number | null;
+  raw_engine_gpu_layers: number | null;
+  raw_engine_max_tokens: number;
+  raw_engine_embedding_model: string;
+  raw_engine_embedding_auto_download: boolean;
+  raw_engine_log_preview_chars: number;
+  raw_engine_log_prompts: boolean;
+  raw_engine_log_completions: boolean;
 };
 
 type LlmModelInfo = {
@@ -32,6 +44,7 @@ type LlmModelInfo = {
 type SettingsResponse = {
   settings?: SettingsState;
   llm?: { loaded?: boolean; model_info?: LlmModelInfo | null };
+  raw_engine?: { defaults?: Partial<SettingsState> };
 };
 
 type StorageUsage = {
@@ -69,6 +82,7 @@ type RawEngineStatus = {
   pid?: number | null;
   host?: string | null;
   port?: number | null;
+  requested_host?: string | null;
   requested_port?: number | null;
   log_dir?: string | null;
   command?: string | null;
@@ -102,11 +116,41 @@ export function SettingsModal(props: {
   onThemeModeChange: (mode: ThemeMode) => void;
 }) {
   const { open, onClose, themeMode, onThemeModeChange } = props;
+  const RAW_ENGINE_DEFAULTS: SettingsState = {
+    theme_mode: themeMode,
+    llm_model_path: "",
+    llm_gpu_layers: 99,
+    llm_ctx_size: 32768,
+    raw_engine_host: "127.0.0.1",
+    raw_engine_port: 11435,
+    raw_engine_model_path: "",
+    raw_engine_ctx: null,
+    raw_engine_threads: null,
+    raw_engine_gpu_layers: null,
+    raw_engine_max_tokens: 1024,
+    raw_engine_embedding_model: "nomic-embed-text-v1.5",
+    raw_engine_embedding_auto_download: true,
+    raw_engine_log_preview_chars: 400,
+    raw_engine_log_prompts: false,
+    raw_engine_log_completions: false,
+  };
   const [settings, setSettings] = useState<SettingsState>({
     theme_mode: themeMode,
     llm_model_path: "",
     llm_gpu_layers: 99,
     llm_ctx_size: 32768,
+    raw_engine_host: "127.0.0.1",
+    raw_engine_port: 11435,
+    raw_engine_model_path: "",
+    raw_engine_ctx: null,
+    raw_engine_threads: null,
+    raw_engine_gpu_layers: null,
+    raw_engine_max_tokens: 1024,
+    raw_engine_embedding_model: "nomic-embed-text-v1.5",
+    raw_engine_embedding_auto_download: true,
+    raw_engine_log_preview_chars: 400,
+    raw_engine_log_prompts: false,
+    raw_engine_log_completions: false,
   });
   const [storage, setStorage] = useState<StorageUsage | null>(null);
   const [restartRequired, setRestartRequired] = useState(false);
@@ -125,8 +169,12 @@ export function SettingsModal(props: {
   const [rawEngineError, setRawEngineError] = useState<string | null>(null);
   const [rawEngineBusy, setRawEngineBusy] = useState(false);
   const [rawLogsOpen, setRawLogsOpen] = useState(false);
+  const [rawAdvancedOpen, setRawAdvancedOpen] = useState(false);
+  const [rawEngineDefaults, setRawEngineDefaults] = useState<Partial<SettingsState>>(RAW_ENGINE_DEFAULTS);
   const resetWrapRef = useRef<HTMLDivElement | null>(null);
   const rawLogRef = useRef<HTMLDivElement | null>(null);
+  const modalRef = useRef<HTMLDivElement | null>(null);
+  const scrollTimersRef = useRef<Map<HTMLElement, number>>(new Map());
 
   function getErrorText(res: { error?: string; data?: any }, fallback: string) {
     return (
@@ -168,6 +216,10 @@ export function SettingsModal(props: {
         setSettings((prev) => ({ ...prev, ...next }));
         const mode = next.theme_mode;
         if (mode) onThemeModeChange(mode);
+      }
+      if (res.ok) {
+        const defaults = (res.data as any)?.raw_engine?.defaults as Partial<SettingsState> | undefined;
+        if (defaults) setRawEngineDefaults(defaults);
       }
       if (res.ok) {
         const loaded = Boolean((res.data as any)?.llm?.loaded);
@@ -265,6 +317,46 @@ export function SettingsModal(props: {
     rawLogRef.current.scrollTop = rawLogRef.current.scrollHeight;
   }, [rawEngineLogs, rawLogsOpen]);
 
+  useEffect(() => {
+    if (!open) return;
+    const root = modalRef.current;
+    if (!root) return;
+    const nodes = Array.from(root.querySelectorAll<HTMLElement>(".settings-scrollable"));
+    if (nodes.length === 0) return;
+    const timers = scrollTimersRef.current;
+    const markScrolling = (el: HTMLElement) => {
+      el.classList.add("is-scrolling");
+      const prior = timers.get(el);
+      if (prior) window.clearTimeout(prior);
+      const timeout = window.setTimeout(() => {
+        el.classList.remove("is-scrolling");
+        timers.delete(el);
+      }, 1000);
+      timers.set(el, timeout);
+    };
+    const onScroll = (event: Event) => {
+      markScrolling(event.currentTarget as HTMLElement);
+    };
+    const onWheel = (event: Event) => {
+      markScrolling(event.currentTarget as HTMLElement);
+    };
+    nodes.forEach((el) => {
+      el.addEventListener("scroll", onScroll, { passive: true });
+      el.addEventListener("wheel", onWheel, { passive: true });
+      el.addEventListener("touchmove", onWheel, { passive: true });
+    });
+    return () => {
+      nodes.forEach((el) => {
+        el.removeEventListener("scroll", onScroll);
+        el.removeEventListener("wheel", onWheel);
+        el.removeEventListener("touchmove", onWheel);
+        el.classList.remove("is-scrolling");
+      });
+      timers.forEach((id) => window.clearTimeout(id));
+      timers.clear();
+    };
+  }, [open, rawLogsOpen]);
+
   const sortedBreakdown = useMemo(() => {
     if (!storage?.breakdown) return [];
     return Object.entries(storage.breakdown).sort((a, b) => (b[1].bytes || 0) - (a[1].bytes || 0));
@@ -276,6 +368,13 @@ export function SettingsModal(props: {
     rawRunning && rawEngineStatus?.host && rawEngineStatus?.port
       ? `http://${rawEngineStatus.host}:${rawEngineStatus.port}`
       : "";
+  const rawConfigLocked = rawRunning || rawStarting;
+  const rawDefaults = rawEngineDefaults || RAW_ENGINE_DEFAULTS;
+  const rawDefaultLabel = (val: any) => (val === null || val === undefined || val === "" ? "Auto" : String(val));
+  const rawMaxTokensDefault =
+    typeof rawDefaults.raw_engine_max_tokens === "number"
+      ? rawDefaults.raw_engine_max_tokens
+      : RAW_ENGINE_DEFAULTS.raw_engine_max_tokens;
 
   async function refreshStorage() {
     const st = await engine<StorageUsage>("/settings/storage", undefined, "GET");
@@ -283,7 +382,7 @@ export function SettingsModal(props: {
   }
 
   async function refreshHealth() {
-    const res = await engine<HealthReport>("/settings/health", undefined, "GET");
+    const res = await engine<HealthReport>("/settings/health?full=1", undefined, "GET");
     if (res.ok) setHealthReport(res.data as any);
   }
 
@@ -295,6 +394,28 @@ export function SettingsModal(props: {
   async function refreshRawEngineLogs() {
     const res = await engine<{ lines?: RawEngineLogLine[] }>("/settings/raw_engine/logs?limit=250", undefined, "GET");
     if (res.ok) setRawEngineLogs((res.data as any)?.lines || []);
+  }
+
+  async function saveRawEngineSettings() {
+    if (rawConfigLocked || rawEngineBusy) {
+      setRawEngineError("Stop the raw server before changing its settings.");
+      return;
+    }
+    setRawEngineError(null);
+    const patch: Partial<SettingsState> = {
+      raw_engine_host: settings.raw_engine_host,
+      raw_engine_port: settings.raw_engine_port,
+      raw_engine_ctx: settings.raw_engine_ctx,
+      raw_engine_threads: settings.raw_engine_threads,
+      raw_engine_gpu_layers: settings.raw_engine_gpu_layers,
+      raw_engine_max_tokens: settings.raw_engine_max_tokens,
+    };
+    const res = await engine<any>("/settings", { settings: patch }, "POST");
+    if (!res.ok) {
+      setRawEngineError(getErrorText(res, "Failed to save raw server settings"));
+      return;
+    }
+    await refreshRawEngineStatus();
   }
 
   async function toggleRawEngine() {
@@ -475,6 +596,7 @@ export function SettingsModal(props: {
       <div
         className="settings-modal"
         onPointerDown={(e) => e.stopPropagation()}
+        ref={modalRef}
       >
         <div className="settings-header">
           <div className="settings-title">Settings</div>
@@ -496,7 +618,7 @@ export function SettingsModal(props: {
           </div>
         ) : null}
 
-        <div className="settings-body">
+        <div className="settings-body settings-scrollable">
           <section className="settings-section">
             <div className="settings-section-title">Health</div>
             {healthReport ? (
@@ -714,7 +836,7 @@ export function SettingsModal(props: {
                 </div>
                 {rawEngineBusy || rawStarting ? <div className="settings-muted">Working…</div> : null}
               </div>
-              <div className="settings-hint">
+              <div className="settings-hint settings-raw-hint">
                 {rawBaseUrl ? (
                   <>
                     Base URL <code>{rawBaseUrl}</code>
@@ -734,17 +856,193 @@ export function SettingsModal(props: {
                 )}
               </div>
               {rawEngineError || rawEngineStatus?.error ? (
-                <div className="settings-hint err">{rawEngineError || rawEngineStatus?.error}</div>
+                <div className="settings-hint err settings-raw-hint">
+                  {rawEngineError || rawEngineStatus?.error}
+                </div>
               ) : null}
 
               <details
-                className="settings-dropdown"
+                className="settings-dropdown settings-raw-dropdown"
                 open={rawLogsOpen}
                 onToggle={(e) => setRawLogsOpen((e.target as HTMLDetailsElement).open)}
               >
                 <summary>Raw server logs & options</summary>
-                <div className="settings-dropdown-panel">
-                  <div className="settings-raw-console" ref={rawLogRef}>
+                <div className="settings-dropdown-panel settings-raw-panel settings-scrollable">
+                  <div className="settings-raw-config">
+                    <div className="settings-row settings-col">
+                      <label className="settings-label">Host</label>
+                      <div className="settings-inline">
+                        <input
+                          className="settings-input settings-input-compact"
+                          type="text"
+                          value={settings.raw_engine_host}
+                          inputMode="decimal"
+                          pattern="[0-9.]*"
+                          onChange={(e) => {
+                            const next = e.target.value.replace(/[^0-9.]/g, "");
+                            setSettings((p) => ({ ...p, raw_engine_host: next }));
+                          }}
+                          disabled={rawConfigLocked || rawEngineBusy}
+                        />
+                        <div className="settings-muted">Default: {rawDefaultLabel(rawDefaults.raw_engine_host)}</div>
+                      </div>
+                    </div>
+
+                    <div className="settings-row settings-col">
+                      <label className="settings-label">Port</label>
+                      <div className="settings-inline">
+                        <input
+                          className="settings-input settings-input-compact"
+                          type="text"
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          value={settings.raw_engine_port ? String(settings.raw_engine_port) : ""}
+                          onChange={(e) => {
+                            const next = e.target.value.replace(/[^0-9]/g, "");
+                            setSettings((p) => ({
+                              ...p,
+                              raw_engine_port: next ? Number(next) : 0,
+                            }));
+                          }}
+                          disabled={rawConfigLocked || rawEngineBusy}
+                        />
+                        <div className="settings-muted">Default: {rawDefaultLabel(rawDefaults.raw_engine_port)}</div>
+                      </div>
+                    </div>
+
+                    <div className="settings-row settings-col">
+                      <label className="settings-label">Context size</label>
+                      <div className="settings-inline">
+                        <select
+                          className="settings-select settings-input-compact"
+                          value={settings.raw_engine_ctx ?? ""}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setSettings((p) => ({
+                              ...p,
+                              raw_engine_ctx: v ? Number(v) : null,
+                            }));
+                          }}
+                          disabled={rawConfigLocked || rawEngineBusy}
+                        >
+                          <option value="">Auto</option>
+                          <option value="8192">8k</option>
+                          <option value="32768">32k</option>
+                        </select>
+                        <div className="settings-muted">Default: {rawDefaultLabel(rawDefaults.raw_engine_ctx)}</div>
+                      </div>
+                    </div>
+
+                    <div className="settings-row">
+                      <button
+                        className={`settings-btn ${rawAdvancedOpen ? "active" : ""}`}
+                        type="button"
+                        onClick={() => setRawAdvancedOpen((prev) => !prev)}
+                      >
+                        Advanced options
+                      </button>
+                    </div>
+
+                    {rawAdvancedOpen ? (
+                      <div className="settings-raw-advanced">
+                        <div className="settings-row settings-col">
+                          <label className="settings-label">Threads</label>
+                          <div className="settings-inline">
+                            <input
+                              className="settings-input settings-input-compact"
+                              type="text"
+                              inputMode="numeric"
+                              pattern="[0-9]*"
+                              value={
+                                settings.raw_engine_threads === null
+                                  ? ""
+                                  : String(settings.raw_engine_threads)
+                              }
+                              onChange={(e) => {
+                                const next = e.target.value.replace(/[^0-9]/g, "");
+                                setSettings((p) => ({
+                                  ...p,
+                                  raw_engine_threads: next ? Number(next) : null,
+                                }));
+                              }}
+                              disabled={rawConfigLocked || rawEngineBusy}
+                            />
+                            <div className="settings-muted">
+                              Default: {rawDefaultLabel(rawDefaults.raw_engine_threads)}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="settings-row settings-col">
+                          <label className="settings-label">GPU layers</label>
+                          <div className="settings-inline">
+                            <input
+                              className="settings-input settings-input-compact"
+                              type="text"
+                              inputMode="numeric"
+                              pattern="[0-9]*"
+                              value={
+                                settings.raw_engine_gpu_layers === null
+                                  ? ""
+                                  : String(settings.raw_engine_gpu_layers)
+                              }
+                              onChange={(e) => {
+                                const next = e.target.value.replace(/[^0-9]/g, "");
+                                setSettings((p) => ({
+                                  ...p,
+                                  raw_engine_gpu_layers: next ? Number(next) : null,
+                                }));
+                              }}
+                              disabled={rawConfigLocked || rawEngineBusy}
+                            />
+                            <div className="settings-muted">
+                              Default: {rawDefaultLabel(rawDefaults.raw_engine_gpu_layers)}
+                            </div>
+                          </div>
+                          <div className="settings-muted">Use 0 for CPU-only.</div>
+                        </div>
+
+                        <div className="settings-row settings-col">
+                          <label className="settings-label">Default max tokens</label>
+                          <div className="settings-inline">
+                            <input
+                              className="settings-input settings-input-compact"
+                              type="text"
+                              inputMode="numeric"
+                              pattern="[0-9]*"
+                              value={String(settings.raw_engine_max_tokens)}
+                              onChange={(e) => {
+                                const next = e.target.value.replace(/[^0-9]/g, "");
+                                setSettings((p) => ({
+                                  ...p,
+                                  raw_engine_max_tokens: next ? Number(next) : rawMaxTokensDefault,
+                                }));
+                              }}
+                              disabled={rawConfigLocked || rawEngineBusy}
+                            />
+                            <div className="settings-muted">
+                              Default: {rawDefaultLabel(rawDefaults.raw_engine_max_tokens)}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    <div className="settings-row">
+                      <button
+                        className="settings-btn"
+                        type="button"
+                        onClick={saveRawEngineSettings}
+                        disabled={rawConfigLocked || rawEngineBusy}
+                      >
+                        Save raw server settings
+                      </button>
+                      {rawConfigLocked ? (
+                        <div className="settings-muted">Stop the server to edit settings.</div>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="settings-raw-console settings-scrollable" ref={rawLogRef}>
                     {rawEngineLogs.length ? (
                       rawEngineLogs.map((entry, idx) => (
                         <div key={`${entry.ts}-${idx}`} className="settings-raw-line">
@@ -848,7 +1146,7 @@ export function SettingsModal(props: {
             <details className="settings-dropdown">
               <summary>Storage files</summary>
               <div className="settings-dropdown-panel">
-                <div className="settings-breakdown">
+                <div className="settings-breakdown settings-scrollable">
                   {sortedBreakdown.map(([name, info]) => (
                     <div key={name} className="settings-breakdown-row">
                       <div className="name">{name}</div>

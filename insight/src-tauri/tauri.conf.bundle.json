@@ -1,7 +1,5 @@
 {
   "bundle": {
-    "externalBin": [
-      "bin/insight-engine"
-    ]
+    "externalBin": []
   }
 }

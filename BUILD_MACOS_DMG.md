@@ -13,8 +13,6 @@ This repo is structured as:
 
 ## 1) Build the Python sidecar (one-time per architecture)
 
-Tauri copies sidecar binaries specified in `insight/src-tauri/tauri.conf.json` → `bundle.externalBin`.
-
 This project expects a sidecar named like:
 
 - `insight/src-tauri/bin/insight-engine-aarch64-apple-darwin` (Apple Silicon)
@@ -22,7 +20,7 @@ This project expects a sidecar named like:
 
 Tauri uses the pattern `name-{target-triple}` for `externalBin`.
 
-### Option A (recommended): PyInstaller `--onefile`
+### Option A (recommended): PyInstaller onedir (spec)
 
 From the repo root:
 
@@ -31,11 +29,13 @@ From the repo root:
 
 2. Build the engine sidecar:
    - Apple Silicon:
-     - `pyinstaller --noconfirm --clean --onefile --name insight-engine backend/engine.py`
-     - `cp dist/insight-engine insight/src-tauri/bin/insight-engine-aarch64-apple-darwin`
+     - `pyinstaller --noconfirm --clean backend/insight_engine_portable.spec`
+     - `cp -R dist/insight-engine insight/src-tauri/bin/insight-engine-aarch64-apple-darwin`
+     - `chmod +x insight/src-tauri/bin/insight-engine-aarch64-apple-darwin/insight-engine`
    - Intel (on an Intel Mac, or via cross-build tooling):
-     - `pyinstaller --noconfirm --clean --onefile --name insight-engine backend/engine.py`
-     - `cp dist/insight-engine insight/src-tauri/bin/insight-engine-x86_64-apple-darwin`
+     - `pyinstaller --noconfirm --clean backend/insight_engine_portable.spec`
+     - `cp -R dist/insight-engine insight/src-tauri/bin/insight-engine-x86_64-apple-darwin`
+     - `chmod +x insight/src-tauri/bin/insight-engine-x86_64-apple-darwin/insight-engine`
 
 Notes:
 - If PyInstaller misses dynamic libs (e.g. `llama_cpp`), add `--collect-submodules llama_cpp` or a `.spec` file.
@@ -50,12 +50,7 @@ From the repo root:
 - `pnpm tauri build --bundles dmg --config src-tauri/tauri.conf.bundle.json`
 
 """
-pyinstaller --noconfirm --clean --onefile \
-  --name insight-engine \
-  --collect-all onnxruntime \
-  --collect-all llama_cpp \
-  backend/engine.py
-
+pyinstaller --noconfirm --clean backend/insight_engine_portable.spec
 """
 
 Notes:
