@@ -1,0 +1,90 @@
+# ---- Local data / runtime state ----
+/storage/
+/models/
+/backend/em_models/
+*.kv
+*.enc
+*.sqlite
+*.sqlite3
+*.db
+
+# ---- Logs / traces ----
+*.log
+*.log.*
+/logs/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pycache_tmp/
+
+# Note: PyInstaller spec files are source code and should be tracked
+# Only ignore auto-generated spec files
+# *.spec  <-- REMOVED: We track backend/insight_engine_portable.spec
+
+# ---- Node / frontend ----
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.vite/
+**/.vite/
+.turbo/
+**/.turbo/
+
+# ---- Rust / Tauri ----
+target/
+**/target/
+build/
+**/bin/
+
+# ---- Editor / OS ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- Backup and temporary files ----
+*.bak
+*backup*
+*.tmp
+*.old
+icon_old.*
+icon_pre_update*
+icon_original*
+icon_working_backup*
+*_backup.*
+
+# ---- Misc ----
+.env
+.env.*
+*.session
+*.pickle
+*.pkl
+
+samples/
+*.pdf
+
+# ---- Test coverage ----
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
