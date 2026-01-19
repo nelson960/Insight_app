@@ -153,7 +153,6 @@ export function SettingsModal(props: {
     raw_engine_log_completions: false,
   });
   const [storage, setStorage] = useState<StorageUsage | null>(null);
-  const [restartRequired, setRestartRequired] = useState(false);
   const [modelValidation, setModelValidation] = useState<{ ok: boolean; msg: string } | null>(null);
   const [_cleanResult, setCleanResult] = useState<string | null>(null);
   const [resetOpen, setResetOpen] = useState(false);
@@ -200,7 +199,6 @@ export function SettingsModal(props: {
     setResetOpen(false);
     setCleanResult(null);
     setModelValidation(null);
-    setRestartRequired(false);
     setEmbeddingDownloading(false);
     setEmbeddingDownloadError(null);
     setRawEngineError(null);
@@ -384,6 +382,13 @@ export function SettingsModal(props: {
   async function refreshHealth() {
     const res = await engine<HealthReport>("/settings/health?full=1", undefined, "GET");
     if (res.ok) setHealthReport(res.data as any);
+
+    // Also fetch LLM info separately (health endpoint doesn't include it)
+    const llmRes = await engine<{ loaded: boolean; model_info: LlmModelInfo | null }>("/settings/llm/info", undefined, "GET");
+    if (llmRes.ok) {
+      setLlmLoaded(Boolean(llmRes.data?.loaded));
+      setLlmInfo(llmRes.data?.model_info || null);
+    }
   }
 
   async function refreshRawEngineStatus() {
@@ -443,7 +448,6 @@ export function SettingsModal(props: {
       "POST"
     );
     if (res.ok) {
-      if ((res.data as any)?.restart_required) setRestartRequired(true);
       setCleanResult(null);
     } else {
       setSettings(prev);
@@ -513,9 +517,8 @@ export function SettingsModal(props: {
       return;
     }
 
-    setRestartRequired(true);
-    setLlmLoaded(false);
-    setLlmInfo(null);
+    // Don't clear llmLoaded/llmInfo immediately - let refreshHealth update them
+    // This prevents the "Model info appears..." flash
     await refreshStorage();
     await refreshHealth();
     setCleanResult("Model settings applied and workspace cleared. Restart the app/engine to reload the model.");
@@ -534,7 +537,6 @@ export function SettingsModal(props: {
       return;
     }
     setResetOpen(false);
-    setRestartRequired(true);
     const st = await engine<StorageUsage>("/settings/storage", undefined, "GET");
     if (st.ok) setStorage(st.data as any);
     const settingsRes = await engine<SettingsResponse>("/settings", undefined, "GET");
@@ -607,11 +609,6 @@ export function SettingsModal(props: {
           </button>
         </div>
 
-        {restartRequired ? (
-          <div className="settings-banner">
-            Changes require restarting the app/engine to fully apply.
-          </div>
-        ) : null}
         {engineBusy?.busy ? (
           <div className="settings-banner warn">
             Background work running. Wait before cleaning/resetting storage or changing context.

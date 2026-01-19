@@ -7,7 +7,7 @@
 ## TL;DR
 
 - Runs fully offline: **ONNX embeddings + Qdrant retrieval + llama.cpp inference**
-- Optimized for responsiveness: **~<500ms TTFT** (Qwen2.5 7B Q4_K_M, Apple M1/M2 w/ GPU layers), **streaming output**
+- Optimized for responsiveness: **~<500ms TTFT** (Qwen2.5 7B Q4_K_M, Apple M1/M2), **streaming output**
 - Built-in safeguards: **RAG-ready gating (HTTP 409)** + **ephemeral "CONTEXT PACK" injection** to prevent context pollution
 - Fast resume: **KV-cache snapshots** persisted per chat to avoid prompt replay
 
@@ -15,7 +15,7 @@
 
 ## Tech Stack
 
-Tauri (Rust) • React/TypeScript • FastAPI (IPC-only) • llama.cpp (GGUF) • Qdrant • ONNX Runtime (Nomic embeddings) • SQLite • Local HTTP inference API (llama.cpp-based, optional)
+Tauri (Rust) • React/TypeScript • FastAPI (IPC-only) • llama.cpp (GGUF) • Qdrant • ONNX Runtime (Nomic embeddings) • SQLite • Local HTTP inference API (llama.cpp-based)
 
 ## Highlights 
 
@@ -63,9 +63,8 @@ Tauri (Rust) • React/TypeScript • FastAPI (IPC-only) • llama.cpp (GGUF) �
 | Metric | Target | Hardware | Model | Notes |
 |--------|--------|----------|-------|------|
 | TTFT | sub-second TTFT (tuning-dependent)| Apple M1/M2 | Qwen2.5 7B Q4_K_M | GPU layers enabled, 8K ctx |
-| tok/s | >35 | Apple M1/M2 | Qwen2.5 7B Q4_K_M | batch size / threads tuned |
+| tok/s | >35/s | Apple M1/M2 | Qwen2.5 7B Q4_K_M | |
 
-**Repro notes:** `--ctx-size 8192`, `--n-gpu-layers <N>`, `--threads <T>`, Qwen2.5 7B (GGUF Q4_K_M).
 
 ### Retrieval Behavior
 
@@ -361,7 +360,7 @@ INSIGHT_WORKSPACE_DIR=~/.insight-dev python backend/engine.py
 
 ## License
 
-[Specify your license here]
+Licensed under the Apache License, Version 1.0.
 
 ## Acknowledgments
 

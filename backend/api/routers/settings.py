@@ -330,15 +330,20 @@ def llm_info() -> Dict[str, Any]:
     """
     Return details about the currently loaded LLM (if any).
 
-    This endpoint does NOT force model load; it only reports info once the LLM is already initialized.
+    This will attempt to initialize the session manager if it doesn't exist yet,
+    which triggers model load. Returns info once the LLM is initialized.
     """
-    mgr = getattr(AppDependencies, "_session_manager", None)
-    if mgr is None:
-        return {"loaded": False, "model_info": None}
     try:
+        # Try to get the session manager - this will trigger initialization if needed
+        mgr = AppDependencies.session_manager()
         return {"loaded": True, "model_info": mgr.model_info()}
+    except FileNotFoundError as exc:
+        # Model not configured or file not found
+        logger.debug(f"LLM not loaded: {exc}")
+        return {"loaded": False, "model_info": None, "error": "Model not configured or not found"}
     except Exception as exc:
-        return {"loaded": True, "model_info": None, "error": str(exc)}
+        logger.error(f"Error getting LLM info: {exc}")
+        return {"loaded": False, "model_info": None, "error": str(exc)}
 
 
 @router.get("/busy")

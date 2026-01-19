@@ -302,9 +302,7 @@ xattr -cr Insight.app
    zip -r Insight-0.1.0-macos.zip Insight.app
    ```
 
----
 
-## 📞 Support
 
 For issues or questions:
 - Check logs: `~/.insight/logs/`
