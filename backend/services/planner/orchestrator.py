@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from backend.services.connectors.llama_session_manager import LlamaSessionManager
 from backend.services.planner.agent_loop import MultiFileAgentConfig, MultiFileAgentLoop
 from backend.services.planner.agent_tools import AgentToolbox, ChunkAnchor
-from backend.services.planner.raw_large_loop import RawLargeAgentLoop
+from backend.services.planner.raw_large_loop import RawLargeAgentLoop, RawLargeAgentConfig
 from backend.services.retrieval.rag_store import RagStore
 from backend.services.memory.ltm_store import LongTermMemoryStore, MemoryHit
 from backend.services.ipc_events import emit_event
@@ -25,6 +26,7 @@ RESERVE_OUTPUT_PCT = 0.10
 CONTEXT_MARGIN_PCT = 0.02
 MAX_INPUT_PCT = 0.65
 SMALL_DOC_PCT = 0.90
+SMALL_DOC_CITE_K = 6
 
 # Retrieval policy (UI-driven focus/scope).
 RAG_PRIMARY_K = 12
@@ -34,9 +36,16 @@ RAG_ALL_K_TOTAL = 14
 # Focused mode should hard-scope retrieval to the focused file only.
 # Cross-file mixing is allowed only in scope=all.
 RAG_SECONDARY_K_TOTAL = 0
- # Output budgeting (percentage-only; no fixed token constants).
+# Output budgeting (percentage-only; no fixed token constants).
+SMALL_RAG_COVERAGE_SAMPLE_CHUNKS = 5
 
-
+RAG_DETAIL_MAP: dict[int, tuple[int, int]] = {
+    1: (3, 0),
+    2: (5, 0),
+    3: (7, 1),
+    4: (9, 1),
+    5: (12, 2),
+}
 def build_context_pack(
     *,
     ltm_hits: List[MemoryHit],
@@ -277,7 +286,6 @@ def build_ui_sources_from_rag_hits(rag_hits: List[Dict[str, Any]]) -> List[Dict[
             ps = p if isinstance(p, int) else None
         if pe is None:
             pe = ps
-
         rec = per_doc.get(doc_id)
         if not rec:
             rec = {"filename": filename, "ranges": []}
@@ -347,6 +355,43 @@ def build_ui_sources_from_rag_hits(rag_hits: List[Dict[str, Any]]) -> List[Dict[
     return out
 
 
+def build_ui_sources_for_small_doc(
+    scope_files: Optional[List[str]], fallback_name: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Build UI-only sources for small-doc mode (full-file injection).
+
+    This is a minimal, filename-only citation list used when we don't have
+    RAG hits (or choose not to run retrieval).
+    """
+    names: List[str] = []
+    if isinstance(scope_files, list):
+        for raw in scope_files:
+            if not isinstance(raw, str):
+                continue
+            s = raw.strip()
+            if s:
+                names.append(s)
+    if not names and isinstance(fallback_name, str) and fallback_name.strip():
+        names = [fallback_name.strip()]
+    if not names:
+        names = ["Document"]
+
+    counts: Dict[str, int] = {}
+    for n in names:
+        counts[n] = counts.get(n, 0) + 1
+    seen: Dict[str, int] = {}
+    display: List[str] = []
+    for n in names:
+        if counts.get(n, 0) <= 1:
+            display.append(n)
+            continue
+        seen[n] = seen.get(n, 0) + 1
+        display.append(f"{n} ({seen[n]})")
+
+    return [{"filename": n, "page_ranges": []} for n in display]
+
+
 def build_dirty_user_turn(user_message: str, *, selection: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
     Build a "dirty" user turn that strongly weights a selected excerpt.
@@ -395,7 +440,7 @@ class InsightOrchestrator:
         rag_store: RagStore,
         ltm_store: LongTermMemoryStore,
         metadata_store: SQLiteMetadataStore,
-        system_hint: str = "You are Insight, a local privacy-first AI assistant.",
+        system_hint: str = "",
     ) -> None:
         self.session_mgr = session_mgr
         self.rag_store = rag_store
@@ -472,6 +517,53 @@ class InsightOrchestrator:
 
         max_input = int(remaining * MAX_INPUT_PCT)
         return max(0, int(max_input))
+
+    def _compute_rag_primary_k(
+        self,
+        *,
+        budget_tokens: int,
+        files_in_scope: int,
+        base_k: int,
+    ) -> int:
+        """
+        Scale anchor counts with available budget.
+
+        This keeps retrieval light for small budgets while allowing
+        more anchors when there's ample room to pack evidence.
+        """
+        try:
+            budget_tokens = int(budget_tokens)
+        except Exception:
+            budget_tokens = 0
+        try:
+            files_in_scope = int(files_in_scope)
+        except Exception:
+            files_in_scope = 1
+        files_in_scope = max(1, files_in_scope)
+        base_k = max(1, int(base_k))
+
+        if budget_tokens <= 0:
+            return base_k
+
+        # Rough heuristic: average window ~220 tokens.
+        approx_window_tokens = 220
+        target_total = max(1, budget_tokens // approx_window_tokens)
+        per_file = max(1, int(target_total // files_in_scope))
+        k = max(base_k, per_file * 2)
+        # Guardrail to avoid excessively large retrieval bursts.
+        return max(base_k, min(k, 64))
+
+    def _map_detail_to_k_radius(self, detail: Optional[int]) -> tuple[Optional[int], Optional[int]]:
+        if detail is None:
+            return None, None
+        try:
+            d = int(detail)
+        except Exception:
+            return None, None
+        if d in RAG_DETAIL_MAP:
+            k, r = RAG_DETAIL_MAP[d]
+            return int(k), int(r)
+        return None, None
 
     @staticmethod
     def _sanitize_filename_for_prompt(name: str) -> str:
@@ -732,12 +824,11 @@ class InsightOrchestrator:
                 out.append(fid)
         return self._uniq_file_ids(out)
 
-    def _raw_large_file_id(self, file_ids: List[str]) -> Optional[str]:
+    def _raw_large_file_ids(self, file_ids: List[str]) -> List[str]:
         """
-        Return the first file_id marked as policy.raw_large=True (Plan B).
-
-        By policy, a chat may contain at most one raw_large file.
+        Return file_ids marked as policy.raw_large=True (Plan B).
         """
+        out: List[str] = []
         for fid in file_ids or []:
             if not isinstance(fid, str) or not fid:
                 continue
@@ -751,10 +842,10 @@ class InsightOrchestrator:
                     except Exception:
                         policy = {}
                 if bool(policy.get("raw_large")):
-                    return fid
+                    out.append(fid)
             except Exception:
                 continue
-        return None
+        return out
 
     @staticmethod
     def _rebalance_hits_by_file(rag_hits: List[Dict[str, Any]], *, max_hits: int) -> List[Dict[str, Any]]:
@@ -963,7 +1054,9 @@ class InsightOrchestrator:
         sources: Optional[List[Dict[str, Any]]] = None,
         mode: str = "chat",
         model: str = "llama_cpp",
-    ) -> None:
+        message_id: Optional[str] = None,
+        target_message_id: Optional[str] = None,
+    ) -> Optional[str]:
         payload: Dict[str, Any] = {"text": text}
         if attachments:
             payload["attachments"] = attachments
@@ -977,7 +1070,68 @@ class InsightOrchestrator:
             if isinstance(selection.get("page"), int):
                 sel["page"] = selection.get("page")
             payload["selection"] = sel
-        message_id = f"msg_{uuid.uuid4().hex}"
+        if target_message_id:
+            # Update existing message (append version)
+            existing = self.metadata_store.get_message(target_message_id)
+            if existing:
+                try:
+                    content = json.loads(existing.get("content_json") or "{}")
+                    # Ensure versions array exists
+                    versions = content.get("versions", [])
+                    if not versions:
+                        # If migrating from non-versioned, add the original text as first version
+                        original_text = content.get("text", "")
+                        if original_text:
+                            versions.append(original_text)
+                    
+                    # Append new version
+                    versions.append(text)
+                    content["versions"] = versions
+                    content["activeVersionIndex"] = len(versions) - 1
+                    content["text"] = text # Update main text to latest
+
+                    # Version-specific sources
+                    version_sources = content.get("versionSources", [])
+                    if not isinstance(version_sources, list):
+                        version_sources = []
+                    if not version_sources:
+                        # Seed first version's sources from existing citations_json if present
+                        existing_citations = existing.get("citations_json")
+                        if isinstance(existing_citations, str) and existing_citations.strip():
+                            try:
+                                parsed = json.loads(existing_citations)
+                                if isinstance(parsed, list):
+                                    version_sources = [parsed]
+                            except Exception:
+                                version_sources = []
+                    # Pad to align with versions
+                    while len(version_sources) < len(versions) - 1:
+                        version_sources.append([])
+                    if sources and isinstance(sources, list):
+                        version_sources.append(sources)
+                    else:
+                        version_sources.append([])
+                    content["versionSources"] = version_sources
+
+                    self.metadata_store.update_message_content(
+                        target_message_id,
+                        json.dumps(content, ensure_ascii=False)
+                    )
+                    if sources and isinstance(sources, list):
+                        try:
+                            citations_json = json.dumps(sources, ensure_ascii=False)
+                            self.metadata_store.update_message_citations(target_message_id, citations_json)
+                        except Exception:
+                            pass
+                    return target_message_id
+                except Exception:
+                    logger.exception("Failed to update message version chat=%s msg=%s", chat_id, target_message_id)
+                except Exception:
+                    logger.exception("Failed to update message version chat=%s msg=%s", chat_id, target_message_id)
+                    # Fallback to insert new if update fails? No, better to log and skip to avoid duplication.
+                    return None
+
+        message_id = message_id or target_message_id or f"msg_{uuid.uuid4().hex}"
         created_at = datetime.now(timezone.utc).isoformat()
         citations_json: Optional[str] = None
         if sources and isinstance(sources, list):
@@ -996,6 +1150,7 @@ class InsightOrchestrator:
             citations_json=citations_json,
             created_at=created_at,
         )
+        return message_id
 
     def handle_message(
         self,
@@ -1006,6 +1161,8 @@ class InsightOrchestrator:
         focus_document_id: Optional[str] = None,
         doc_pane_open: Optional[bool] = None,
         selection: Optional[Dict[str, Any]] = None,
+        *,
+        skip_user_message: bool = False,
     ) -> str:
         tokens: List[str] = []
         for tok in self.handle_message_stream(
@@ -1017,6 +1174,7 @@ class InsightOrchestrator:
             doc_pane_open=doc_pane_open,
             selection=selection,
             request_id=None,
+            skip_user_message=skip_user_message,
         ):
             tokens.append(tok)
         return "".join(tokens)
@@ -1030,13 +1188,18 @@ class InsightOrchestrator:
         focus_document_id: Optional[str] = None,
         doc_pane_open: Optional[bool] = None,
         selection: Optional[Dict[str, Any]] = None,
+
         *,
         request_id: Optional[str] = None,
+        skip_user_message: bool = False,
+        target_assistant_id: Optional[str] = None,
+        user_message_id: Optional[str] = None,
     ):
         """
         Streaming variant of handle_message yielding tokens.
         """
         start = time.perf_counter()
+        logger.info("Orchestrator stream start chat=%s skip_user=%s target_ast=%s", chat_id, skip_user_message, target_assistant_id)
         documents = documents or []
         attachments = attachments or []
 
@@ -1137,17 +1300,43 @@ class InsightOrchestrator:
             except Exception:
                 effective_focus_name = None
 
+        rag_mode = "rag" if has_selection_text else "small_doc"
+        rag_detail_value = None
+        if not has_selection_text:
+            try:
+                raw_mode = self.metadata_store.get_setting("rag_default_mode")
+            except Exception:
+                raw_mode = None
+            if isinstance(raw_mode, str) and raw_mode.strip() in {"small_doc", "rag"}:
+                rag_mode = raw_mode.strip()
+            try:
+                raw_detail = self.metadata_store.get_setting("rag_default_detail")
+            except Exception:
+                raw_detail = None
+            if isinstance(raw_detail, int):
+                rag_detail_value = raw_detail
+
+        rag_detail_k, rag_detail_radius = self._map_detail_to_k_radius(rag_detail_value)
+        rag_k_override = rag_detail_k if rag_detail_k is not None else None
+        if rag_k_override is not None and rag_k_override < 1:
+            rag_k_override = None
+        rag_radius_override = rag_detail_radius if rag_detail_radius is not None else None
+        if rag_radius_override is not None:
+            rag_radius_override = max(0, min(3, rag_radius_override))
+
         small_doc_mode = False
         small_doc_pack: Optional[str] = None
         small_doc_reason: Optional[str] = None
 
         rag_hits_raw: List[Dict[str, Any]] = []
         scope_files: Optional[List[str]] = None
+        small_doc_file_ids: List[str] = []
         query_vector: Any = None
+        rag_total_k_all: Optional[int] = None
 
         # Plan B ("raw_large"): skip ingestion/RAG, use rg_search + read_raw_window evidence.
-        raw_large_fid = self._raw_large_file_id(chat_doc_ids)
-        if (not raw_large_fid) and documents:
+        raw_large_fids = self._raw_large_file_ids(chat_doc_ids)
+        if not raw_large_fids and not has_selection_text and rag_mode != "rag":
             # Small-doc full-text mode (ephemeral only). This must run BEFORE any retrieval.
             scope_file_ids: List[str] = []
             if scope_mode == "all" and scope_doc_ids:
@@ -1156,6 +1345,7 @@ class InsightOrchestrator:
                 scope_file_ids = [effective_focus]
 
             if scope_file_ids:
+                small_doc_file_ids = list(scope_file_ids)
                 pack_info = self._small_doc_pack_for_files(scope_file_ids)
                 if not pack_info:
                     small_doc_reason = "missing_text"
@@ -1218,27 +1408,45 @@ class InsightOrchestrator:
                     request_id,
                 )
 
-        if raw_large_fid:
+        if raw_large_fids:
             scope_mode = "raw_large"
-            effective_focus = raw_large_fid
+            effective_focus = raw_large_fids[0]
             scope_doc_ids = []
             secondary_doc_ids = []
-            try:
-                rec = self.metadata_store.get_file(raw_large_fid) or {}
-                name = rec.get("filename") if isinstance(rec, dict) else None
-                if isinstance(name, str) and name.strip():
-                    effective_focus_name = name.strip()
-            except Exception:
-                effective_focus_name = None
-            scope_files = [effective_focus_name] if effective_focus_name else None
+            names: List[str] = []
+            for fid in raw_large_fids:
+                try:
+                    rec = self.metadata_store.get_file(fid) or {}
+                    name = rec.get("filename") if isinstance(rec, dict) else None
+                    if isinstance(name, str) and name.strip():
+                        names.append(name.strip())
+                except Exception:
+                    continue
+            effective_focus_name = names[0] if names else None
+            scope_files = names if names else None
 
-            rag_hits_raw.extend(
-                self.raw_large_loop.build_evidence_hits(
-                    user_message,
-                    file_id=raw_large_fid,
-                    request_id=request_id,
+            try:
+                cfg_base = RawLargeAgentConfig()
+                per_doc = max(1, int(cfg_base.max_windows) // max(1, len(raw_large_fids)))
+            except Exception:
+                cfg_base = None
+                per_doc = None
+
+            for fid in raw_large_fids:
+                cfg = cfg_base
+                if cfg_base and per_doc is not None:
+                    try:
+                        cfg = dataclasses.replace(cfg_base, max_windows=per_doc)
+                    except Exception:
+                        cfg = cfg_base
+                rag_hits_raw.extend(
+                    self.raw_large_loop.build_evidence_hits(
+                        user_message,
+                        file_id=fid,
+                        request_id=request_id,
+                        config=cfg,
+                    )
                 )
-            )
         elif not small_doc_mode:
             # Stop re-embedding the same query per file: compute query embedding once per turn
             # and re-use it across dense retrieval calls (focused + secondary docs).
@@ -1258,13 +1466,27 @@ class InsightOrchestrator:
                         chat_id,
                         files_in_scope=len(doc_ids_in_scope),
                     )
+                    per_file_k = rag_k_override or self._compute_rag_primary_k(
+                        budget_tokens=rag_budget_tokens,
+                        files_in_scope=len(doc_ids_in_scope),
+                        base_k=primary_k,
+                    )
                     # Keep per-file retrieval stable (fair) by scaling total_k with file count.
-                    total_k = max(RAG_ALL_K_TOTAL, 7 * len(doc_ids_in_scope))
+                    if rag_k_override is not None:
+                        total_k = max(1, per_file_k * len(doc_ids_in_scope))
+                    else:
+                        total_k = max(RAG_ALL_K_TOTAL, per_file_k * len(doc_ids_in_scope))
+                    rag_total_k_all = total_k
+                    rag_radius = (
+                        rag_radius_override
+                        if rag_radius_override is not None
+                        else (3 if rag_budget_tokens >= 8000 else 2)
+                    )
                     cfg = MultiFileAgentConfig(
                         total_k=total_k,
-                        dense_k=16,
-                        sparse_k=16,
-                        radius=2,
+                        dense_k=max(per_file_k, 12),
+                        sparse_k=max(per_file_k, 12),
+                        radius=rag_radius,
                         max_tokens_total=max(600, rag_budget_tokens),
                         max_tokens_per_file_floor=600,
                         repair_on_empty=True,
@@ -1295,17 +1517,27 @@ class InsightOrchestrator:
                     chat_id,
                     files_in_scope=1,
                 )
+                per_file_k = rag_k_override or self._compute_rag_primary_k(
+                    budget_tokens=rag_budget_tokens,
+                    files_in_scope=1,
+                    base_k=primary_k,
+                )
+                rag_radius = (
+                    rag_radius_override
+                    if rag_radius_override is not None
+                    else (3 if rag_budget_tokens >= 8000 else 2)
+                )
                 focus_anchors = self.agent_tools.hybrid_search(
                     user_message,
                     file_id=effective_focus,
-                    top_k=primary_k,
+                    top_k=per_file_k,
                     query_vector=query_vector,
-                    dense_k=max(primary_k, 10),
-                    sparse_k=max(primary_k, 10),
+                    dense_k=max(per_file_k, 10),
+                    sparse_k=max(per_file_k, 10),
                 )
                 focus_windows_map = self.agent_tools.windows_from_anchors(
                     focus_anchors,
-                    radius=2,
+                    radius=rag_radius,
                     max_tokens_per_file=max(600, rag_budget_tokens),
                 )
                 for w in focus_windows_map.get(effective_focus, []):
@@ -1323,6 +1555,13 @@ class InsightOrchestrator:
                             "score": 1.0,
                         }
                     )
+                self._append_rag_coverage_fill(
+                    file_id=effective_focus,
+                    windows=focus_windows_map.get(effective_focus, []),
+                    rag_budget_tokens=rag_budget_tokens,
+                    rag_hits_raw=rag_hits_raw,
+                    request_id=request_id,
+                )
             elif documents:
                 doc_ids = self._uniq_file_ids(documents)
                 if doc_ids:
@@ -1330,23 +1569,34 @@ class InsightOrchestrator:
                         chat_id,
                         files_in_scope=len(doc_ids),
                     )
+                    per_file_k = rag_k_override or self._compute_rag_primary_k(
+                        budget_tokens=rag_budget_tokens,
+                        files_in_scope=len(doc_ids),
+                        base_k=primary_k,
+                    )
+                    rag_radius = (
+                        rag_radius_override
+                        if rag_radius_override is not None
+                        else (3 if rag_budget_tokens >= 8000 else 2)
+                    )
                     anchors: List[ChunkAnchor] = []
                     for fid in doc_ids:
                         anchors.extend(
                             self.agent_tools.hybrid_search(
                                 user_message,
                                 file_id=fid,
-                                top_k=max(1, primary_k // max(1, len(doc_ids))),
+                                top_k=per_file_k,
                                 query_vector=query_vector,
-                                dense_k=8,
-                                sparse_k=8,
+                                dense_k=max(per_file_k, 8),
+                                sparse_k=max(per_file_k, 8),
                             )
                         )
                     windows_map = self.agent_tools.windows_from_anchors(
                         anchors,
-                        radius=2,
+                        radius=rag_radius,
                         max_tokens_per_file=max(600, int(max(600, rag_budget_tokens) // max(1, len(doc_ids)))),
                     )
+                    per_file_budget = max(600, int(max(600, rag_budget_tokens) // max(1, len(doc_ids))))
                     for fid in doc_ids:
                         for w in windows_map.get(fid, []):
                             if not w.text:
@@ -1359,12 +1609,34 @@ class InsightOrchestrator:
                                     "page": w.page_start,
                                     "page_start": w.page_start,
                                     "page_end": w.page_end,
-                                    "chunk_id": f"seq_window:{w.seq_start}-{w.seq_end}",
-                                    "score": 1.0,
-                                }
-                            )
+                                        "chunk_id": f"seq_window:{w.seq_start}-{w.seq_end}",
+                                        "score": 1.0,
+                                    }
+                                )
+                        self._append_rag_coverage_fill(
+                            file_id=fid,
+                            windows=windows_map.get(fid, []),
+                            rag_budget_tokens=per_file_budget,
+                            rag_hits_raw=rag_hits_raw,
+                            request_id=request_id,
+                        )
             else:
                 rag_hits_raw.extend(self.rag_store.retrieve(user_message, chat_id=chat_id, top_k=primary_k))
+
+        ui_rag_hits: List[Dict[str, Any]] = []
+        if small_doc_mode and small_doc_file_ids:
+            try:
+                if getattr(self.rag_store, "embedder", None):
+                    query_vector = self.rag_store.embed(user_message)
+                    if query_vector is not None:
+                        ui_rag_hits = self.rag_store.retrieve_with_vector(
+                            query_vector,
+                            chat_id=chat_id,
+                            doc_ids=small_doc_file_ids,
+                            top_k=SMALL_DOC_CITE_K,
+                        )
+            except Exception:
+                ui_rag_hits = []
 
         selected_rag = [] if small_doc_mode else self._dedup_rag(rag_hits_raw)
 
@@ -1374,7 +1646,7 @@ class InsightOrchestrator:
                 chat_id,
                 files_in_scope=max(1, len(doc_ids_in_scope)),
             )
-            total_k = max(RAG_ALL_K_TOTAL, 7 * max(1, len(doc_ids_in_scope)))
+            total_k = rag_total_k_all or max(RAG_ALL_K_TOTAL, 7 * max(1, len(doc_ids_in_scope)))
             selected_rag = self._rebalance_hits_by_file(selected_rag, max_hits=total_k)
             selected_rag = self._apply_rag_budget_balanced(
                 chat_id,
@@ -1439,27 +1711,138 @@ class InsightOrchestrator:
                 )
             context_pack = (task_hint + "\n" + (context_pack or "")).strip()
 
-        # UI-only sources (never model-visible). Show for both focused and all modes.
+        # Enforce doc-grounded answering when documents are in scope and we're not in small-doc mode.
+        if chat_doc_ids and scope_mode in {"raw_large", "focused", "all"} and not small_doc_mode:
+            doc_rules = (
+                "TASK (STRICT):\n"
+                "1) Answer ONLY using the EVIDENCE and SELECTED EXCERPT.\n"
+                "2) If the answer is not explicitly contained, respond exactly: "
+                "\"Not found in provided documents.\"\n"
+                "3) Do not use outside knowledge. Do not invent details.\n"
+                "4) If multiple files are relevant, mention which filename each claim comes from.\n\n"
+            )
+            context_pack = (doc_rules + (context_pack or "")).strip()
+
+        # UI-only sources (never model-visible).
+        # Only emit citations when we have concrete evidence (rag hits or selection).
         ui_sources: List[Dict[str, Any]] = []
         try:
-            ui_sources = build_ui_sources_from_rag_hits(selected_rag)
+            if small_doc_mode:
+                # Small-doc mode injects full text; show filename-only sources
+                # only when we have in-scope filenames to display.
+                if (isinstance(scope_files, list) and scope_files) or (
+                    isinstance(effective_focus_name, str) and effective_focus_name.strip()
+                ):
+                    ui_sources = build_ui_sources_for_small_doc(scope_files, effective_focus_name)
+                else:
+                    ui_sources = []
+            else:
+                if selected_rag:
+                    ui_sources = build_ui_sources_from_rag_hits(selected_rag)
+                elif has_selection_text:
+                    ui_sources = build_ui_sources_for_small_doc(scope_files, effective_focus_name)
+                else:
+                    ui_sources = []
         except Exception:
             ui_sources = []
 
+        # Enforce "answer only from text": if docs are attached but no evidence
+        # (small-doc pack, selection text, or RAG hits), return a grounded fallback.
+        has_selection_text = bool(
+            selection_for_prompt
+            and isinstance(selection_for_prompt, dict)
+            and isinstance(selection_for_prompt.get("text"), str)
+            and selection_for_prompt.get("text").strip()
+        )
+        evidence_present = bool(
+            (small_doc_mode and small_doc_pack)
+            or selected_rag
+            or has_selection_text
+        )
+        if chat_doc_ids and scope_mode in {"raw_large", "focused", "all"} and not evidence_present:
+            fallback_reply = "Not found in provided documents."
+
+            def generator():
+                persisted_user_id: Optional[str] = None
+                if not skip_user_message:
+                    try:
+                        persisted_user_id = self._persist_ui_message(
+                            chat_id=chat_id,
+                            role="user",
+                            text=user_message,
+                            attachments=attachments,
+                            focus_document_id=effective_focus,
+                            selection=selection,
+                            message_id=user_message_id if isinstance(user_message_id, str) else None,
+                        )
+                    except Exception:
+                        logger.exception("Failed to persist UI user message chat=%s", chat_id)
+
+                # Stream the fallback reply as a single chunk.
+                yield fallback_reply
+
+                try:
+                    persisted_assistant_id = self._persist_ui_message(
+                        chat_id=chat_id,
+                        role="assistant",
+                        text=fallback_reply,
+                        sources=ui_sources or None,
+                        target_message_id=target_assistant_id,
+                    )
+                    if request_id and (persisted_user_id or persisted_assistant_id):
+                        try:
+                            emit_event(
+                                "chat_message_ids",
+                                chat_id=chat_id,
+                                request_id=request_id,
+                                user_message_id=persisted_user_id,
+                                assistant_message_id=persisted_assistant_id,
+                            )
+                        except Exception:
+                            pass
+                    if ui_sources and request_id:
+                        emit_event(
+                            "chat_sources",
+                            chat_id=chat_id,
+                            request_id=request_id,
+                            sources=ui_sources,
+                        )
+                except Exception:
+                    logger.exception("Failed to persist UI assistant message chat=%s", chat_id)
+
+                total_ms = (time.perf_counter() - start) * 1000
+                logger.info(
+                    "Planner stream done chat=%s scope=%s focus=%s summary=%s docs=%d rag_hits=%d ltm=%d time_ms=%.1f request_id=%s",
+                    chat_id,
+                    scope_mode,
+                    effective_focus,
+                    summary_request,
+                    len(chat_doc_ids),
+                    len(selected_rag),
+                    len(ltm_hits),
+                    total_ms,
+                    request_id,
+                )
+
+            return generator()
+
         def generator():
             tokens: List[str] = []
+            persisted_user_id: Optional[str] = None
             # Persist clean UI user message immediately so history is instant.
-            try:
-                self._persist_ui_message(
-                    chat_id=chat_id,
-                    role="user",
-                    text=user_message,
-                    attachments=attachments,
-                    focus_document_id=effective_focus,
-                    selection=selection,
-                )
-            except Exception:
-                logger.exception("Failed to persist UI user message chat=%s", chat_id)
+            if not skip_user_message:
+                try:
+                    persisted_user_id = self._persist_ui_message(
+                        chat_id=chat_id,
+                        role="user",
+                        text=user_message,
+                        attachments=attachments,
+                        focus_document_id=effective_focus,
+                        selection=selection,
+                        message_id=user_message_id if isinstance(user_message_id, str) else None,
+                    )
+                except Exception:
+                    logger.exception("Failed to persist UI user message chat=%s", chat_id)
 
             dirty_user = (
                 build_dirty_user_turn(user_message, selection=selection_for_prompt) if has_selection_text else None
@@ -1472,6 +1855,7 @@ class InsightOrchestrator:
                 max_tokens=max_tokens,
                 temperature=0.2,
                 request_id=request_id,
+                skip_user_message=skip_user_message,
             ):
                 tokens.append(token)
                 yield token
@@ -1479,12 +1863,24 @@ class InsightOrchestrator:
             reply = "".join(tokens)
             try:
                 if reply.strip():
-                    self._persist_ui_message(
+                    persisted_assistant_id = self._persist_ui_message(
                         chat_id=chat_id,
                         role="assistant",
                         text=reply,
                         sources=ui_sources or None,
+                        target_message_id=target_assistant_id,
                     )
+                    if request_id and (persisted_user_id or persisted_assistant_id):
+                        try:
+                            emit_event(
+                                "chat_message_ids",
+                                chat_id=chat_id,
+                                request_id=request_id,
+                                user_message_id=persisted_user_id,
+                                assistant_message_id=persisted_assistant_id,
+                            )
+                        except Exception:
+                            pass
                     if ui_sources and request_id:
                         emit_event(
                             "chat_sources",
@@ -1532,5 +1928,117 @@ class InsightOrchestrator:
             seen.add(key)
             deduped.append(h)
         return deduped
+
+    def _append_rag_coverage_fill(
+        self,
+        *,
+        file_id: str,
+        windows: list[Any],
+        rag_budget_tokens: int,
+        rag_hits_raw: list[dict[str, Any]],
+        request_id: str | None = None,
+    ) -> None:
+        if not file_id or int(rag_budget_tokens or 0) <= 0:
+            return
+        stats = self.metadata_store.chunk_seq_stats_for_file(file_id)
+        total_chunks = int(stats.get("count", 0) or 0)
+        if total_chunks <= 0:
+            return
+
+        covered: set[int] = set()
+        for w in windows or []:
+            try:
+                start_i = int(getattr(w, "seq_start"))
+                end_i = int(getattr(w, "seq_end"))
+            except Exception:
+                continue
+            if end_i < start_i:
+                end_i = start_i
+            for seq_i in range(start_i, end_i + 1):
+                covered.add(seq_i)
+
+        seq_min = int(stats.get("min_seq", 0) or 0)
+        seq_max = int(stats.get("max_seq", seq_min) or seq_min)
+        rows = self.metadata_store.fetch_chunks_by_seq_range(
+            file_id,
+            seq_start=seq_min,
+            seq_end=seq_max,
+        )
+        sample = rows[: min(len(rows), SMALL_RAG_COVERAGE_SAMPLE_CHUNKS)]
+        if sample:
+            sample_chars = sum(
+                len(r.get("text") or "") for r in sample if isinstance(r, dict)
+            )
+            avg_tokens = max(1, int((sample_chars / max(1, len(sample))) / 4))
+        else:
+            avg_tokens = 400
+
+        max_chunks_fit = max(1, int(int(rag_budget_tokens) / max(1, avg_tokens)))
+        target_chunks = min(total_chunks, max_chunks_fit)
+        if target_chunks <= 0 or len(covered) >= target_chunks:
+            return
+
+        added = 0
+        for row in rows:
+            if len(covered) + added >= target_chunks:
+                break
+            seq = row.get("seq") if isinstance(row, dict) else None
+            try:
+                seq_i = int(seq) if seq is not None else None
+            except Exception:
+                seq_i = None
+            if seq_i is not None and seq_i in covered:
+                continue
+            text = row.get("text") if isinstance(row, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                continue
+            meta = row.get("metadata") if isinstance(row, dict) else {}
+            if not isinstance(meta, dict):
+                meta = {}
+            page_start = meta.get("page_start")
+            page_end = meta.get("page_end")
+            page = meta.get("page")
+            try:
+                page_start_i = int(page_start) if page_start is not None else None
+            except Exception:
+                page_start_i = None
+            try:
+                page_end_i = int(page_end) if page_end is not None else None
+            except Exception:
+                page_end_i = None
+            if page_start_i is None:
+                try:
+                    page_start_i = int(page) if page is not None else None
+                except Exception:
+                    page_start_i = None
+            if page_end_i is None:
+                page_end_i = page_start_i
+
+            rag_hits_raw.append(
+                {
+                    "doc_id": file_id,
+                    "text": text,
+                    "filename": row.get("filename") if isinstance(row, dict) else None,
+                    "page": page_start_i,
+                    "page_start": page_start_i,
+                    "page_end": page_end_i,
+                    "chunk_id": row.get("id") if isinstance(row, dict) else None,
+                    "score": 0.5,
+                }
+            )
+            added += 1
+
+        if added:
+            logger.info(
+                "RAG coverage fill file=%s total_chunks=%d avg_tokens=%d budget=%d target_chunks=%d covered=%d added=%d request_id=%s",
+                file_id,
+                total_chunks,
+                avg_tokens,
+                int(rag_budget_tokens),
+                target_chunks,
+                len(covered),
+                added,
+                request_id,
+            )
 
 __all__ = ["InsightOrchestrator"]

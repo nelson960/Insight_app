@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from backend.core.workspace import get_workspace
+from backend.runtime_utils import is_packaged
 from backend.services.storage.sqlite_store import SQLiteMetadataStore
 
 
@@ -105,10 +106,13 @@ class EngineConfig:
             model_path = cls._load_model_path_from_settings()
         if not model_path:
             raise ValueError("INSIGHT_ENGINE_MODEL_PATH is required.")
+        host = os.getenv("INSIGHT_ENGINE_HOST", "127.0.0.1")
+        if is_packaged() and host not in {"127.0.0.1", "localhost", "::1"}:
+            host = "127.0.0.1"
         log_dir = Path(os.getenv("INSIGHT_LOG_DIR") or (Path.home() / ".insight" / "engine_logs"))
         embedding_path = cls._resolve_embedding_path()
         return cls(
-            host=os.getenv("INSIGHT_ENGINE_HOST", "127.0.0.1"),
+            host=host,
             port=int(os.getenv("INSIGHT_ENGINE_PORT", "11435")),
             model_path=Path(model_path),
             ctx_size=_env_int("INSIGHT_ENGINE_CTX"),
@@ -121,5 +125,5 @@ class EngineConfig:
             log_preview_chars=int(os.getenv("INSIGHT_LOG_PREVIEW_CHARS", "400")),
             embedding_path=embedding_path,
             embedding_model=os.getenv("INSIGHT_ENGINE_EMBEDDING_MODEL", "nomic-embed-text-v1.5"),
-            embedding_auto_download=_env_bool("INSIGHT_ENGINE_EMBEDDING_AUTO_DOWNLOAD", True),
+            embedding_auto_download=_env_bool("INSIGHT_ENGINE_EMBEDDING_AUTO_DOWNLOAD", False),
         )

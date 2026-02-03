@@ -15,6 +15,9 @@ class PlannerRequest:
     selection: Optional[Dict[str, Any]] = None  # UI hint: selected excerpt, highest priority
     screenshot: Optional[str] = None
     request_id: Optional[str] = None
+    skip_user_message: bool = False
+    target_assistant_id: Optional[str] = None
+    user_message_id: Optional[str] = None
 
 
 @dataclass(slots=True)

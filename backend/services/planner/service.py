@@ -23,6 +23,7 @@ class PlannerService:
             focus_document_id=request.focus_document_id,
             doc_pane_open=request.doc_pane_open,
             selection=request.selection,
+            skip_user_message=request.skip_user_message,
         )
         return PlannerResult(
             answer=reply,
@@ -43,6 +44,9 @@ class PlannerService:
             doc_pane_open=request.doc_pane_open,
             selection=request.selection,
             request_id=request.request_id,
+            skip_user_message=request.skip_user_message,
+            target_assistant_id=request.target_assistant_id,
+            user_message_id=request.user_message_id,
         )
 
 

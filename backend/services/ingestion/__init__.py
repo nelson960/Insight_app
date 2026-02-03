@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from ..extraction import FileExtractionService, create_extraction_service
-from .chunker import ChunkerConfig, BlockChunker
+from .chunker import ChunkerConfig, CodeAwareChunker
 from typing import TYPE_CHECKING, Any
 from .embedder import EmbeddingClient, EmbeddingConfig, EmbeddingConnector
 from .index_writer import ChunkStore, VectorIndex, VectorIndexWriter
@@ -57,7 +57,7 @@ def create_ingestion_pipeline(
     """
 
     extraction = extraction_service or create_extraction_service()
-    chunker = BlockChunker(config=chunker_config)
+    chunker = CodeAwareChunker(config=chunker_config)
     connectors = list(embedding_connectors) if embedding_connectors else _default_embedding_connectors(
         nomic_model_dir=nomic_model_dir,
         auto_download=nomic_auto_download,
@@ -81,7 +81,7 @@ def create_ingestion_pipeline(
 
 __all__ = [
     "ChunkerConfig",
-    "BlockChunker",
+    "CodeAwareChunker",
     "EmbeddingClient",
     "EmbeddingConfig",
     "EmbeddingConnector",

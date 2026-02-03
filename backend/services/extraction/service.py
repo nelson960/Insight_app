@@ -123,6 +123,9 @@ class FileExtractionService:
 
         metadata = {
             "content_type": mime,
+            "source_path": str(resolved_path),
+            "source_name": resolved_path.name,
+            "source_ext": resolved_path.suffix.lower(),
             **(document.metadata or {}),
         }
         logger.info("Extraction complete for %s (%d chars)", resolved_path, len(text))

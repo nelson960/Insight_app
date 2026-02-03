@@ -3,10 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -110,6 +111,15 @@ fn get_engine_ready_timeout_secs() -> u64 {
         }
     }
     30 // Default: 30 seconds (faster than old 60s)
+}
+
+fn get_watchdog_interval_secs() -> u64 {
+    if let Ok(value) = std::env::var("INSIGHT_WATCHDOG_INTERVAL_SECS") {
+        if let Ok(secs) = value.trim().parse::<u64>() {
+            return secs.max(1);
+        }
+    }
+    3
 }
 
 /// Wait for the engine to become ready by polling the stdout stream.
@@ -240,10 +250,12 @@ where
 }
 
 pub struct EngineProcess {
-    child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
+    child: Arc<Mutex<Child>>,
+    stdin: Arc<Mutex<ChildStdin>>,
     state: Arc<RouterState>,
-    pid_path: PathBuf,
+    crashed: Arc<Mutex<bool>>,
+    crash_reason: Arc<Mutex<Option<String>>>,
+    watchdog_started: AtomicBool,
 }
 
 struct RouterState {
@@ -274,8 +286,8 @@ fn next_request_id() -> String {
 impl EngineProcess {
     pub fn spawn(python_bin: &str) -> Result<Self> {
         let project_root = resolve_project_root()?;
-        let pid_path = project_root.join("storage").join("engine.pid");
-        cleanup_stale_engine(&pid_path);
+        // Remove legacy pid file if present (no longer used).
+        let _ = fs::remove_file(project_root.join("storage").join("engine.pid"));
 
         // Create logs directory and open stderr log file
         let logs_dir = project_root.join("storage").join("logs");
@@ -344,18 +356,18 @@ impl EngineProcess {
 
         spawn_stdout_router(BufReader::new(stdout), state.clone());
 
-        write_pid(&pid_path, child.id());
-
         // Wait for engine to become ready (default 30s, configurable via INSIGHT_ENGINE_READY_TIMEOUT_SECS)
         if should_wait_for_engine_ready() {
             wait_for_engine_ready(&stderr_path, get_engine_ready_timeout_secs())?;
         }
 
         Ok(Self {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
+            child: Arc::new(Mutex::new(child)),
+            stdin: Arc::new(Mutex::new(stdin)),
             state,
-            pid_path,
+            crashed: Arc::new(Mutex::new(false)),
+            crash_reason: Arc::new(Mutex::new(None)),
+            watchdog_started: AtomicBool::new(false),
         })
     }
 
@@ -368,9 +380,8 @@ impl EngineProcess {
         let workspace_dir = dirs::home_dir()
             .ok_or_else(|| anyhow!("couldn't find home dir"))?
             .join(".insight");
-
-        let pid_path = workspace_dir.join("engine.pid");
-        cleanup_stale_engine(&pid_path);
+        // Remove legacy pid file if present (no longer used).
+        let _ = fs::remove_file(workspace_dir.join("engine.pid"));
 
         // Create logs directory and open stderr log file
         let logs_dir = workspace_dir.join("logs");
@@ -420,24 +431,76 @@ impl EngineProcess {
         // This is required to support /chat streaming + concurrent /files/* requests.
         spawn_stdout_router(BufReader::new(stdout), state.clone());
 
-        write_pid(&pid_path, child.id());
-
         // Wait for engine to become ready (default 30s, configurable via INSIGHT_ENGINE_READY_TIMEOUT_SECS)
         if should_wait_for_engine_ready() {
             wait_for_engine_ready(&stderr_path, get_engine_ready_timeout_secs())?;
         }
 
         Ok(Self {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
+            child: Arc::new(Mutex::new(child)),
+            stdin: Arc::new(Mutex::new(stdin)),
             state,
-            pid_path,
+            crashed: Arc::new(Mutex::new(false)),
+            crash_reason: Arc::new(Mutex::new(None)),
+            watchdog_started: AtomicBool::new(false),
         })
     }
 
     pub fn set_app_handle(&self, app: tauri::AppHandle) {
         if let Ok(mut slot) = self.state.app.lock() {
             *slot = Some(app);
+        }
+        if self
+            .watchdog_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            if let Ok(slot) = self.state.app.lock() {
+                if let Some(app) = slot.as_ref() {
+                    spawn_process_watchdog(
+                        Arc::clone(&self.child),
+                        Arc::clone(&self.crashed),
+                        Arc::clone(&self.crash_reason),
+                        app.clone(),
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn is_crashed(&self) -> bool {
+        self.crashed.lock().map(|c| *c).unwrap_or(false)
+    }
+
+    pub fn get_crash_reason(&self) -> Option<String> {
+        self.crash_reason.lock().ok()?.clone()
+    }
+
+    fn emit_crash_event(&self, message: &str, suggestion: Option<&str>) {
+        let payload = serde_json::json!({
+            "message": message,
+            "suggestion": suggestion.unwrap_or("Please restart the application. If this persists, try reducing GPU layers in Settings."),
+        });
+        if let Ok(slot) = self.state.app.lock() {
+            if let Some(app) = slot.as_ref() {
+                let _ = app.emit("engine-crashed", payload);
+            }
+        }
+    }
+
+    pub fn mark_crashed(&self, reason: String) {
+        let mut should_emit = false;
+        if let Ok(mut crashed) = self.crashed.lock() {
+            if !*crashed {
+                *crashed = true;
+                should_emit = true;
+            }
+        }
+        if let Ok(mut reason_guard) = self.crash_reason.lock() {
+            *reason_guard = Some(reason.clone());
+        }
+        if should_emit {
+            self.emit_crash_event(&reason, None);
         }
     }
 
@@ -462,11 +525,52 @@ impl EngineProcess {
             pending.insert(request_id.clone(), tx);
         }
 
+        if self.is_crashed() {
+            if let Ok(mut pending) = self.state.pending.lock() {
+                pending.remove(&request_id);
+            }
+            let reason = self
+                .get_crash_reason()
+                .unwrap_or_else(|| "Engine has crashed".to_string());
+            return Err(anyhow!(reason));
+        }
+
         let line = serde_json::to_string(&req)?;
         {
             let mut stdin = self.stdin.lock().map_err(|_| anyhow!("stdin mutex poisoned"))?;
-            writeln!(stdin, "{line}")?;
-            stdin.flush()?;
+            match writeln!(stdin, "{line}") {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                    self.mark_crashed("Broken pipe: engine process died unexpectedly".to_string());
+                    if let Ok(mut pending) = self.state.pending.lock() {
+                        pending.remove(&request_id);
+                    }
+                    return Err(anyhow!(
+                        "Broken pipe: engine has crashed. Please restart the application."
+                    ));
+                }
+                Err(e) => {
+                    if let Ok(mut pending) = self.state.pending.lock() {
+                        pending.remove(&request_id);
+                    }
+                    return Err(anyhow!("Failed to write to engine stdin: {}", e));
+                }
+            }
+            if let Err(e) = stdin.flush() {
+                if e.kind() == ErrorKind::BrokenPipe {
+                    self.mark_crashed("Broken pipe: engine process died unexpectedly".to_string());
+                    if let Ok(mut pending) = self.state.pending.lock() {
+                        pending.remove(&request_id);
+                    }
+                    return Err(anyhow!(
+                        "Broken pipe: engine has crashed. Please restart the application."
+                    ));
+                }
+                if let Ok(mut pending) = self.state.pending.lock() {
+                    pending.remove(&request_id);
+                }
+                return Err(anyhow!("Failed to flush engine stdin: {}", e));
+            }
         }
 
         // Wait for the router thread to deliver the response for this request id.
@@ -518,6 +622,16 @@ impl EngineProcess {
             );
         }
 
+        if self.is_crashed() {
+            if let Ok(mut streams) = self.state.streams.lock() {
+                streams.remove(request_id);
+            }
+            let reason = self
+                .get_crash_reason()
+                .unwrap_or_else(|| "Engine has crashed".to_string());
+            return Err(anyhow!(reason));
+        }
+
         let mut payload = payload.clone();
         // Ensure backend sees the request id so it can cancel model generation.
         if let Some(obj) = payload.as_object_mut() {
@@ -535,8 +649,35 @@ impl EngineProcess {
         let line = serde_json::to_string(&req)?;
         {
             let mut stdin = self.stdin.lock().map_err(|_| anyhow!("stdin mutex poisoned"))?;
-            writeln!(stdin, "{line}")?;
-            stdin.flush()?;
+            match writeln!(stdin, "{line}") {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                    self.mark_crashed("Broken pipe during stream start".to_string());
+                    if let Ok(mut streams) = self.state.streams.lock() {
+                        streams.remove(request_id);
+                    }
+                    return Err(anyhow!("Broken pipe: engine crashed"));
+                }
+                Err(e) => {
+                    if let Ok(mut streams) = self.state.streams.lock() {
+                        streams.remove(request_id);
+                    }
+                    return Err(anyhow!("Failed to write to engine stdin: {}", e));
+                }
+            }
+            if let Err(e) = stdin.flush() {
+                if e.kind() == ErrorKind::BrokenPipe {
+                    self.mark_crashed("Broken pipe during stream start".to_string());
+                    if let Ok(mut streams) = self.state.streams.lock() {
+                        streams.remove(request_id);
+                    }
+                    return Err(anyhow!("Broken pipe: engine crashed"));
+                }
+                if let Ok(mut streams) = self.state.streams.lock() {
+                    streams.remove(request_id);
+                }
+                return Err(anyhow!("Failed to flush engine stdin: {}", e));
+            }
         }
         Ok(())
     }
@@ -559,10 +700,17 @@ impl EngineProcess {
             let _ = stdin.flush();
         }
         if let Ok(mut child) = self.child.lock() {
+            // Give the engine a moment to shut down cleanly so it can
+            // stop any child services (e.g., raw engine server).
+            for _ in 0..20 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
-        let _ = fs::remove_file(&self.pid_path);
     }
 }
 
@@ -578,89 +726,17 @@ impl Drop for EngineProcess {
         }
 
         if let Ok(mut child) = self.child.try_lock() {
+            for _ in 0..10 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
             let _ = child.kill();
             let _ = child.wait();
         } else {
             eprintln!("[WARNING] Failed to acquire child lock during drop, process may not be killed cleanly");
         }
-
-        let _ = fs::remove_file(&self.pid_path);
-    }
-}
-
-fn write_pid(pid_path: &PathBuf, pid: u32) {
-    if let Some(parent) = pid_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(pid_path, pid.to_string());
-}
-
-fn cleanup_stale_engine(pid_path: &PathBuf) {
-    let pid = match fs::read_to_string(pid_path) {
-        Ok(raw) => raw.trim().parse::<u32>().ok(),
-        Err(_) => None,
-    };
-    let Some(pid) = pid else {
-        let _ = fs::remove_file(pid_path);
-        return;
-    };
-    if !pid_is_engine(pid) {
-        let _ = fs::remove_file(pid_path);
-        return;
-    }
-    terminate_pid(pid);
-    let _ = fs::remove_file(pid_path);
-}
-
-fn terminate_pid(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status();
-        std::thread::sleep(Duration::from_millis(200));
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status();
-    }
-}
-
-fn pid_is_engine(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let output = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
-            .output();
-        if let Ok(output) = output {
-            if output.status.success() {
-                let cmd = String::from_utf8_lossy(&output.stdout);
-                // Check for Python engine processes
-                if cmd.contains("backend/engine.py")
-                    || cmd.contains("engine.py")
-                    || cmd.contains("backend.engine")
-                {
-                    return true;
-                }
-                // Check for bundled binary (insight-engine or insight-engine-<arch>)
-                if cmd.contains("insight-engine") && !cmd.contains("grep") {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-    #[cfg(windows)]
-    {
-        let _ = pid;
-        true
     }
 }
 
@@ -817,6 +893,59 @@ fn spawn_stdout_router(mut stdout: BufReader<ChildStdout>, state: Arc<RouterStat
             };
             if let Some(tx) = tx {
                 let _ = tx.send(resp);
+            }
+        }
+    });
+}
+
+fn spawn_process_watchdog(
+    child: Arc<Mutex<Child>>,
+    crashed: Arc<Mutex<bool>>,
+    crash_reason: Arc<Mutex<Option<String>>>,
+    app: tauri::AppHandle,
+) {
+    thread::spawn(move || {
+        let check_interval = Duration::from_secs(get_watchdog_interval_secs());
+        loop {
+            thread::sleep(check_interval);
+
+            if let Ok(c) = crashed.lock() {
+                if *c {
+                    break;
+                }
+            }
+
+            let exit_status = match child.lock() {
+                Ok(mut child_guard) => match child_guard.try_wait() {
+                    Ok(Some(status)) => Some(status),
+                    Ok(None) => None,
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
+
+            if let Some(status) = exit_status {
+                let reason = if status.success() {
+                    "Engine exited cleanly".to_string()
+                } else {
+                    format!("Engine crashed with code: {:?}", status)
+                };
+
+                if let Ok(mut c) = crashed.lock() {
+                    *c = true;
+                }
+                if let Ok(mut r) = crash_reason.lock() {
+                    *r = Some(reason.clone());
+                }
+
+                let _ = app.emit(
+                    "engine-crashed",
+                    serde_json::json!({
+                        "message": reason,
+                        "suggestion": "Please restart the application. If this persists, try reducing GPU layers in Settings.",
+                    }),
+                );
+                break;
             }
         }
     });

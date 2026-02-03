@@ -8,14 +8,29 @@ import sqlite3
 import sys
 import threading
 import shutil
+import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, Callable
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from backend.api.deps import AppDependencies
+from backend.api.deps import AppDependencies, peek_session_manager, peek_sqlite_store
 from backend.core.workspace import get_workspace
-from backend.services.gguf_metadata import detect_chat_template_kind, is_gguf
+from backend.services.gguf_metadata import (
+    is_gguf,
+    read_gguf_int_kv,
+    read_gguf_int_kv_suffix,
+    read_gguf_string_kv,
+)
+from backend.runtime_utils import is_packaged
+from backend.services.llama_templates import (
+    MODEL_VALIDATION_VERSION,
+    build_model_record,
+    chat_template_error_message,
+    compute_model_fingerprint,
+    model_record_is_current,
+    validate_chat_template_for_path,
+)
 
 if TYPE_CHECKING:
     from backend.services.storage import SQLiteMetadataStore
@@ -24,22 +39,71 @@ if TYPE_CHECKING:
 router = APIRouter(prefix="/settings", tags=["Settings"])
 logger = logging.getLogger(__name__)
 
-ALLOWED_CTX_SIZES = {8192, 32768}
+DEFAULT_CTX_SIZES = [8192, 32768]
 RAW_ENGINE_DEFAULTS = {
     "raw_engine_host": "127.0.0.1",
     "raw_engine_port": 11435,
     "raw_engine_model_path": "",
-    "raw_engine_ctx": None,
+    "raw_engine_ctx": 32768,
     "raw_engine_threads": None,
     "raw_engine_gpu_layers": None,
     "raw_engine_max_tokens": 1024,
     "raw_engine_embedding_model": "nomic-embed-text-v1.5",
-    "raw_engine_embedding_auto_download": True,
+    "raw_engine_embedding_auto_download": False,
     "raw_engine_log_preview_chars": 400,
     "raw_engine_log_prompts": False,
     "raw_engine_log_completions": False,
 }
 RAW_ENGINE_SETTING_KEYS = set(RAW_ENGINE_DEFAULTS.keys())
+
+
+def _is_sqlite_lock_error(exc: Exception) -> bool:
+    """Check if an exception is a SQLite lock/busy error."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    error_str = str(exc).lower()
+    return (
+        "locked" in error_str or
+        "disk i/o error" in error_str or
+        "database is locked" in error_str or
+        "database is busy" in error_str
+    )
+
+
+def _retry_on_lock[T](
+    func: Callable[[], T],
+    max_retries: int = 3,
+    delay_ms: int = 200,
+) -> T:
+    """Retry a function if it fails with SQLite lock errors.
+
+    Args:
+        func: Function to retry
+        max_retries: Maximum number of retry attempts
+        delay_ms: Delay between retries in milliseconds
+
+    Returns:
+        The result of the function
+
+    Raises:
+        The last exception if all retries fail
+    """
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except sqlite3.OperationalError as exc:
+            last_exception = exc
+            if _is_sqlite_lock_error(exc) and attempt < max_retries - 1:
+                # Wait before retrying with exponential backoff
+                time.sleep(delay_ms / 1000 * (attempt + 1))
+                continue
+            # Re-raise if not a lock error or out of retries
+            raise
+    # This shouldn't be reached, but just in case
+    if last_exception:
+        raise last_exception
+    raise RuntimeError("Retry failed with no exception")
 
 
 def _ensure_bool(v: Any, default: bool = False) -> bool:
@@ -77,6 +141,56 @@ def _non_negative_int(v: Any) -> Optional[int]:
     if out is None:
         return None
     return out if out >= 0 else None
+
+
+def _validate_chat_template_path(p: Path) -> Tuple[bool, Optional[str], Optional[str]]:
+    try:
+        validation = validate_chat_template_for_path(p)
+    except Exception as exc:
+        logger.warning("Chat template validation failed path=%s err=%s", p, exc)
+        return False, chat_template_error_message("llama_cpp_unavailable"), None
+    if not validation.ok:
+        return False, chat_template_error_message(validation.reason), None
+    return True, None, validation.template_name
+
+
+def _validate_chat_template_record(p: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        validation = validate_chat_template_for_path(p)
+    except Exception as exc:
+        logger.warning("Chat template validation failed path=%s err=%s", p, exc)
+        return None, chat_template_error_message("llama_cpp_unavailable")
+    if not validation.ok:
+        return None, chat_template_error_message(validation.reason)
+    record = build_model_record(p, validation)
+    return record, None
+
+
+def _persist_model_record(
+    store: "SQLiteMetadataStore",
+    *,
+    prefix: str,
+    record: Dict[str, Any],
+) -> None:
+    fingerprint = record.get("model_id") or compute_model_fingerprint(Path(record.get("path", "")))
+    store.set_setting(f"{prefix}_model_record_json", record)
+    store.set_setting(f"{prefix}_model_fingerprint", fingerprint)
+    store.set_setting(f"{prefix}_model_validation_version", MODEL_VALIDATION_VERSION)
+
+
+def _load_model_record_if_current(
+    store: "SQLiteMetadataStore",
+    *,
+    prefix: str,
+    path: Path,
+) -> Optional[Dict[str, Any]]:
+    try:
+        record = store.get_setting(f"{prefix}_model_record_json")
+    except Exception:
+        record = None
+    if model_record_is_current(record, path):
+        return record
+    return None
 
 
 def _port_available(host: str, port: int) -> tuple[bool, Optional[str]]:
@@ -144,12 +258,88 @@ def _raw_engine_mgr():
         )
 
 
-def _normalize_ctx_size(v: Any, default: int = 32768) -> int:
+def _read_ctx_max(path: Optional[Path]) -> Optional[int]:
+    if not path or not path.exists() or not path.is_file():
+        return None
+    try:
+        val = read_gguf_int_kv_suffix(path, ["context_length"])
+    except Exception:
+        return None
+    if not isinstance(val, int) or val <= 0:
+        return None
+    return val
+
+
+def _build_model_info_preview(path: Path) -> Dict[str, Any]:
+    try:
+        arch = read_gguf_string_kv(path, "general.architecture") or ""
+        name = read_gguf_string_kv(path, "general.name") or ""
+        size_label = read_gguf_string_kv(path, "general.size_label") or ""
+        file_type = read_gguf_int_kv(path, "general.file_type")
+        quant_ver = read_gguf_int_kv(path, "general.quantization_version")
+        n_layer = read_gguf_int_kv_suffix(path, [".block_count"])
+        n_head = read_gguf_int_kv_suffix(path, [".attention.head_count"])
+        n_head_kv = read_gguf_int_kv_suffix(path, [".attention.head_count_kv"])
+        n_embd = read_gguf_int_kv_suffix(path, [".embedding_length"])
+        ctx_train = read_gguf_int_kv_suffix(path, [".context_length"])
+        tok_model = read_gguf_string_kv(path, "tokenizer.ggml.model") or read_gguf_string_kv(
+            path, "tokenizer.ggml.pre"
+        )
+        vocab_size = read_gguf_int_kv(path, "tokenizer.ggml.tokens")
+    except Exception:
+        arch = ""
+        name = ""
+        size_label = ""
+        file_type = None
+        quant_ver = None
+        n_layer = None
+        n_head = None
+        n_head_kv = None
+        n_embd = None
+        ctx_train = None
+        tok_model = ""
+        vocab_size = None
+    return {
+        "path": str(path),
+        "architecture": arch or None,
+        "name": name or None,
+        "size_label": size_label or None,
+        "file_type": file_type,
+        "quantization_version": quant_ver,
+        "n_layer": n_layer,
+        "n_head": n_head,
+        "n_head_kv": n_head_kv,
+        "n_embd": n_embd,
+        "ctx_train": ctx_train,
+        "tokenizer_model": tok_model or None,
+        "vocab_size": vocab_size,
+    }
+
+
+def _ctx_options(ctx_max: Optional[int]) -> list[int]:
+    opts = list(DEFAULT_CTX_SIZES)
+    if isinstance(ctx_max, int) and ctx_max > 0:
+        opts = [v for v in opts if v <= ctx_max]
+        if ctx_max not in opts:
+            opts.append(ctx_max)
+    if not opts and isinstance(ctx_max, int) and ctx_max > 0:
+        opts = [ctx_max]
+    return sorted(set(opts))
+
+
+def _normalize_ctx_size(v: Any, *, ctx_max: Optional[int], default: int = 32768) -> int:
     try:
         x = int(v)
     except Exception:
-        return default
-    return x if x in ALLOWED_CTX_SIZES else default
+        x = default
+    if x <= 0:
+        x = default
+    if isinstance(ctx_max, int) and ctx_max > 0:
+        if x > ctx_max:
+            x = ctx_max
+        if x <= 0:
+            x = ctx_max
+    return x
 
 
 def _dir_usage(path: Path) -> Tuple[int, int]:
@@ -182,7 +372,7 @@ def _settings_store() -> tuple[SQLiteMetadataStore, bool]:
 
     Returns (store, should_close).
     """
-    existing = getattr(AppDependencies, "_sqlite_store", None)
+    existing = peek_sqlite_store()
     if existing is not None:
         return existing, False
     return AppDependencies.sqlite_store(), False
@@ -254,7 +444,7 @@ def _require_idle(op: str) -> None:
 def get_settings() -> Dict[str, Any]:
     settings: Dict[str, Any] = {}
     settings_error: Optional[str] = None
-    existing = getattr(AppDependencies, "_sqlite_store", None)
+    existing = peek_sqlite_store()
     if existing is not None:
         store, should_close = _settings_store()
         try:
@@ -273,15 +463,35 @@ def get_settings() -> Dict[str, Any]:
     ctx_size = settings.get("llm_ctx_size")
     theme_mode = settings.get("theme_mode")
     raw_engine_settings = _normalize_raw_engine_settings(settings)
+    raw_model_path = raw_engine_settings.get("raw_engine_model_path") if isinstance(raw_engine_settings, dict) else ""
+    raw_model_path = raw_model_path or model_path
+    raw_ctx_max = None
+    if isinstance(raw_model_path, str) and raw_model_path:
+        raw_ctx_max = _read_ctx_max(Path(raw_model_path).expanduser())
+    raw_ctx_sizes = _ctx_options(raw_ctx_max)
+    raw_engine_settings["raw_engine_ctx"] = _normalize_ctx_size(
+        raw_engine_settings.get("raw_engine_ctx"),
+        ctx_max=raw_ctx_max,
+        default=ctx_size,
+    )
+    rag_default_mode = settings.get("rag_default_mode")
+    rag_default_detail = settings.get("rag_default_detail")
 
     if not isinstance(model_path, str) or not model_path:
         model_path = ""
     if not isinstance(gpu_layers, int):
         gpu_layers = 99
-    if not isinstance(ctx_size, int) or ctx_size not in ALLOWED_CTX_SIZES:
-        ctx_size = 32768
+    ctx_max = None
+    if isinstance(model_path, str) and model_path:
+        ctx_max = _read_ctx_max(Path(model_path).expanduser())
+    ctx_sizes = _ctx_options(ctx_max)
+    ctx_size = _normalize_ctx_size(ctx_size, ctx_max=ctx_max, default=32768)
     if theme_mode not in ("system", "dark", "light"):
         theme_mode = "system"
+    if rag_default_mode not in ("small_doc", "rag"):
+        rag_default_mode = "small_doc"
+    if not isinstance(rag_default_detail, int) or rag_default_detail < 1 or rag_default_detail > 5:
+        rag_default_detail = 3
 
     # Embedding model is fixed (nomic ONNX). Report presence for UX.
     embed_base = _resolve_embed_dir_fast()
@@ -291,7 +501,7 @@ def get_settings() -> Dict[str, Any]:
     llm_loaded = False
     llm_model_info: Optional[Dict[str, Any]] = None
     try:
-        mgr = getattr(AppDependencies, "_session_manager", None)
+        mgr = peek_session_manager()
         if mgr is not None:
             llm_loaded = True
             llm_model_info = mgr.model_info()
@@ -305,10 +515,13 @@ def get_settings() -> Dict[str, Any]:
             "llm_model_path": model_path,
             "llm_gpu_layers": gpu_layers,
             "llm_ctx_size": ctx_size,
+            "rag_default_mode": rag_default_mode,
+            "rag_default_detail": rag_default_detail,
             **raw_engine_settings,
         },
         "llm": {
-            "ctx_sizes": sorted(list(ALLOWED_CTX_SIZES)),
+            "ctx_sizes": ctx_sizes,
+            "ctx_max": ctx_max,
             "loaded": llm_loaded,
             "model_info": llm_model_info,
         },
@@ -321,12 +534,14 @@ def get_settings() -> Dict[str, Any]:
         },
         "raw_engine": {
             "defaults": RAW_ENGINE_DEFAULTS,
+            "ctx_sizes": raw_ctx_sizes,
+            "ctx_max": raw_ctx_max,
         },
     }
 
 
 @router.get("/llm/info")
-def llm_info() -> Dict[str, Any]:
+def llm_info(load: bool = Query(False)) -> Dict[str, Any]:
     """
     Return details about the currently loaded LLM (if any).
 
@@ -334,8 +549,13 @@ def llm_info() -> Dict[str, Any]:
     which triggers model load. Returns info once the LLM is initialized.
     """
     try:
-        # Try to get the session manager - this will trigger initialization if needed
-        mgr = AppDependencies.session_manager()
+        if load:
+            # Try to get the session manager - this will trigger initialization if needed
+            mgr = AppDependencies.session_manager()
+            return {"loaded": True, "model_info": mgr.model_info()}
+        mgr = peek_session_manager()
+        if mgr is None:
+            return {"loaded": False, "model_info": None}
         return {"loaded": True, "model_info": mgr.model_info()}
     except FileNotFoundError as exc:
         # Model not configured or file not found
@@ -397,9 +617,24 @@ def raw_engine_start() -> Dict[str, Any]:
         return {"ok": False, "error": "Model must be a .gguf file"}
     if not is_gguf(p):
         return {"ok": False, "error": "File does not look like a valid GGUF model"}
-    template_kind = detect_chat_template_kind(p)
-    if template_kind not in {"chatml", "llama3"}:
-        return {"ok": False, "error": "Unsupported chat template. Use ChatML or Llama-3."}
+    record = None
+    store, should_close = _settings_store()
+    try:
+        record = _load_model_record_if_current(store, prefix="raw_engine", path=p)
+    finally:
+        if should_close:
+            store.close()
+    if record is None:
+        record, err = _validate_chat_template_record(p)
+        if err:
+            return {"ok": False, "error": err}
+        if record:
+            store, should_close = _settings_store()
+            try:
+                _persist_model_record(store, prefix="raw_engine", record=record)
+            finally:
+                if should_close:
+                    store.close()
 
     host = raw_engine_settings.get("raw_engine_host", RAW_ENGINE_DEFAULTS["raw_engine_host"])
     port = raw_engine_settings.get("raw_engine_port", RAW_ENGINE_DEFAULTS["raw_engine_port"])
@@ -455,8 +690,8 @@ def raw_engine_logs(limit: int = Query(250, ge=1, le=250)) -> Dict[str, Any]:
 @router.post("/embedding/download")
 def download_embedding_model() -> Dict[str, Any]:
     from backend.services.connectors.nomic import (
-        MissingDependencyError,
-        ensure_local_nomic_model_files,
+        start_embedding_download_process,
+        clear_download_cancel,
         get_download_state,
         set_download_state,
     )
@@ -464,6 +699,7 @@ def download_embedding_model() -> Dict[str, Any]:
     from backend.services.health import clear_startup_health_cache
 
     _require_idle("download embedding model")
+    clear_download_cancel()
     model_dir = AppDependencies.nomic_model_dir()
     model_dir.mkdir(parents=True, exist_ok=True)
     cfg = NomicOnnxConfig()
@@ -472,23 +708,41 @@ def download_embedding_model() -> Dict[str, Any]:
     if not missing:
         set_download_state("ready")
         return {"ok": True, "downloaded": False, "path": str(model_dir), "status": "ready"}
-    state = get_download_state()
-    if state.get("status") == "downloading":
-        return {"ok": True, "downloaded": False, "path": str(model_dir), "status": "downloading"}
-
-    def _run_download() -> None:
-        try:
-            ensure_local_nomic_model_files(model_dir, required_paths=required)
-        except MissingDependencyError as exc:
-            set_download_state("error", str(exc))
-        except Exception as exc:
-            set_download_state("error", str(exc))
-
-    set_download_state("downloading")
+    try:
+        result = start_embedding_download_process(model_dir, required_paths=required)
+    except Exception as exc:
+        set_download_state("error", str(exc))
+        return {"ok": False, "error": str(exc)}
     clear_startup_health_cache()
-    t = threading.Thread(target=_run_download, daemon=True)
-    t.start()
-    return {"ok": True, "downloaded": False, "path": str(model_dir), "status": "downloading"}
+    return {
+        "ok": True,
+        "downloaded": False,
+        "path": str(model_dir),
+        "status": result.get("status", "downloading"),
+    }
+
+
+@router.post("/embedding/cancel")
+def cancel_embedding_download() -> Dict[str, Any]:
+    from backend.services.connectors.nomic import (
+        request_download_cancel,
+        cancel_embedding_download_process,
+        get_download_state,
+        set_download_state,
+    )
+    from backend.services.health import clear_startup_health_cache
+
+    state = get_download_state()
+    if state.get("status") != "downloading":
+        return {"ok": True, "cancelled": False, "status": state.get("status")}
+    request_download_cancel()
+    try:
+        cancel_embedding_download_process(AppDependencies.nomic_model_dir())
+    except Exception:
+        pass
+    set_download_state("error", "Download cancelled.")
+    clear_startup_health_cache()
+    return {"ok": True, "cancelled": True, "status": "cancelled"}
 
 
 @router.post("")
@@ -517,6 +771,10 @@ def set_settings(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
                 if should_close:
                     store.close()
                 return {"ok": False, "error": "raw_engine_host is required"}
+            if is_packaged() and host.strip() not in {"127.0.0.1", "localhost", "::1"}:
+                if should_close:
+                    store.close()
+                return {"ok": False, "error": "raw_engine_host must be localhost in bundled builds"}
             store.set_setting("raw_engine_host", host.strip())
 
         if "raw_engine_port" in settings:
@@ -554,15 +812,33 @@ def set_settings(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
                     if should_close:
                         store.close()
                     return {"ok": False, "error": "File does not look like a valid GGUF model"}
-                template_kind = detect_chat_template_kind(p)
-                if template_kind not in {"chatml", "llama3"}:
+                record, err = _validate_chat_template_record(p)
+                if err:
                     if should_close:
                         store.close()
-                    return {"ok": False, "error": "Unsupported chat template. Use ChatML or Llama-3."}
+                    return {"ok": False, "error": err}
                 store.set_setting("raw_engine_model_path", str(p))
+                if record:
+                    _persist_model_record(store, prefix="raw_engine", record=record)
 
         if "raw_engine_ctx" in settings:
             ctx = _positive_int(settings.get("raw_engine_ctx"))
+            raw_ctx_max = None
+            raw_mp = settings.get("raw_engine_model_path")
+            if not raw_mp:
+                try:
+                    raw_mp = store.get_setting("raw_engine_model_path")
+                except Exception:
+                    raw_mp = None
+            if not raw_mp:
+                try:
+                    raw_mp = store.get_setting("llm_model_path")
+                except Exception:
+                    raw_mp = None
+            if isinstance(raw_mp, str) and raw_mp:
+                raw_ctx_max = _read_ctx_max(Path(raw_mp).expanduser())
+            if ctx is not None:
+                ctx = _normalize_ctx_size(ctx, ctx_max=raw_ctx_max, default=ctx)
             store.set_setting("raw_engine_ctx", ctx)
 
         if "raw_engine_threads" in settings:
@@ -638,6 +914,23 @@ def set_settings(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
                 store.close()
             return {"ok": False, "error": "invalid theme_mode"}
 
+    if "rag_default_mode" in settings:
+        mode = settings.get("rag_default_mode")
+        if mode in ("small_doc", "rag"):
+            store.set_setting("rag_default_mode", mode)
+        else:
+            if should_close:
+                store.close()
+            return {"ok": False, "error": "invalid rag_default_mode"}
+
+    if "rag_default_detail" in settings:
+        detail = _safe_int(settings.get("rag_default_detail"), 3)
+        if detail < 1 or detail > 5:
+            if should_close:
+                store.close()
+            return {"ok": False, "error": "rag_default_detail must be between 1 and 5"}
+        store.set_setting("rag_default_detail", detail)
+
     # LLM settings (model path / ctx size) are applied via /settings/llm/apply because they
     # require clearing user data (KV sessions + DB + Qdrant) to avoid inconsistent state.
     if "llm_model_path" in settings or "llm_ctx_size" in settings:
@@ -666,35 +959,81 @@ def set_settings(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 
 @router.post("/model/validate")
 def validate_model(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    model_path = payload.get("model_path") if isinstance(payload, dict) else None
-    if not isinstance(model_path, str) or not model_path:
-        return {"ok": False, "error": "model_path is required"}
-    p = Path(model_path).expanduser()
-    if not p.exists():
-        return {"ok": False, "error": f"Model file not found: {p}"}
-    if not p.is_file():
-        return {"ok": False, "error": f"Not a file: {p}"}
-    if p.suffix.lower() != ".gguf":
-        return {"ok": False, "error": "Model must be a .gguf file"}
-    if not is_gguf(p):
-        return {"ok": False, "error": "File does not look like a valid GGUF model"}
-    template_kind = detect_chat_template_kind(p)
-    if template_kind not in {"chatml", "llama3"}:
-        return {
-            "ok": False,
-            "error": "Unsupported chat template. Use a GGUF with ChatML or Llama-3.",
-        }
     try:
-        size = p.stat().st_size
-    except Exception:
-        size = 0
-    return {
-        "ok": True,
-        "model_path": str(p),
-        "size_bytes": int(size),
-        "note": "Model path looks valid. Full compatibility is verified when the engine loads the model.",
-        "chat_template_kind": template_kind,
-    }
+        model_path = payload.get("model_path") if isinstance(payload, dict) else None
+        if not isinstance(model_path, str) or not model_path:
+            return {"ok": False, "error": "model_path is required"}
+        p = Path(model_path).expanduser()
+        if not p.exists():
+            return {"ok": False, "error": f"Model file not found: {p}"}
+        if not p.is_file():
+            return {"ok": False, "error": f"Not a file: {p}"}
+        if p.suffix.lower() != ".gguf":
+            return {"ok": False, "error": "Model must be a .gguf file"}
+        if not is_gguf(p):
+            return {"ok": False, "error": "File does not look like a valid GGUF model"}
+
+        logger.debug("validate_model: Starting validation for %s", p)
+
+        # Try to load cached record from database with a short timeout
+        # If database is busy, skip the cache and validate the file directly
+        record: Optional[Dict[str, Any]] = None
+        try:
+            store, should_close = _settings_store()
+            try:
+                record = _load_model_record_if_current(store, prefix="llm", path=p)
+                logger.debug("validate_model: Got cached record for %s: %s", p, "found" if record else "None")
+            except sqlite3.OperationalError as exc:
+                if _is_sqlite_lock_error(exc):
+                    logger.debug("validate_model: Database busy, skipping cache for %s", p)
+                    record = None
+                else:
+                    raise
+            finally:
+                if should_close:
+                    store.close()
+        except Exception as exc:
+            logger.warning("validate_model: Error loading cached record for %s: %s", p, exc)
+            record = None
+
+        # If no cached record, validate the file directly (no database access)
+        if record is None:
+            record, err = _validate_chat_template_record(p)
+            if err:
+                return {"ok": False, "error": err}
+        try:
+            size = p.stat().st_size
+        except Exception:
+            size = 0
+        template_name = None
+        fingerprint = None
+        if record:
+            template_name = record.get("template_selected_name")
+            fingerprint = record.get("model_id")
+        ctx_max = _read_ctx_max(p)
+        ctx_sizes = _ctx_options(ctx_max)
+        model_info = _build_model_info_preview(p)
+        logger.debug("validate_model: Validation complete for %s", p)
+        return {
+            "ok": True,
+            "model_path": str(p),
+            "size_bytes": int(size),
+            "note": "Model path looks valid. Full compatibility is verified when the engine loads the model.",
+            "chat_template_kind": "embedded",
+            "chat_template_name": template_name,
+            "model_fingerprint": fingerprint,
+            "ctx_max": ctx_max,
+            "ctx_sizes": ctx_sizes,
+            "model_info": model_info,
+        }
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_lock_error(exc):
+            logger.error("validate_model: Lock error in outer handler: %s", exc)
+            return {"ok": False, "error": "Database is busy. Please try again."}
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected error in validate_model: %s", exc)
+        return {"ok": False, "error": f"Validation error: {str(exc)}"}
 
 
 @router.post("/llm/apply")
@@ -706,86 +1045,115 @@ def apply_llm_settings(payload: Dict[str, Any] = Body(default={})) -> Dict[str, 
     - deletes DB (messages/files/doc_pages/chunks/jobs), Qdrant vectors, KV sessions, uploads, cache, logs
     - preserves the updated app settings so the engine can restart/reload cleanly
     """
-    confirm = payload.get("confirm") if isinstance(payload, dict) else None
-    if confirm is not True:
-        return {"ok": False, "error": "confirm=true required"}
-
-    _require_idle("apply model settings")
-
-    settings = payload.get("settings") if isinstance(payload, dict) else None
-    if not isinstance(settings, dict):
-        return {"ok": False, "error": "settings object is required"}
-
-    store, should_close = _settings_store()
     try:
-        merged = dict(store.list_settings())
-    finally:
-        if should_close:
-            store.close()
+        confirm = payload.get("confirm") if isinstance(payload, dict) else None
+        if confirm is not True:
+            return {"ok": False, "error": "confirm=true required"}
 
-    if "llm_ctx_size" in settings:
-        merged["llm_ctx_size"] = _normalize_ctx_size(settings.get("llm_ctx_size"), 32768)
+        _require_idle("apply model settings")
 
-    if "llm_gpu_layers" in settings:
-        merged["llm_gpu_layers"] = _safe_int(settings.get("llm_gpu_layers"), 99)
+        settings = payload.get("settings") if isinstance(payload, dict) else None
+        if not isinstance(settings, dict):
+            return {"ok": False, "error": "settings object is required"}
 
-    if "llm_model_path" in settings:
-        mp = settings.get("llm_model_path")
-        if not isinstance(mp, str) or not mp:
-            return {"ok": False, "error": "invalid llm_model_path"}
-        p = Path(mp).expanduser()
-        if not p.exists():
-            return {"ok": False, "error": f"Model file not found: {p}"}
-        if not p.is_file():
-            return {"ok": False, "error": f"Not a file: {p}"}
-        if p.suffix.lower() != ".gguf":
-            return {"ok": False, "error": "Model must be a .gguf file"}
-        if not is_gguf(p):
-            return {"ok": False, "error": "File does not look like a valid GGUF model"}
-        template_kind = detect_chat_template_kind(p)
-        if template_kind not in {"chatml", "llama3"}:
-            return {"ok": False, "error": "Unsupported chat template. Use ChatML or Llama-3."}
-        merged["llm_model_path"] = str(p)
+        store, should_close = _settings_store()
+        try:
+            merged = dict(store.list_settings())
+        except sqlite3.OperationalError as exc:
+            error_str = str(exc).lower()
+            if "locked" in error_str or "disk i/o" in error_str or "database is locked" in error_str:
+                return {"ok": False, "error": "Database is busy. Please try again."}
+            raise
+        finally:
+            if should_close:
+                store.close()
 
-    # Remember workspace base (reset_all clears the workspace singleton).
-    ws_base = Path(AppDependencies.workspace().base)
+        if "llm_gpu_layers" in settings:
+            merged["llm_gpu_layers"] = _safe_int(settings.get("llm_gpu_layers"), 99)
 
-    # Reset all user data (closes Qdrant/SQLite first).
-    AppDependencies.reset_all(confirm=True, keep_em_models=True)
+        ctx_path: Optional[Path] = None
+        if "llm_model_path" in settings:
+            mp = settings.get("llm_model_path")
+            if not isinstance(mp, str) or not mp:
+                return {"ok": False, "error": "invalid llm_model_path"}
+            p = Path(mp).expanduser()
+            if not p.exists():
+                return {"ok": False, "error": f"Model file not found: {p}"}
+            if not p.is_file():
+                return {"ok": False, "error": f"Not a file: {p}"}
+            if p.suffix.lower() != ".gguf":
+                return {"ok": False, "error": "Model must be a .gguf file"}
+            if not is_gguf(p):
+                return {"ok": False, "error": "File does not look like a valid GGUF model"}
+            record: Optional[Dict[str, Any]] = None
+            # Need to get a fresh store reference since we closed it above
+            store2, should_close2 = _settings_store()
+            try:
+                record = _load_model_record_if_current(store2, prefix="llm", path=p)
+            except sqlite3.OperationalError as exc:
+                error_str = str(exc).lower()
+                if "locked" in error_str or "disk i/o" in error_str or "database is locked" in error_str:
+                    record = None  # Continue without cached record
+                else:
+                    raise
+            finally:
+                if should_close2:
+                    store2.close()
 
-    # Recreate a fresh DB and restore only app settings. Do not open local Qdrant here
-    # (it is expensive and can hold locks until the engine restarts).
-    ws = get_workspace(base_dir=ws_base)
-    from backend.services.storage.sqlite_store import SQLiteConfig, create_sqlite_store
+            if record is None:
+                record, err = _validate_chat_template_record(p)
+                if err:
+                    return {"ok": False, "error": err}
+            merged["llm_model_path"] = str(p)
+            ctx_path = p
+            if record:
+                merged["llm_model_record_json"] = record
+                merged["llm_model_fingerprint"] = record.get("model_id")
+                merged["llm_model_validation_version"] = MODEL_VALIDATION_VERSION
+        else:
+            mp_existing = merged.get("llm_model_path")
+            if isinstance(mp_existing, str) and mp_existing:
+                ctx_path = Path(mp_existing).expanduser()
 
-    restored = create_sqlite_store(ws.db, config=SQLiteConfig())
-    for k, v in merged.items():
-        restored.set_setting(k, v)
-    restored.close()
+        ctx_max = _read_ctx_max(ctx_path)
+        if "llm_ctx_size" in settings:
+            merged["llm_ctx_size"] = _normalize_ctx_size(
+                settings.get("llm_ctx_size"),
+                ctx_max=ctx_max,
+                default=32768,
+            )
+        elif ctx_max:
+            merged["llm_ctx_size"] = _normalize_ctx_size(
+                merged.get("llm_ctx_size"),
+                ctx_max=ctx_max,
+                default=32768,
+            )
 
-    # Kick off background chat-router load now that a model path is configured.
-    try:
-        from backend.api.chat_router_loader import maybe_start_chat_router_load
+        # Remember workspace base (reset_all clears the workspace singleton).
+        ws_base = Path(AppDependencies.workspace().base)
 
-        maybe_start_chat_router_load("llm_apply")
-    except Exception:
-        pass
-    try:
-        from backend.services.health import clear_startup_health_cache
+        # Reset all user data (closes Qdrant/SQLite first).
+        AppDependencies.reset_all(confirm=True, keep_em_models=True)
 
-        clear_startup_health_cache()
-    except Exception:
-        pass
+        # Recreate a fresh DB and restore only app settings. Do not open local Qdrant here
+        # (it is expensive and can hold locks until the engine restarts).
+        ws = get_workspace(base_dir=ws_base)
+        from backend.services.storage.sqlite_store import SQLiteConfig, create_sqlite_store
 
-    return {
-        "ok": True,
-        "reset_done": True,
-        "settings": {
-            "llm_model_path": merged.get("llm_model_path"),
-            "llm_gpu_layers": merged.get("llm_gpu_layers"),
-            "llm_ctx_size": merged.get("llm_ctx_size"),
-        },
-    }
+        restored = create_sqlite_store(ws.db, config=SQLiteConfig())
+        for k, v in merged.items():
+            restored.set_setting(k, v)
+        restored.close()
+
+        return {"ok": True, "restart_required": True}
+    except sqlite3.OperationalError as exc:
+        error_str = str(exc).lower()
+        if "locked" in error_str or "disk i/o" in error_str or "database is locked" in error_str:
+            return {"ok": False, "error": "Database is busy. Please try again."}
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected error in apply_llm_settings: %s", exc)
+        return {"ok": False, "error": f"Apply error: {str(exc)}"}
 
 
 @router.get("/storage")

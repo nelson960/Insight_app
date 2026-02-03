@@ -5,33 +5,30 @@ import type { CardLayout } from "./components/Canvas";
 import { CardOverlay } from "./components/CardOverlay";
 import { ChatWindow } from "./components/ChatWindow";
 import { SettingsModal, ThemeMode } from "./components/SettingsModal";
+import { FirstRunSetupModal } from "./components/FirstRunSetupModal";
 import { useSessions } from "./state/useSessions";
 import { engine } from "./api/engine";
 import { setTheme as setAppTheme } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
-import {
-  StartupHealthModal,
-  HealthReport,
-} from "./components/StartupHealthModal";
+import { HealthReport } from "./components/StartupHealthModal";
 
 const NOTES_STORAGE_KEY = "insight.canvas.notes.v1";
 const LINKS_STORAGE_KEY = "insight.canvas.links.v1";
+const CARD_LAYOUT_STORAGE_KEY = "insight.card.layout.default.v1";
 const DEFAULT_CARD_LAYOUT: CardLayout = {
   showChat: true,
   showDocs: true,
   chatOnRight: true,
-  splitRatio: 0.5,
+  splitRatio: 0.6,
 };
+const DEFAULT_DOCK_DEAD_ZONE = { x: 0, y: 0, w: 240, h: 200 };
 const STARTUP_BLOCKING_CODES = new Set([
   "model_not_configured",
   "model_missing",
   "model_not_file",
   "model_wrong_extension",
   "model_invalid",
-  "embedding_missing",
-  "embedding_downloading",
-  "embedding_download_failed",
   "chat_router_failed",
 ]);
 
@@ -49,7 +46,7 @@ function pickBlockingIssues(
 
 function coerceCardLayout(raw: unknown): CardLayout | null {
   if (!raw || typeof raw !== "object") return null;
-  const obj = raw as any;
+  const obj = raw as Record<string, unknown>;
 
   const showChat = typeof obj.showChat === "boolean" ? obj.showChat : DEFAULT_CARD_LAYOUT.showChat;
   const showDocs = typeof obj.showDocs === "boolean" ? obj.showDocs : DEFAULT_CARD_LAYOUT.showDocs;
@@ -72,6 +69,145 @@ function coerceCardLayout(raw: unknown): CardLayout | null {
   return { showChat, showDocs, chatOnRight, splitRatio, activeFileId };
 }
 
+type SpawnHint = {
+  anchor: { x: number; y: number };
+  bounds?: { w: number; h: number };
+  avoidZones?: Array<{ x: number; y: number; w: number; h: number }>;
+};
+
+function rectOverlapArea(
+  ax: number,
+  ay: number,
+  aw: number,
+  ah: number,
+  bx: number,
+  by: number,
+  bw: number,
+  bh: number
+) {
+  const x1 = Math.max(ax, bx);
+  const y1 = Math.max(ay, by);
+  const x2 = Math.min(ax + aw, bx + bw);
+  const y2 = Math.min(ay + ah, by + bh);
+  if (x2 <= x1 || y2 <= y1) return 0;
+  return (x2 - x1) * (y2 - y1);
+}
+
+function equalLayout(a?: CardLayout, b?: CardLayout) {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return (
+    a.showChat === b.showChat &&
+    a.showDocs === b.showDocs &&
+    a.chatOnRight === b.chatOnRight &&
+    a.splitRatio === b.splitRatio &&
+    (a.activeFileId ?? null) === (b.activeFileId ?? null)
+  );
+}
+
+function findOpenPosition(
+  start: { x: number; y: number },
+  size: { w: number; h: number },
+  notes: CanvasNote[],
+  bounds?: { w: number; h: number },
+  avoidZones?: Array<{ x: number; y: number; w: number; h: number }>
+) {
+  const clampToBounds = (pos: { x: number; y: number }) => {
+    if (!bounds) return pos;
+    const maxX = Math.max(0, bounds.w - size.w);
+    const maxY = Math.max(0, bounds.h - size.h);
+    return {
+      x: Math.max(0, Math.min(maxX, pos.x)),
+      y: Math.max(0, Math.min(maxY, pos.y)),
+    };
+  };
+
+  const inBounds = (pos: { x: number; y: number }) => {
+    if (!bounds) return true;
+    return pos.x >= 0 && pos.y >= 0 && pos.x + size.w <= bounds.w && pos.y + size.h <= bounds.h;
+  };
+
+  const startPos = clampToBounds(start);
+  if (!notes.length) return startPos;
+  const margin = 16;
+  const step = 40;
+  const maxRing = 18;
+  const candidates: Array<{ x: number; y: number }> = [];
+  candidates.push({ x: startPos.x, y: startPos.y });
+  for (let r = 1; r <= maxRing; r += 1) {
+    for (let dx = -r; dx <= r; dx += 1) {
+      for (let dy = -r; dy <= r; dy += 1) {
+        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+        candidates.push({ x: startPos.x + dx * step, y: startPos.y + dy * step });
+      }
+    }
+  }
+  let best = candidates[0] ?? startPos;
+  let bestOverlap = Number.POSITIVE_INFINITY;
+  const avoidPenalty = avoidZones && avoidZones.length ? size.w * size.h * 4 : 0;
+  for (const c of candidates) {
+    if (!inBounds(c)) continue;
+    let overlap = 0;
+    let hit = false;
+    for (const n of notes) {
+      const area = rectOverlapArea(
+        c.x,
+        c.y,
+        size.w,
+        size.h,
+        n.x - margin,
+        n.y - margin,
+        n.w + margin * 2,
+        n.h + margin * 2
+      );
+      if (area > 0) {
+        hit = true;
+        overlap += area;
+      }
+    }
+    if (avoidZones && avoidZones.length) {
+      for (const zone of avoidZones) {
+        const area = rectOverlapArea(c.x, c.y, size.w, size.h, zone.x, zone.y, zone.w, zone.h);
+        if (area > 0) {
+          hit = true;
+          overlap += avoidPenalty;
+        }
+      }
+    }
+    if (!hit) return c;
+    if (overlap < bestOverlap) {
+      bestOverlap = overlap;
+      best = c;
+    }
+  }
+  return clampToBounds(best);
+}
+
+function loadPersistedCardLayout(): CardLayout | null {
+  try {
+    const raw = localStorage.getItem(CARD_LAYOUT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const layout = coerceCardLayout(parsed);
+    if (!layout) return null;
+    if (Math.abs(layout.splitRatio - 0.5) < 1e-6) {
+      layout.splitRatio = DEFAULT_CARD_LAYOUT.splitRatio;
+    }
+    return { ...layout, activeFileId: undefined };
+  } catch {
+    return null;
+  }
+}
+
+function persistCardLayout(layout: CardLayout) {
+  try {
+    const cleaned = { ...layout, activeFileId: undefined };
+    localStorage.setItem(CARD_LAYOUT_STORAGE_KEY, JSON.stringify(cleaned));
+  } catch {
+    // ignore
+  }
+}
+
 function loadPersistedNotes(): CanvasNote[] | null {
   try {
     const raw = localStorage.getItem(NOTES_STORAGE_KEY);
@@ -81,19 +217,23 @@ function loadPersistedNotes(): CanvasNote[] | null {
     const out: CanvasNote[] = [];
     for (const item of parsed) {
       if (!item || typeof item !== "object") continue;
-      const chatId = (item as any).chatId;
-      const x = Number((item as any).x);
-      const y = Number((item as any).y);
-      const w = Number((item as any).w);
-      const h = Number((item as any).h);
-      const z = Number((item as any).z);
+      const obj = item as Record<string, unknown>;
+      const chatId = obj.chatId;
+      const x = Number(obj.x);
+      const y = Number(obj.y);
+      const w = Number(obj.w);
+      const h = Number(obj.h);
+      const z = Number(obj.z);
       if (typeof chatId !== "string" || !chatId) continue;
       if (![x, y, w, h, z].every(Number.isFinite)) continue;
-      const layout = coerceCardLayout((item as any).layout);
-      const locked = typeof (item as any).locked === "boolean" ? (item as any).locked : undefined;
+      let layout = coerceCardLayout(obj.layout);
+      if (layout && Math.abs(layout.splitRatio - 0.5) < 1e-6) {
+        layout = { ...layout, splitRatio: DEFAULT_CARD_LAYOUT.splitRatio };
+      }
+      const locked = typeof obj.locked === "boolean" ? obj.locked : undefined;
       const collapsed =
-        typeof (item as any).collapsed === "boolean" ? (item as any).collapsed : undefined;
-      const groupColorRaw = (item as any).groupColor;
+        typeof obj.collapsed === "boolean" ? obj.collapsed : undefined;
+      const groupColorRaw = obj.groupColor;
       const groupColor =
         typeof groupColorRaw === "string" && groupColorRaw.trim()
           ? groupColorRaw.trim()
@@ -105,7 +245,7 @@ function loadPersistedNotes(): CanvasNote[] | null {
         w,
         h,
         z,
-        title: (item as any).title,
+        title: typeof obj.title === "string" ? obj.title : undefined,
         locked,
         collapsed,
         groupColor,
@@ -113,7 +253,8 @@ function loadPersistedNotes(): CanvasNote[] | null {
       });
     }
     return out;
-  } catch {
+  } catch (err) {
+    console.error("[Storage] Failed to load notes:", err);
     return null;
   }
 }
@@ -143,10 +284,11 @@ function loadPersistedLinks(): CanvasLink[] | null {
     const out: CanvasLink[] = [];
     for (const item of parsed) {
       if (!item || typeof item !== "object") continue;
-      const id = (item as any).id;
-      const fromChatId = (item as any).fromChatId;
-      const toChatId = (item as any).toChatId;
-      const kind = (item as any).kind;
+      const obj = item as Record<string, unknown>;
+      const id = obj.id;
+      const fromChatId = obj.fromChatId;
+      const toChatId = obj.toChatId;
+      const kind = obj.kind;
       if (typeof id !== "string" || !id) continue;
       if (typeof fromChatId !== "string" || !fromChatId) continue;
       if (typeof toChatId !== "string" || !toChatId) continue;
@@ -154,7 +296,8 @@ function loadPersistedLinks(): CanvasLink[] | null {
       out.push({ id, fromChatId, toChatId, kind });
     }
     return out;
-  } catch {
+  } catch (err) {
+    console.error("[Storage] Failed to load links:", err);
     return null;
   }
 }
@@ -178,18 +321,27 @@ function App() {
   const [activeChat, setActiveChat] = useState<string | null>(null);
   const [notes, setNotes] = useState<CanvasNote[]>([]);
   const [links, setLinks] = useState<CanvasLink[]>([]);
+  const [defaultCardLayout, setDefaultCardLayout] = useState<CardLayout>(DEFAULT_CARD_LAYOUT);
+  const defaultCardLayoutRef = useRef<CardLayout>(DEFAULT_CARD_LAYOUT);
+  const notesRef = useRef<CanvasNote[]>([]);
+  const spawnHintRef = useRef<SpawnHint | null>(null);
+  const layoutPersistTimerRef = useRef<number | null>(null);
   const [overlayChatId, setOverlayChatId] = useState<string | null>(null);
   const [overlayCardId, setOverlayCardId] = useState<string | null>(null);
   const [overlayChatClosing, setOverlayChatClosing] = useState(false);
   const [overlayCardClosing, setOverlayCardClosing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<"general" | "model" | "retrieval" | "raw" | "storage">(
+    "general"
+  );
   const [themeMode, setThemeMode] = useState<ThemeMode>("system");
+  const [engineCrashed, setEngineCrashed] = useState(false);
+  const [crashDetails, setCrashDetails] = useState<string | null>(null);
   const [confirmDeleteChatId, setConfirmDeleteChatId] = useState<string | null>(
     null
   );
-  const [startupHealth, setStartupHealth] = useState<HealthReport | null>(null);
-  const [startupHealthOpen, setStartupHealthOpen] = useState(false);
-  const startupHealthPromptedRef = useRef(false);
+  const [deletedChatIds, setDeletedChatIds] = useState<string[]>([]);
+  const [setupOpen, setSetupOpen] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
 
   const pickStartupIssues = useCallback(
@@ -197,46 +349,78 @@ function App() {
     []
   );
 
-  const showStartupHealthOnce = useCallback((report: HealthReport | null) => {
+  const maybeOpenSetup = useCallback((report: HealthReport | null) => {
     if (!report) {
-      setStartupHealth(null);
-      setStartupHealthOpen(false);
+      setSetupOpen(false);
+      return false;
+    }
+    const issues = Array.isArray(report.issues) ? report.issues : [];
+    const needsSetup = issues.some((issue) =>
+      [
+        "model_not_configured",
+        "model_missing",
+        "model_not_file",
+        "model_wrong_extension",
+        "model_validation_required",
+      ].includes(issue.code)
+    );
+    if (needsSetup) {
+      setSetupOpen(true);
       return true;
     }
-    setStartupHealth(report);
-    if (!startupHealthPromptedRef.current) {
-      startupHealthPromptedRef.current = true;
-      setStartupHealthOpen(true);
-    }
+    setSetupOpen(false);
     return false;
   }, []);
 
-  const showStartupHealthNow = useCallback((report: HealthReport | null) => {
-    if (!report) {
-      setStartupHealth(null);
-      setStartupHealthOpen(false);
-      return true;
+  const buildSetupFallbackReport = useCallback(async (): Promise<HealthReport | null> => {
+    const res = await engine<any>("/settings", undefined, "GET");
+    if (!res.ok) return null;
+    const issues: HealthReport["issues"] = [];
+    const settings = (res.data as any)?.settings || {};
+    const embedding = (res.data as any)?.embedding || {};
+    const modelPath = settings?.llm_model_path;
+    if (!modelPath) {
+      issues.push({
+        code: "model_not_configured",
+        severity: "error",
+        message: "No model is configured yet.",
+        fix: "Open Settings → Model and choose a GGUF model file.",
+        action: "open_settings",
+      });
     }
-    startupHealthPromptedRef.current = true;
-    setStartupHealth(report);
-    setStartupHealthOpen(true);
-    return false;
+    if (embedding?.present === false) {
+      issues.push({
+        code: "embedding_missing",
+        severity: "warning",
+        message: "Embedding model files are missing.",
+        fix: "Download embeddings in Settings → Model.",
+        action: "open_settings",
+      });
+    }
+    if (!issues.length) return null;
+    return { ok: false, issues, checks: { health_fallback: true } };
   }, []);
 
   const ensureModelReady = useCallback(async () => {
     const res = await engine<HealthReport>("/settings/health", undefined, "GET");
     if (!res.ok) return true;
     const trimmed = pickStartupIssues(res.data as any);
-    if (trimmed) return showStartupHealthNow(trimmed);
+    if (trimmed) return !maybeOpenSetup(trimmed);
     const checks = (res.data as any)?.checks || {};
     const chatReady = checks.chat_router_ready;
     const chatLoading = checks.chat_router_loading;
     const chatError = checks.chat_router_error;
-    if (chatReady === false || chatLoading || chatError) {
+    if (chatError) {
       return false;
     }
+    if (chatLoading) {
+      return true;
+    }
+    if (chatReady === false) {
+      return true;
+    }
     return true;
-  }, [pickStartupIssues, showStartupHealthNow]);
+  }, [pickStartupIssues, maybeOpenSetup]);
 
   // Load persisted app settings (theme) from backend.
   useEffect(() => {
@@ -263,14 +447,19 @@ function App() {
     let cancelled = false;
     const handleReport = (report?: HealthReport | null) => {
       if (cancelled) return;
-      const trimmed = pickStartupIssues(report);
-      showStartupHealthOnce(trimmed);
+      maybeOpenSetup(report || null);
     };
 
     (async () => {
       const res = await engine<HealthReport>("/settings/health", undefined, "GET");
-      if (!res.ok || cancelled) return;
-      handleReport(res.data as any);
+      if (cancelled) return;
+      if (res.ok) {
+        handleReport(res.data as any);
+        return;
+      }
+      const fallback = await buildSetupFallbackReport();
+      if (cancelled) return;
+      if (fallback) handleReport(fallback);
     })();
 
     const unlistenPromise = listen<{ report?: HealthReport }>("engine-event", (event) => {
@@ -335,6 +524,25 @@ function App() {
     }
   }, [themeMode]);
 
+  useEffect(() => {
+    const unlisten = listen<{
+      message?: string;
+      suggestion?: string;
+    }>("engine-crashed", (event) => {
+      console.error("[App] Engine crash detected:", event.payload);
+      setEngineCrashed(true);
+      setCrashDetails(
+        event.payload?.suggestion ||
+          event.payload?.message ||
+          "The Python engine has crashed. Please restart the application."
+      );
+    });
+
+    return () => {
+      unlisten.then((fn) => fn()).catch(console.error);
+    };
+  }, []);
+
   // Rehydrate canvas notes on startup (persistent card positions).
   useEffect(() => {
     const restored = loadPersistedNotes();
@@ -347,6 +555,14 @@ function App() {
     const restored = loadPersistedLinks();
     if (restored && restored.length) {
       setLinks(restored);
+    }
+  }, []);
+
+  useEffect(() => {
+    const restored = loadPersistedCardLayout();
+    if (restored) {
+      setDefaultCardLayout(restored);
+      defaultCardLayoutRef.current = restored;
     }
   }, []);
 
@@ -376,17 +592,39 @@ function App() {
     return () => window.clearTimeout(t);
   }, [links]);
 
-  // Pick the first session automatically when loaded.
-  useEffect(() => {
-    if (!loading && sessions.length > 0 && !activeChat) {
-      setActiveChat(sessions[0].chat_id);
-    }
-  }, [sessions, loading, activeChat]);
-
+  const deletedChatIdSet = useMemo(() => new Set(deletedChatIds), [deletedChatIds]);
   const sortedSessions = useMemo(
     () => [...sessions].sort((a, b) => a.chat_id.localeCompare(b.chat_id)),
     [sessions]
   );
+  const visibleSessions = useMemo(
+    () => sortedSessions.filter((s) => !deletedChatIdSet.has(s.chat_id)),
+    [sortedSessions, deletedChatIdSet]
+  );
+
+  // Pick the first session automatically when loaded.
+  useEffect(() => {
+    if (!loading && visibleSessions.length > 0 && !activeChat) {
+      setActiveChat(visibleSessions[0].chat_id);
+    }
+  }, [visibleSessions, loading, activeChat]);
+
+  useEffect(() => {
+    notesRef.current = notes;
+  }, [notes]);
+
+  const handleSpawnHint = useCallback((hint: SpawnHint) => {
+    spawnHintRef.current = hint;
+  }, []);
+
+  useEffect(() => {
+    if (!deletedChatIds.length) return;
+    const sessionIds = new Set(sessions.map((s) => s.chat_id));
+    const next = deletedChatIds.filter((id) => sessionIds.has(id));
+    if (next.length !== deletedChatIds.length) {
+      setDeletedChatIds(next);
+    }
+  }, [sessions, deletedChatIds]);
 
   function focusChat(chatId: string) {
     if (!chatId) return;
@@ -440,18 +678,6 @@ function App() {
     if (!chatId) return;
     if (!patch || typeof patch !== "object") return;
 
-    function equalLayout(a?: CardLayout, b?: CardLayout) {
-      if (a === b) return true;
-      if (!a || !b) return false;
-      return (
-        a.showChat === b.showChat &&
-        a.showDocs === b.showDocs &&
-        a.chatOnRight === b.chatOnRight &&
-        a.splitRatio === b.splitRatio &&
-        (a.activeFileId ?? null) === (b.activeFileId ?? null)
-      );
-    }
-
     setNotes((prev) => {
       let changed = false;
       const next = prev.map((n) => {
@@ -483,7 +709,25 @@ function App() {
   const handleOverlayLayoutChange = useCallback(
     (nextLayout: CardLayout) => {
       if (!overlayCardId) return;
+      const noteLayout = notesRef.current.find((n) => n.chatId === overlayCardId)?.layout;
+      const isSync = noteLayout ? equalLayout(noteLayout, nextLayout) : false;
       updateNote(overlayCardId, { layout: nextLayout });
+      if (nextLayout.showChat && nextLayout.showDocs && !isSync) {
+        const updated: CardLayout = {
+          ...DEFAULT_CARD_LAYOUT,
+          chatOnRight: nextLayout.chatOnRight,
+          splitRatio: nextLayout.splitRatio,
+        };
+        defaultCardLayoutRef.current = updated;
+        setDefaultCardLayout(updated);
+        if (layoutPersistTimerRef.current != null) {
+          window.clearTimeout(layoutPersistTimerRef.current);
+        }
+        layoutPersistTimerRef.current = window.setTimeout(() => {
+          layoutPersistTimerRef.current = null;
+          persistCardLayout(updated);
+        }, 200);
+      }
     },
     [overlayCardId, updateNote]
   );
@@ -501,7 +745,7 @@ function App() {
     if (loading) return;
     setNotes((prev) => {
       const existingIds = new Set(prev.map((n) => n.chatId));
-      const sessionIds = new Set(sessions.map((s) => s.chat_id));
+      const sessionIds = new Set(visibleSessions.map((s) => s.chat_id));
       // Drop notes for chats that no longer exist.
       const filtered = prev.filter((n) => sessionIds.has(n.chatId));
       if (filtered.length !== prev.length) {
@@ -510,43 +754,50 @@ function App() {
       const next: CanvasNote[] = [...prev];
       let z = (prev.reduce((m, n) => Math.max(m, n.z), 0) || 0) + 1;
 
-      const toAdd = sessions.filter((s) => !existingIds.has(s.chat_id));
+      const toAdd = visibleSessions.filter((s) => !existingIds.has(s.chat_id));
       if (!toAdd.length) return prev;
 
-      // Simple grid-ish placement.
-      const baseX = 60;
-      const baseY = 60;
+      const spawnHint = spawnHintRef.current;
+      const anchor = spawnHint?.anchor ?? { x: 80, y: 80 };
+      const bounds = spawnHint?.bounds;
+      const avoidZones = spawnHint?.avoidZones ?? [DEFAULT_DOCK_DEAD_ZONE];
       const colW = 260;
       const rowH = 170;
       const startIndex = prev.length;
       for (let i = 0; i < toAdd.length; i++) {
         const idx = startIndex + i;
-        const col = idx % 4;
-        const row = Math.floor(idx / 4);
+        let desired = anchor;
+        if (idx > 0) {
+          const localIdx = idx - 1;
+          const col = localIdx % 3;
+          const row = Math.floor(localIdx / 3);
+          desired = { x: anchor.x + col * colW, y: anchor.y + row * rowH };
+        }
+        const pos = findOpenPosition(desired, { w: 240, h: 140 }, next, bounds, avoidZones);
         next.push({
           chatId: toAdd[i].chat_id,
           title: toAdd[i].title,
-          x: baseX + col * colW,
-          y: baseY + row * rowH,
+          x: pos.x,
+          y: pos.y,
           w: 240,
           h: 140,
           z: z++,
-          layout: { ...DEFAULT_CARD_LAYOUT },
+          layout: { ...defaultCardLayoutRef.current },
         });
       }
       return next;
     });
-  }, [sessions, loading]);
+  }, [visibleSessions, loading]);
 
   // Drop links for chats that no longer exist.
   useEffect(() => {
     if (loading) return;
-    const sessionIds = new Set(sessions.map((s) => s.chat_id));
+    const sessionIds = new Set(visibleSessions.map((s) => s.chat_id));
     setLinks((prev) => {
       const next = prev.filter((l) => sessionIds.has(l.fromChatId) && sessionIds.has(l.toChatId));
       return next.length === prev.length ? prev : next;
     });
-  }, [sessions, loading]);
+  }, [visibleSessions, loading]);
 
   async function deleteChat(chatId: string) {
     // Note: window.confirm/alert can be blocked in the Tauri WebView.
@@ -558,9 +809,10 @@ function App() {
     setConfirmDeleteChatId(null);
 
     // Optimistic UI update.
+    setDeletedChatIds((prev) => (prev.includes(chatId) ? prev : [...prev, chatId]));
     removeSession(chatId);
     if (activeChat === chatId) {
-      const remaining = sessions.filter((s) => s.chat_id !== chatId);
+      const remaining = visibleSessions.filter((s) => s.chat_id !== chatId);
       setActiveChat(remaining.length ? remaining[0].chat_id : null);
     }
     setNotes((prev) => prev.filter((n) => n.chatId !== chatId));
@@ -571,6 +823,7 @@ function App() {
     const res = await engine(`/chat/sessions/${encodeURIComponent(chatId)}`, undefined, "DELETE");
     if (!res.ok) {
       console.error("Delete failed", res);
+      setDeletedChatIds((prev) => prev.filter((id) => id !== chatId));
       // Re-sync from backend on failure.
       // Re-sync from backend on failure.
       await reload();
@@ -613,11 +866,16 @@ function App() {
 
     setConfirmDeleteChatId(null);
 
+    setDeletedChatIds((prev) => {
+      const next = new Set(prev);
+      ids.forEach((id) => next.add(id));
+      return [...next];
+    });
     // Optimistic UI update.
     for (const id of ids) removeSession(id);
 
     if (activeChat && ids.includes(activeChat)) {
-      const remaining = sessions.filter((s) => !ids.includes(s.chat_id));
+      const remaining = visibleSessions.filter((s) => !ids.includes(s.chat_id));
       setActiveChat(remaining.length ? remaining[0].chat_id : null);
     }
     setNotes((prev) => prev.filter((n) => !ids.includes(n.chatId)));
@@ -632,6 +890,7 @@ function App() {
       const res = await engine(`/chat/sessions/${encodeURIComponent(id)}`, undefined, "DELETE");
       if (!res.ok) {
         console.error("Delete group failed", id, res);
+        setDeletedChatIds((prev) => prev.filter((cid) => !ids.includes(cid)));
         await reload();
         return;
       }
@@ -641,22 +900,27 @@ function App() {
     await reload();
   }
 
-  function createChatCardAt(pos: { x: number; y: number }) {
+  function createChatCardAt(
+    pos: { x: number; y: number },
+    opts?: { bounds?: { w: number; h: number }; avoidZones?: Array<{ x: number; y: number; w: number; h: number }> }
+  ) {
     const id = `chat-${Date.now()}`;
     addLocalChat(id);
     setActiveChat(id);
     setNotes((prev) => {
       const nextZ = (prev.reduce((m, n) => Math.max(m, n.z), 0) || 0) + 1;
+      const size = { w: 320, h: 200 };
+      const placed = findOpenPosition(pos, size, prev, opts?.bounds, opts?.avoidZones);
       return [
         ...prev,
         {
           chatId: id,
-          x: pos.x,
-          y: pos.y,
-          w: 320,
-          h: 200,
+          x: placed.x,
+          y: placed.y,
+          w: size.w,
+          h: size.h,
           z: nextZ,
-          layout: { ...DEFAULT_CARD_LAYOUT },
+          layout: { ...defaultCardLayoutRef.current },
         },
       ];
     });
@@ -697,20 +961,27 @@ function App() {
         }
 
         const parent = typeof parentId === "string" ? prev.find((n) => n.chatId === parentId) : null;
-        const x = parent ? parent.x + Math.max(260, parent.w) + 40 : 80;
-        const y = parent ? parent.y + 20 : 80;
+        const desired = {
+          x: parent ? parent.x + Math.max(260, parent.w) + 40 : 80,
+          y: parent ? parent.y + 20 : 80,
+        };
+        const size = { w: 360, h: 220 };
+        const spawnHint = spawnHintRef.current;
+        const bounds = spawnHint?.bounds;
+        const avoidZones = spawnHint?.avoidZones ?? [DEFAULT_DOCK_DEAD_ZONE];
+        const placed = findOpenPosition(desired, size, prev, bounds, avoidZones);
 
         return [
           ...prev,
           {
             chatId: childId,
-            x,
-            y,
-            w: 360,
-            h: 220,
+            x: placed.x,
+            y: placed.y,
+            w: size.w,
+            h: size.h,
             z: nextZ,
             title: requestedTitle || undefined,
-            layout: { ...DEFAULT_CARD_LAYOUT },
+            layout: { ...defaultCardLayoutRef.current },
           },
         ];
       });
@@ -728,7 +999,7 @@ function App() {
       <div className="shell">
         <main className="main">
           <Canvas
-            sessions={sortedSessions}
+            sessions={visibleSessions}
             activeChatId={activeChat}
             notes={notes}
             links={links}
@@ -747,28 +1018,65 @@ function App() {
               setOverlayCardClosing(false);
               setOverlayChatId(null);
             }}
-            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSettings={() => {
+              setSettingsInitialTab("general");
+              setSettingsOpen(true);
+            }}
             onDeleteChat={deleteChat}
             onDeleteChatTree={deleteChatTree}
             confirmDeleteChatId={confirmDeleteChatId}
             onResetConfirmDelete={() => setConfirmDeleteChatId(null)}
             loadingSessions={loading}
+            onSpawnHint={handleSpawnHint}
             dockVisible={!overlayCardId && !overlayChatId}
+          />
+          <FirstRunSetupModal
+            open={setupOpen}
+            onOpenSettings={() => {
+              setSetupOpen(false);
+              setSettingsInitialTab("model");
+              setSettingsOpen(true);
+            }}
           />
           <SettingsModal
             open={settingsOpen}
             onClose={() => setSettingsOpen(false)}
             themeMode={themeMode}
             onThemeModeChange={(mode) => setThemeMode(mode)}
+            initialTab={settingsInitialTab}
           />
-          <StartupHealthModal
-            open={startupHealthOpen}
-            report={startupHealth}
-            onOpenSettings={() => {
-              setStartupHealthOpen(false);
-              setSettingsOpen(true);
-            }}
-          />
+          {engineCrashed ? (
+            <div className="crash-backdrop" role="dialog" aria-modal="true">
+              <div className="crash-modal">
+                <div className="crash-header">
+                  <h2 className="crash-title">Engine Crash Detected</h2>
+                </div>
+                <div className="crash-body">
+                  <div className="crash-message">
+                    {crashDetails || "The Python engine has crashed unexpectedly."}
+                  </div>
+                  <div className="crash-suggestions">
+                    <h3>Recovery Options:</h3>
+                    <ul>
+                      <li>Restart the application using the button below</li>
+                      <li>If crashes persist, open Settings → Model and reduce GPU layers</li>
+                      <li>Current setting may be too high for your system</li>
+                      <li>Try setting GPU layers to 35 or lower</li>
+                    </ul>
+                  </div>
+                </div>
+                <div className="crash-actions">
+                  <button
+                    className="crash-btn primary"
+                    onClick={() => window.location.reload()}
+                    type="button"
+                  >
+                    Restart Application
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
           {storageError && (
             <div
               style={{
@@ -810,13 +1118,13 @@ function App() {
             <OverlayBoundary title="Card UI crashed" onClose={closeOverlayCard}>
               {(() => {
                 const note = notes.find((n) => n.chatId === overlayCardId);
-                const layout = note?.layout ?? DEFAULT_CARD_LAYOUT;
+                const layout = note?.layout ?? defaultCardLayout;
                 return (
                   <CardOverlay
                     key={overlayCardId}
                     title={
                       note?.title ||
-                      sortedSessions.find((s) => s.chat_id === overlayCardId)?.title ||
+                      visibleSessions.find((s) => s.chat_id === overlayCardId)?.title ||
                       overlayCardId
                     }
                     chatId={overlayCardId}
@@ -825,7 +1133,7 @@ function App() {
                     initialLayout={layout}
                     onLayoutChange={handleOverlayLayoutChange}
                     onTitleChange={handleOverlayTitleChange}
-                    sessions={sortedSessions}
+                    sessions={visibleSessions}
                     loadingSessions={loading}
                     onOpenCard={(chatId) => {
                       setActiveChat(chatId);
@@ -834,15 +1142,18 @@ function App() {
                       setOverlayChatId(null);
                     }}
                     onCreateCard={() => {
-                      const idx = notes.length;
-                      const col = idx % 4;
-                      const row = Math.floor(idx / 4);
-                      return createChatCardAt({
-                        x: 60 + col * 260,
-                        y: 60 + row * 170,
+        const spawnHint = spawnHintRef.current;
+        const anchor = spawnHint?.anchor ?? { x: 80, y: 80 };
+                      const avoidZones = spawnHint?.avoidZones ?? [DEFAULT_DOCK_DEAD_ZONE];
+                      return createChatCardAt(anchor, {
+                        bounds: spawnHint?.bounds,
+                        avoidZones,
                       });
                     }}
-                    onOpenSettings={() => setSettingsOpen(true)}
+                    onOpenSettings={() => {
+                      setSettingsInitialTab("general");
+                      setSettingsOpen(true);
+                    }}
                     onDeleteChat={deleteChat}
                     confirmDeleteChatId={confirmDeleteChatId}
                     onRequireModel={ensureModelReady}
@@ -872,7 +1183,7 @@ function App() {
                 <div className="chat-overlay-header">
                   <div className="chat-overlay-title">
                     {notes.find((n) => n.chatId === overlayChatId)?.title ||
-                      sortedSessions.find((s) => s.chat_id === overlayChatId)?.title ||
+                      visibleSessions.find((s) => s.chat_id === overlayChatId)?.title ||
                       overlayChatId}
                   </div>
                   <button

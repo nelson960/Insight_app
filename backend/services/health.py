@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
 import logging
 import sqlite3
 import sys
@@ -10,11 +12,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from backend.core.workspace import Workspace, get_workspace
-from backend.api.chat_router_loader import (
-    chat_router_error,
-    chat_router_loading,
-    chat_router_ready,
-)
 
 logger = logging.getLogger(__name__)
 _startup_health_lock = threading.Lock()
@@ -74,7 +71,7 @@ def clear_startup_health_cache() -> None:
         _startup_health_cached_at = None
 
 
-def _read_settings_quick(db_path: Path, *, timeout_ms: int = 250) -> tuple[str, Any, Any, Optional[str]]:
+def _read_settings_quick(db_path: Path, *, timeout_ms: int = 5000) -> tuple[str, Any, Any, Optional[str]]:
     model_path = ""
     ctx_size = None
     gpu_layers = None
@@ -113,6 +110,43 @@ def _read_settings_quick(db_path: Path, *, timeout_ms: int = 250) -> tuple[str, 
         if "unable to open database file" in err:
             return model_path, ctx_size, gpu_layers, None
         return model_path, ctx_size, gpu_layers, err
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _read_model_record_quick(
+    db_path: Path,
+    *,
+    key: str = "llm_model_record_json",
+    timeout_ms: int = 250,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not db_path.exists():
+        return None, None
+    conn: sqlite3.Connection | None = None
+    try:
+        timeout = max(0.0, float(timeout_ms) / 1000.0)
+        db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, timeout=timeout)
+        conn.execute(f"PRAGMA busy_timeout={int(timeout_ms)}")
+        row = conn.execute("SELECT value_json FROM app_settings WHERE key=?", (key,)).fetchone()
+        if not row or row[0] is None:
+            return None, None
+        try:
+            raw = json.loads(row[0])
+            return raw if isinstance(raw, dict) else None, None
+        except Exception:
+            return None, None
+    except sqlite3.Error as exc:
+        err = str(exc)
+        if "no such table" in err:
+            return None, None
+        if "unable to open database file" in err:
+            return None, None
+        return None, err
     finally:
         if conn is not None:
             try:
@@ -164,7 +198,13 @@ def run_startup_health_fast() -> Dict[str, Any]:
 
     model_path, ctx_size, gpu_layers, settings_error = _read_settings_quick(ws.db)
     if settings_error:
-        if "locked" not in settings_error.lower():
+        # Treat "disk I/O error" as a transient lock error (SQLite returns this for timeout/lock issues)
+        is_lock_error = (
+            "locked" in settings_error.lower() or
+            "disk I/O error" in settings_error or
+            "database is locked" in settings_error.lower()
+        )
+        if not is_lock_error:
             issues.append(
                 _issue(
                     "settings_unreadable",
@@ -177,6 +217,22 @@ def run_startup_health_fast() -> Dict[str, Any]:
 
     checks["llm_ctx_size"] = ctx_size
     checks["llm_gpu_layers"] = gpu_layers
+
+
+    try:
+        threshold = int(os.environ.get("INSIGHT_GPU_LAYER_WARNING_THRESHOLD", "35"))
+    except Exception:
+        threshold = 35
+    if platform.system() == "Darwin" and isinstance(gpu_layers, int) and gpu_layers > threshold:
+        issues.append(
+            _issue(
+                "gpu_layers_too_high",
+                "warning",
+                f"GPU layers set to {gpu_layers}, which may cause instability on macOS Metal.",
+                f"Try reducing GPU layers to {threshold} or lower in Settings → Model.",
+            )
+        )
+        logger.warning("Health check: High GPU layer count (%d) may cause crashes", gpu_layers)
 
     model_path = (model_path or "").strip()
     model_ready = False
@@ -227,44 +283,41 @@ def run_startup_health_fast() -> Dict[str, Any]:
         else:
             model_ready = True
 
-    try:
-        checks["chat_router_ready"] = chat_router_ready()
-        checks["chat_router_loading"] = chat_router_loading()
-        chat_err = chat_router_error()
-        if chat_err:
-            checks["chat_router_error"] = chat_err
-    except Exception:
-        checks["chat_router_ready"] = False
     if model_ready:
-        if checks.get("chat_router_error"):
+        from backend.services.llama_templates import MODEL_VALIDATION_VERSION, compute_model_fingerprint
+
+        record, record_error = _read_model_record_quick(ws.db)
+        record_ok: Optional[bool] = None
+        if record_error:
+            if "locked" in record_error.lower():
+                # Transient lock: do not surface a hard error in fast health.
+                record_ok = None
+            else:
+                logger.warning("Health check model record read failed: %s", record_error)
+        if record_ok is None and isinstance(record, dict):
+            try:
+                record_ok = (
+                    record.get("accepted") is True
+                    and str(record.get("path") or "") == str(Path(model_path).expanduser())
+                    and str(record.get("validation_version") or "") == MODEL_VALIDATION_VERSION
+                    and str(record.get("model_id") or "") == compute_model_fingerprint(Path(model_path).expanduser())
+                )
+            except Exception:
+                record_ok = False
+        checks["model_record_valid"] = record_ok
+        if record_ok is False:
             issues.append(
                 _issue(
-                    "chat_router_failed",
+                    "model_validation_required",
                     "error",
-                    "Chat engine failed to start.",
-                    "Restart Insight. If it persists, re-apply the model in Settings.",
+                    "Model validation is required before use.",
+                    "Open Settings → Model and re-apply the GGUF file.",
                     action="open_settings",
                 )
             )
-        elif checks.get("chat_router_loading"):
-            issues.append(
-                _issue(
-                    "chat_router_loading",
-                    "warning",
-                    "Chat engine is warming up.",
-                    "Keep Insight open and try again in a few seconds.",
-                )
-            )
-        elif checks.get("chat_router_ready") is False:
-            issues.append(
-                _issue(
-                    "chat_router_not_ready",
-                    "warning",
-                    "Chat engine is not ready yet.",
-                    "Restart Insight. If it persists, re-apply the model in Settings.",
-                    action="open_settings",
-                )
-            )
+
+    if model_ready:
+        checks["chat_router_ready"] = True
 
     embed_base = _resolve_embed_dir_fast(ws)
     embed_ok = bool((embed_base / "tokenizer.json").exists() and (embed_base / "onnx" / "model.onnx").exists())
@@ -272,10 +325,14 @@ def run_startup_health_fast() -> Dict[str, Any]:
     checks["embedding_path"] = str(embed_base)
     download_state = get_download_state()
     download_status = download_state.get("status")
+    download_error = download_state.get("error")
+    if download_status == "error" and download_error == "Download cancelled.":
+        download_status = "idle"
+        download_error = None
     if not embed_ok and download_status == "ready":
         download_status = "idle"
     checks["embedding_download_status"] = download_status
-    checks["embedding_download_error"] = download_state.get("error")
+    checks["embedding_download_error"] = download_error
     if not embed_ok and download_status != "downloading":
         issues.append(
             _issue(
@@ -344,7 +401,7 @@ def run_startup_health() -> Dict[str, Any]:
     ws = get_workspace()
     from backend.api.deps import AppDependencies
     from backend.services.connectors.nomic import get_download_state
-    from backend.services.gguf_metadata import detect_chat_template_kind, is_gguf
+    from backend.services.gguf_metadata import is_gguf, read_gguf_string_kv
     from backend.services.security.key_manager import KeyManager
 
     # Storage writability check.
@@ -446,59 +503,47 @@ def run_startup_health() -> Dict[str, Any]:
                 )
             )
         else:
-            template_kind = detect_chat_template_kind(p)
-            checks["model_chat_template_kind"] = template_kind
-            if template_kind not in {"chatml", "llama3"}:
+            template = read_gguf_string_kv(p, "tokenizer.chat_template")
+            checks["model_chat_template_kind"] = "embedded" if template else "missing"
+            if not template:
                 issues.append(
                     _issue(
-                        "model_template_unsupported",
+                        "model_template_missing",
                         "error",
-                        "The model chat template is not supported.",
-                        "Choose a GGUF with a ChatML or Llama-3 chat template.",
+                        "The model does not include an embedded chat template.",
+                        "Choose a GGUF with an embedded chat template.",
                         action="open_settings",
                     )
-                    )
+                )
             else:
                 model_ready = True
 
-    try:
-        checks["chat_router_ready"] = chat_router_ready()
-        checks["chat_router_loading"] = chat_router_loading()
-        chat_err = chat_router_error()
-        if chat_err:
-            checks["chat_router_error"] = chat_err
-    except Exception:
-        checks["chat_router_ready"] = False
     if model_ready:
-        if checks.get("chat_router_error"):
+        from backend.services.llama_templates import model_record_is_current
+
+        record, record_error = _read_model_record_quick(ws.db, timeout_ms=500)
+        record_ok: Optional[bool] = None
+        if record_error:
+            if "locked" in record_error.lower():
+                record_ok = None
+            else:
+                logger.warning("Health check model record read failed: %s", record_error)
+        if record_ok is None:
+            record_ok = model_record_is_current(record, Path(model_path).expanduser())
+        checks["model_record_valid"] = record_ok
+        if record_ok is False:
             issues.append(
                 _issue(
-                    "chat_router_failed",
+                    "model_validation_required",
                     "error",
-                    "Chat engine failed to start.",
-                    "Restart Insight. If it persists, re-apply the model in Settings.",
+                    "Model validation is required before use.",
+                    "Open Settings → Model and re-apply the GGUF file.",
                     action="open_settings",
                 )
             )
-        elif checks.get("chat_router_loading"):
-            issues.append(
-                _issue(
-                    "chat_router_loading",
-                    "warning",
-                    "Chat engine is warming up.",
-                    "Keep Insight open and try again in a few seconds.",
-                )
-            )
-        elif checks.get("chat_router_ready") is False:
-            issues.append(
-                _issue(
-                    "chat_router_not_ready",
-                    "warning",
-                    "Chat engine is not ready yet.",
-                    "Restart Insight. If it persists, re-apply the model in Settings.",
-                    action="open_settings",
-                )
-            )
+
+    if model_ready:
+        checks["chat_router_ready"] = True
 
     # Embedding assets presence (documents will not ingest without them).
     embed_base = AppDependencies.nomic_model_dir()
@@ -507,10 +552,14 @@ def run_startup_health() -> Dict[str, Any]:
     checks["embedding_path"] = str(embed_base)
     download_state = get_download_state()
     download_status = download_state.get("status")
+    download_error = download_state.get("error")
+    if download_status == "error" and download_error == "Download cancelled.":
+        download_status = "idle"
+        download_error = None
     if not embed_ok and download_status == "ready":
         download_status = "idle"
     checks["embedding_download_status"] = download_status
-    checks["embedding_download_error"] = download_state.get("error")
+    checks["embedding_download_error"] = download_error
     if not embed_ok and download_status != "downloading":
         issues.append(
             _issue(

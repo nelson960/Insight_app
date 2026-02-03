@@ -249,15 +249,22 @@ async def chat_stream(websocket: WebSocket):
     def _producer() -> None:
         try:
             for chunk in stream:
-                asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result()
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                except RuntimeError:
+                    # Event loop likely closed; stop producing.
+                    break
         except Exception as exc:
             logger.exception("Streaming planner error")
-            asyncio.run_coroutine_threadsafe(
-                queue.put({"event": "error", "detail": str(exc)}),
-                loop,
-            ).result()
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, {"event": "error", "detail": str(exc)})
+            except RuntimeError:
+                pass
         finally:
-            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+            except RuntimeError:
+                pass
 
     threading.Thread(target=_producer, daemon=True).start()
 
@@ -287,15 +294,23 @@ def _run_planner(payload: dict):
     service = AppDependencies.planner_service()
     req = _build_request(payload)
     logger.info(
-        "chat _run_planner chat=%s stream=%s docs=%d",
+        "chat _run_planner chat=%s stream=%s docs=%d skip_user=%s target_ast=%s",
         req.chat_id,
         payload.get("stream", True),
         len(req.documents or []) if hasattr(req, "documents") else 0,
+        req.skip_user_message,
+        req.target_assistant_id,
     )
     # Default to streaming unless explicitly disabled.
     if payload.get("stream", True):
         logger.info("chat streaming start chat=%s", req.chat_id)
-        blocking_stream = service.stream_request(req)
+        try:
+            blocking_stream = service.stream_request(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed to start streaming planner")
+            raise HTTPException(status_code=500, detail=str(exc))
 
         async def token_streamer():
             queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -331,7 +346,13 @@ def _run_planner(payload: dict):
 
         return StreamingResponse(token_streamer(), media_type="text/plain")
 
-    result = service.handle_request(req)
+    try:
+        result = service.handle_request(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Chat request failed")
+        raise HTTPException(status_code=500, detail=str(exc))
     resp: Dict[str, Any] = {"answer": result.answer}
     include_ctx = payload.get("include_context_status")
     if include_ctx:
@@ -360,6 +381,66 @@ def context_status(chat_id: str):
     except ValueError:
         raise HTTPException(status_code=404, detail="Chat not found")
     return status
+
+
+@router.post("/messages/edit")
+def edit_message(payload: Dict[str, Any] = Body(...)):
+    chat_id = payload.get("chat_id")
+    message_id = payload.get("message_id")
+    new_text = payload.get("content")
+    if new_text is None:
+        new_text = payload.get("text")
+
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        raise HTTPException(status_code=400, detail="chat_id is required")
+    if not isinstance(message_id, str) or not message_id.strip():
+        raise HTTPException(status_code=400, detail="message_id is required")
+    if not isinstance(new_text, str) or not new_text.strip():
+        raise HTTPException(status_code=400, detail="content is required")
+
+    chat_id = chat_id.strip()
+    message_id = message_id.strip()
+    new_text = new_text.strip()
+
+    store = AppDependencies.sqlite_store()
+    row = store.get_message_with_chat(message_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="message not found")
+    if row.get("chat_id") != chat_id:
+        raise HTTPException(status_code=400, detail="message does not belong to chat")
+    if row.get("role") != "user":
+        raise HTTPException(status_code=400, detail="only user messages can be edited")
+
+    content_json = row.get("content_json") or ""
+    payload_json: Dict[str, Any] = {}
+    try:
+        if content_json:
+            decoded = json.loads(content_json)
+            if isinstance(decoded, dict):
+                payload_json = decoded
+            else:
+                payload_json = {"text": str(decoded)}
+    except Exception:
+        payload_json = {"text": content_json}
+
+    payload_json["text"] = new_text
+    store.update_message_content(message_id, json.dumps(payload_json, ensure_ascii=False))
+
+    truncated = 0
+    if bool(payload.get("truncate_after", True)):
+        truncated = store.delete_messages_after(message_id)
+
+    resynced = False
+    if bool(payload.get("resync_kv", True)):
+        try:
+            mgr = AppDependencies.session_manager()
+            messages = store.fetch_messages_for_chat(chat_id)
+            mgr.seed_session_messages(chat_id, messages=messages)
+            resynced = True
+        except Exception as exc:
+            logger.warning("Failed to resync KV for chat=%s msg=%s: %s", chat_id, message_id, exc)
+
+    return {"ok": True, "truncated": truncated, "resynced": resynced}
 
 @router.post("/branch")
 def branch_chat(payload: Dict[str, Any] = Body(...)):
@@ -637,6 +718,9 @@ def _build_request(payload: Dict[str, Any]) -> PlannerRequest:
             selection=selection,
             screenshot=payload.get("screenshot"),
             request_id=payload.get("request_id"),
+            skip_user_message=bool(payload.get("skip_user_message")),
+            target_assistant_id=payload.get("target_assistant_id"),
+            user_message_id=payload.get("user_message_id") if isinstance(payload.get("user_message_id"), str) else None,
         )
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=f"Missing field {exc.args[0]}") from exc

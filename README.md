@@ -11,17 +11,30 @@
 - Built-in safeguards: **RAG-ready gating (HTTP 409)** + **ephemeral "CONTEXT PACK" injection** to prevent context pollution
 - Fast resume: **KV-cache snapshots** persisted per chat to avoid prompt replay
 
+## Value Proposition
 
+Insight is a **local research workspace**, not just a chat UI.  
+It’s built for **parallel thinking** (cards + links), **strict grounding** (selection‑first + scope control),  
+and **clean context** (one‑time CONTEXT PACK + KV resume) so answers stay tight and explainable.
 
 ## Tech Stack
 
 Tauri (Rust) • React/TypeScript • FastAPI (IPC-only) • llama.cpp (GGUF) • Qdrant • ONNX Runtime (Nomic embeddings) • SQLite • Local HTTP inference API (llama.cpp-based)
 
-## Highlights 
+## Highlights
 
 - **Systems + ML:** retrieval quality ↔ latency/memory tradeoffs, context budgeting, multi-session KV cache
 - **Applied research:** failure modes + mitigation (scope control, compaction drift, large-file fallback)
 - **Production awareness:** isolation across chats/files (chat_id/file_id scoping), IPC-only backend, cancellation via native aborts
+
+Recent hardening fixes after a full review:
+
+- **SQLite safety:** thread‑local connections to prevent cross‑thread corruption
+- **Upload safety:** size enforcement before read + concurrency backpressure
+- **Ingestion reliability:** cancellation race fixed; jobs now respect cancel signals
+- **LLM stability:** generation timeouts + abort callback to avoid hangs
+- **IPC security:** allowlist path normalization to prevent traversal
+- **Lifecycle sanity:** app‑scoped dependency container + clean shutdown hooks
 
 ## Demo
 
@@ -44,7 +57,6 @@ Tauri (Rust) • React/TypeScript • FastAPI (IPC-only) • llama.cpp (GGUF) �
 </p>
 <p align="center"><b>Settings: local Raw API server running on localhost</b></p>
 
-
 ## Product Features
 
 - Selection-first + document-grounded QA: highlight text from files or model responses to ask follow-ups with precise grounding; supports focused/all-doc scope and compare mode.
@@ -55,16 +67,41 @@ Tauri (Rust) • React/TypeScript • FastAPI (IPC-only) • llama.cpp (GGUF) �
 
 ---
 
+## Canvas Workspace (Card-Based UI)
+
+Insight’s canvas is a **spatial workspace** built around **cards**. Each card is an independent chat + document context you can place on the board, so you can branch ideas without losing state.
+
+- **Card = workspace:** a single card pairs chat with focused documents for that thread.
+- **Linked cards:** visually connect cards to show how ideas branch or relate.
+- **Parallel threads:** keep multiple investigations open side‑by‑side without mixing context.
+- **Context isolation:** each card maintains its own conversation state and context budget.
+
+This is designed for research and analysis workflows where you want to explore multiple directions in parallel while keeping grounding tight per card.
+
+---
+
+## Beyond Retrieval
+
+Insight is RAG‑enabled, but it’s designed as a **local, stateful workspace** rather than a single retrieval pipeline:
+
+- **Canvas‑native workflow:** cards represent parallel investigative threads, not a single chat stream.
+- **Session state + KV snapshots:** per‑chat llama.cpp state is persisted for fast resume (not just re‑prompting).
+- **Context policy:** retrieved chunks are injected as a one‑time **CONTEXT PACK**, never saved to history.
+- **Dual access paths:** full desktop RAG via IPC + a separate local HTTP API for raw, stateless inference.
+- **Scope control:** focused vs all‑documents retrieval is first‑class in the UI, not a hidden backend toggle.
+
+RAG is one ingredient; the product is a **local research workspace** with persistent state, branching, and strict context hygiene.
+
+---
 
 ## Results (Local Hardware)
 
 ### Latency
 
-| Metric | Target | Hardware | Model | Notes |
-|--------|--------|----------|-------|------|
-| TTFT | sub-second TTFT (tuning-dependent)| Apple M1/M2 | Qwen2.5 7B Q4_K_M | GPU layers enabled, 8K ctx |
-| tok/s | >35/s | Apple M1/M2 | Qwen2.5 7B Q4_K_M | |
-
+| Metric | Target                             | Hardware    | Model             | Notes                      |
+| ------ | ---------------------------------- | ----------- | ----------------- | -------------------------- |
+| TTFT   | sub-second TTFT (tuning-dependent) | Apple M1/M2 | Qwen2.5 7B Q4_K_M | GPU layers enabled, 8K ctx |
+| tok/s  | >35/s                              | Apple M1/M2 | Qwen2.5 7B Q4_K_M |                            |
 
 ### Retrieval Behavior
 
@@ -81,16 +118,19 @@ Tauri (Rust) • React/TypeScript • FastAPI (IPC-only) • llama.cpp (GGUF) �
 ### Qualitative Examples
 
 **Success case (focused mode):**
+
 - **Query:** "What is the return policy for electronics?"
 - **Context:** User viewing "returns-policy.pdf" in documents pane
 - **Result:** Correct answer extracted from focused document
 
 **Success case (multi-hop with scope):**
+
 - **Query:** "Compare the revenue growth mentioned in the Q2 report with the projections from the strategic plan"
 - **Context:** User switches to "all-documents" scope
 - **Result:** System retrieves from both documents, enabling cross-document synthesis
 
 **Failure case (context overflow):**
+
 - **Query:** Long conversation history + large retrieved chunks
 - **Behavior:** Automatic compaction summarizes earlier turns; retrieved context trimmed head-first
 - **Observation:** Summarizer occasionally loses nuanced details from early conversation
@@ -117,22 +157,28 @@ All inference, embeddings, and retrieval run locally. No document contents are s
 ## Key Technical Ideas
 
 - **Dual-access LLM architecture:** Same swappable GGUF model layer accessible via (1) IPC for desktop app with full RAG, (2) HTTP API for external tools
-- **Hot-swappable models:** Change `INSIGHT_ENGINE_MODEL_PATH` → both interfaces immediately use new model; any GGUF format works
+- **Drop‑in models (GGUF):** Works with any GGUF that embeds a valid chat template. No hard‑coded templates per model.
 - **Clean KV architecture:** Retrieved chunks injected as one-time **CONTEXT PACK**, never persisted to chat history → reduces cross-turn contamination
 - **KV session snapshotting:** llama.cpp state serialized per chat → instant resume without replaying prompts
 - **RAG-ready enforcement:** `/chat` returns **HTTP 409** until embeddings/indexing complete → reduces low-quality answers during ingestion (observed in early prototypes)
 - **Scope-aware retrieval:** Focused vs all-documents mode tied to UI state → enables multi-document queries when user selects broader scope
 - **Raw-file fallback:** ripgrep-based line search for large text/log files without ingestion overhead
 
+## System Prompt Policy (Why “No System Info”)
+
+Insight does **not** rely on a heavy, permanent system prompt. Instead:
+
+- **Model templates come from GGUF metadata** (minja renderer) — no hardcoded template strings.
+- **Per‑turn instructions** (RAG rules, evidence policy, and selection context) are injected as an **ephemeral CONTEXT PACK** and never persisted in chat history.
+- This keeps **model behavior consistent across different GGUFs** and avoids system‑prompt drift during compaction.
+
 ---
 
 ## Project Status
 
 **Current state:** Production-ready onedir build for macOS (Apple Silicon)
-
 **Supported:** macOS (Apple Silicon ARM64)
 **Distribution:** Standalone .app bundle (no installer required)
-
 **Demo:** [Add GIF/Loom/screenshot here showing chat streaming + doc focus switch]
 
 ---
@@ -149,74 +195,71 @@ Both paths share the same GGUF model layer, enabling **hot-swappable models** vi
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          GGUF Model Layer (Swappable)                       │
-│                                                                              │
-│   Any GGUF format model (Qwen2.5 7B, Llama 3.1 8B, Mistral 7B, etc.)       │
-│   ↓                                                                          │
-│   llama.cpp (quantized inference: Q4_K_M, Q5_K_M, etc.)                     │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                    Dual Access Paths                               │   │
-│   ├─────────────────────────────────────┬───────────────────────────────┤   │
-│   │  Path 1: Internal IPC (with RAG)    │  Path 2: Local HTTP API      │   │
-│   │                                     │                               │   │
-│   │  ┌─────────────────────────────┐   │  ┌─────────────────────────┐  │   │
-│   │  │ Tauri Desktop Shell        │   │  │ Raw Engine Server        │  │   │
-│   │  │ (Rust IPC orchestration)   │   │  │ (localhost:11435)        │  │   │
-│   │  └──────────┬──────────────────┘   │  │ Local llama.cpp API      │  │   │
-│   │             │                      │  │ /chat (text generation)  │  │   │
-│   │             ▼                      │  │ /embeddings (optional)    │  │   │
-│   │  ┌─────────────────────────────┐   │  │ Model-agnostic           │  │   │
-│   │  │ React Frontend (TypeScript) │   │  │ (any GGUF works)         │  │   │
-│   │  │ Canvas + Chat + Docs        │   │  │ Swappable via env var    │  │   │
-│   │  └──────────┬──────────────────┘   │  └──────────┬──────────────┘  │   │
-│   │             │                      │             │                  │   │
-│   │             ▼                      │             ▼                  │   │
-│   │  ┌─────────────────────────────┐   │  ┌─────────────────────────┐  │   │
-│   │  │ Python Engine (FastAPI)     │   │  │ FastAPI HTTP Server     │  │   │
-│   │  │ IPC-only (x-insight-ipc)    │   │  │ (uvicorn)               │  │   │
-│   │  └──────────┬──────────────────┘   │  └──────────┬──────────────┘  │   │
-│   │             │                      │             │                  │   │
-│   │             ▼                      │             │                  │   │
-│   │  ┌─────────────────────────────┐   │             │                  │   │
-│   │  │ Orchestrator (Planner)      │   │             │                  │   │
-│   │  │ - RAG pipeline              │   │             │                  │   │
-│   │  │ - Scope control             │   │             │                  │   │
-│   │  │ - Context budgeting         │   │             │                  │   │
-│   │  │ - Compaction                │   │             │                  │   │
-│   │  └──────────┬──────────────────┘   │             │                  │   │
-│   │             │                      │             │                  │   │
-│   │  ┌──────────┴────────────────┐     │             │                  │   │
-│   │  │ Retrieval Layer            │     │             │                  │   │
-│   │  │ - Qdrant (dense, K=12)     │     │             │                  │   │
-│   │  │ - Lexical fallback         │     │             │                  │   │
-│   │  │ - Raw file server (ripgrep)│     │             │                  │   │
-│   │  └──────────┬────────────────┘     │             │                  │   │
-│   │             │                      │             │                  │   │
-│   │  ┌──────────┴────────────────┐     │             │                  │   │
-│   │  │ LlamaSessionManager        │     │             │                  │   │
-│   │  │ - Multi-session KV cache   │     │             │                  │   │
-│   │  │ - Snapshot/restore         │     │             │                  │   │
-│   │  │ - Prompt rendering         │     │             │                  │   │
-│   │  └──────────┬────────────────┘     │             │                  │   │
-│   └─────────────┼──────────────────────┘             │                  │   │
-│                 │                                    │                  │   │
-│                 └────────────┬───────────────────────┘                  │   │
-│                              ▼                                        │   │
-│                    ┌─────────────────────┐                             │   │
-│                    │   llama.cpp         │                             │   │
-│                    │   (GGUF models)     │◄───── Swappable via:        │   │
-│                    └─────────────────────┘      INSIGHT_ENGINE_MODEL_PATH│   │
+│   Any GGUF model (Qwen2.5, Llama 3.1, Mistral, DeepSeek, GPT‑OSS, etc.)      │
 └─────────────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Local Storage (~/.insight/)                │
-│  - SQLite (messages, files, metadata)                        │
-│  - Qdrant (vector embeddings, insight_chunks, insight_memories)│
-│  - KV Sessions (llama.cpp state snapshots)                   │
-│  - ONNX models (Nomic Embed Text v1.5)                       │
-│  - Engine logs (raw_engine_server requests)                  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           llama.cpp (KV + inference)                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+          ▲                                       ▲
+          │                                       │
+┌─────────┴───────────────┐              ┌─────────┴─────────────────────────┐
+│ Path 1: Desktop IPC      │              │ Path 2: Local HTTP API            │
+│ (full RAG + UI)          │              │ Raw Engine Server (127.0.0.1)     │
+└─────────┬───────────────┘              └─────────┬─────────────────────────┘
+          │                                       │
+┌─────────▼──────────────────────────────────────┐ │
+│ Desktop UI (Tauri + React)                     │ │
+│  - ChatWindow, DocumentsPane, SettingsModal    │ │
+│  - State: chatUiStore (Zustand)                │ │
+│  - API: engine.ts (IPC client wrappers)        │ │
+└─────────┬──────────────────────────────────────┘ │
+          │ Tauri IPC Commands (JSON over stdio)    │
+┌─────────▼──────────────────────────────────────┐ │
+│ Rust Tauri Layer (lib.rs, engine.rs)           │ │
+│  - EngineProcess spawns Python sidecar         │ │
+│  - StdoutRouter routes by request_id           │ │
+│  - Direct SQLite access for session listing    │ │
+└─────────┬──────────────────────────────────────┘ │
+          │ stdin/stdout (JSON lines)               │
+┌─────────▼──────────────────────────────────────┐ │
+│ Python Engine (engine.py - IPC wrapper)         │ │
+│  - RequestManager (anyio TaskGroup)             │ │
+│  - StdoutWriter (thread-safe JSON)              │ │
+│  - IPC allowlist enforcement                    │ │
+└─────────┬──────────────────────────────────────┘ │
+          │ FastAPI HTTP (ASGI)                    │
+┌─────────▼──────────────────────────────────────┐ │
+│ FastAPI Application (app.py)                   │ │
+│  - x-insight-ipc header check                   │ │
+│  - Routers: chat, files, settings, docs, search │ │
+│  - Dependency container bound per app           │ │
+└─────────┬──────────────────────────────────────┘ │
+          │                                       │
+          │                    ┌──────────────────▼──────────────────────┐
+          │                    │ Raw Engine HTTP (uvicorn)               │
+          │                    │  - /chat (text generation)              │
+          │                    │  - /embeddings (optional)               │
+          │                    └─────────────────────────────────────────┘
+          │
+┌─────────▼──────────────────────────────────────────────────────────────────┐
+│ Ingestion + Planning + Storage                                              │
+│  - Scheduler, Extractors, Chunker, Embedder                                 │
+│  - Orchestrator (scope control, context budgeting, compaction)              │
+│  - Retrieval (Qdrant dense + lexical + raw large-file windows)              │
+│  - LlamaSessionManager (multi-session KV, snapshot/restore, rendering)      │
+│  - Storage: SQLite, Qdrant, Files (disk)                                    │
+└─────────┬──────────────────────────────────────────────────────────────────┘
+          │
+┌─────────▼─────────────────────────────────────────────────────────────┐
+│ Local Storage (~/.insight/)                                            │
+│  - SQLite (messages, files, metadata)                                  │
+│  - Qdrant (vector embeddings, insight_chunks, insight_memories)        │
+│  - KV Sessions (llama.cpp state snapshots)                             │
+│  - ONNX models (Nomic Embed Text v1.5)                                 │
+│  - Engine logs (raw_engine_server requests)                            │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -263,6 +306,7 @@ The **raw engine server** provides Path 2 access to the swappable local LLM back
 <summary>Usage examples</summary>
 
 **Basic chat completion:**
+
 ```bash
 curl http://127.0.0.1:11435/chat \
   -H "Content-Type: application/json" \
@@ -274,6 +318,7 @@ curl http://127.0.0.1:11435/chat \
 ```
 
 **Streaming:**
+
 ```bash
 curl http://127.0.0.1:11435/chat \
   -H "Content-Type: application/json" \
@@ -285,6 +330,7 @@ curl http://127.0.0.1:11435/chat \
 ```
 
 **Switching models:**
+
 ```bash
 # Stop server in Settings UI
 export INSIGHT_ENGINE_MODEL_PATH=/path/to/qwen2.5-7b.gguf
@@ -307,6 +353,7 @@ export INSIGHT_ENGINE_MODEL_PATH=/path/to/qwen2.5-7b.gguf
 <summary>Storage layout (~/.insight)</summary>
 
 All data is stored under `~/.insight/`:
+
 - `db.sqlite`: User messages, file metadata, chat-file associations
 - `qdrant/`: Vector database (collections: `insight_chunks`, `insight_memories`)
 - `kv_sessions/`: llama.cpp KV cache snapshots per chat
@@ -315,7 +362,6 @@ All data is stored under `~/.insight/`:
 - `logs/`: Application logs
 
 </details>
-
 
 ---
 
@@ -356,7 +402,6 @@ INSIGHT_WORKSPACE_DIR=~/.insight-dev python backend/engine.py
 ```
 
 ---
-
 
 ## License
 

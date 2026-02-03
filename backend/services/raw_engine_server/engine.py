@@ -14,6 +14,12 @@ except Exception as exc:  # pragma: no cover
     raise RuntimeError("llama_cpp is required for raw engine.") from exc
 
 from backend.services.connectors.nomic_onnx import NomicOnnxConfig, NomicOnnxEmbedTextConnector
+from backend.services.llama_templates import (
+    apply_chat_template_minja,
+    chat_template_error_message,
+    normalize_messages_for_template,
+    validate_chat_template_for_llm,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +28,7 @@ class RawEngine:
     _PROMPT_RENDERER_LLAMA3 = "llama3"
     _PROMPT_RENDERER_CHATML = "chatml"
     _PROMPT_RENDERER_UNKNOWN = "unknown"
-    _DEFAULT_SYSTEM_PROMPT = "You are Insight, a local privacy-first AI assistant."
+    _DEFAULT_SYSTEM_PROMPT = ""
     _DEFAULT_TEMPERATURE = 0.7
     _DEFAULT_TOP_P = 0.9
     _DEFAULT_TOP_K = 40
@@ -48,9 +54,19 @@ class RawEngine:
 
         self.llm = Llama(**kwargs)
         self.ctx_size = self._resolve_ctx_size(config.ctx_size)
-        self.prompt_renderer = self._detect_prompt_renderer_id()
-        if self.prompt_renderer == self._PROMPT_RENDERER_UNKNOWN:
-            raise ValueError("Unsupported chat template for this model.")
+        tpl_result = validate_chat_template_for_llm(
+            self.llm,
+            model_path=self.config.model_path,
+            require_chat_template=True,
+            reject_multimodal=True,
+        )
+        if not tpl_result.ok:
+            raise ValueError(chat_template_error_message(tpl_result.reason))
+        self._chat_template = tpl_result.template
+        self._chat_template_name = tpl_result.template_name or "default"
+        self._stop_token_texts = list(tpl_result.stop_token_texts or [])
+        self._stop_token_ids = list(tpl_result.stop_token_ids or [])
+        self.prompt_renderer = f"minja:{self._chat_template_name}"
         self.model_info = self._build_model_info()
 
     def _resolve_ctx_size(self, requested: Optional[int]) -> int:
@@ -83,15 +99,124 @@ class RawEngine:
             meta = getattr(self.llm, "metadata", {}) or {}
         except Exception:
             meta = {}
+        def _meta_str(key: str) -> str:
+            try:
+                val = meta.get(key)
+                return "" if val is None else str(val)
+            except Exception:
+                return ""
+
+        def _meta_int(key: str) -> Optional[int]:
+            try:
+                val = meta.get(key)
+                if val is None:
+                    return None
+                return int(val)
+            except Exception:
+                return None
+
+        def _meta_int_suffix(suffixes: List[str]) -> Optional[int]:
+            for key, value in meta.items():
+                if not isinstance(key, str):
+                    continue
+                if not any(key.endswith(sfx) for sfx in suffixes):
+                    continue
+                if value is None:
+                    continue
+                try:
+                    return int(value)
+                except Exception:
+                    continue
+            return None
+
+        def _meta_str_suffix(suffixes: List[str]) -> str:
+            for key, value in meta.items():
+                if not isinstance(key, str):
+                    continue
+                if not any(key.endswith(sfx) for sfx in suffixes):
+                    continue
+                if value is None:
+                    continue
+                try:
+                    return str(value)
+                except Exception:
+                    continue
+            return ""
+
+        def _meta_float_suffix(suffixes: List[str]) -> Optional[float]:
+            for key, value in meta.items():
+                if not isinstance(key, str):
+                    continue
+                if not any(key.endswith(sfx) for sfx in suffixes):
+                    continue
+                try:
+                    return float(value)
+                except Exception:
+                    continue
+            return None
+
+        meta_arch = _meta_str("general.architecture")
+        meta_name = _meta_str("general.name")
+        meta_basename = _meta_str("general.basename")
+        meta_size = _meta_str("general.size_label")
+        meta_file_type = _meta_int("general.file_type")
+        meta_quant_ver = _meta_int("general.quantization_version")
+
+        n_layer = _meta_int_suffix([".block_count"])
+        n_head = _meta_int_suffix([".attention.head_count"])
+        n_head_kv = _meta_int_suffix([".attention.head_count_kv"])
+        n_embd = _meta_int_suffix([".embedding_length"])
+        rope_type = _meta_str_suffix([".rope.type", ".rope.scaling.type"])
+        rope_freq_base = _meta_float_suffix([".rope.freq_base"])
+
+        ctx_train: Optional[int] = None
+        try:
+            ctx_train = int(self.llm._model.n_ctx_train())  # type: ignore[attr-defined]
+        except Exception:
+            ctx_train = _meta_int_suffix([".context_length"])
+
+        tok_model = _meta_str("tokenizer.ggml.model") or _meta_str("tokenizer.ggml.pre")
+        add_bos = _meta_str("tokenizer.ggml.add_bos_token")
+        bos_id = _meta_int("tokenizer.ggml.bos_token_id")
+        eos_id = _meta_int("tokenizer.ggml.eos_token_id")
+        vocab_size: Optional[int] = None
+        try:
+            vocab_size = int(self.llm.n_vocab())  # type: ignore[attr-defined]
+        except Exception:
+            vocab_size = _meta_int("tokenizer.ggml.tokens")
+
+        kv_cache_gib: Optional[float] = None
+        try:
+            if n_layer and n_head and n_head_kv and n_embd and self.ctx_size:
+                head_dim = max(1, int(n_embd // max(1, n_head)))
+                kv_bytes = 4 * n_layer * int(self.ctx_size) * n_head_kv * head_dim
+                kv_cache_gib = kv_bytes / (1024 ** 3)
+        except Exception:
+            kv_cache_gib = None
+
         return {
             "path": str(self.config.model_path),
-            "name": meta.get("general.name") or meta.get("general.basename") or self.config.model_path.name,
-            "architecture": meta.get("general.architecture"),
-            "file_type": meta.get("general.file_type"),
-            "quantization_version": meta.get("general.quantization_version"),
-            "ctx_train": meta.get("llama.context_length") or meta.get("qwen2.context_length"),
+            "name": meta_name or meta_basename or self.config.model_path.name,
+            "architecture": meta_arch or None,
+            "size_label": meta_size or None,
+            "file_type": meta_file_type,
+            "quantization_version": meta_quant_ver,
+            "ctx_train": ctx_train,
             "ctx_runtime": self.ctx_size,
+            "n_layer": n_layer,
+            "n_head": n_head,
+            "n_head_kv": n_head_kv,
+            "n_embd": n_embd,
+            "rope_type": rope_type or None,
+            "rope_freq_base": rope_freq_base,
+            "vocab_size": vocab_size,
+            "tokenizer_model": tok_model or None,
+            "add_bos_token": add_bos or None,
+            "bos_token_id": bos_id,
+            "eos_token_id": eos_id,
+            "kv_cache_gib": kv_cache_gib,
             "prompt_renderer": self.prompt_renderer,
+            "chat_template_name": str(getattr(self, "_chat_template_name", "") or "default"),
         }
 
     def acquire(self) -> bool:
@@ -173,14 +298,18 @@ class RawEngine:
         return "".join(out)
 
     def render_prompt(self, messages: Sequence[Dict[str, str]], *, add_generation_prompt: bool) -> str:
-        normalized = self._normalize_messages(messages)
-        if self.prompt_renderer == self._PROMPT_RENDERER_CHATML:
-            return self._render_chatml_prompt(normalized, add_generation_prompt=add_generation_prompt)
-        if self.prompt_renderer == self._PROMPT_RENDERER_LLAMA3:
-            return self._render_llama3_prompt(normalized, add_generation_prompt=add_generation_prompt)
-        raise ValueError("Unsupported chat template for this model.")
+        if not getattr(self, "_chat_template", None):
+            raise ValueError("Missing chat template for this model.")
+        normalized = normalize_messages_for_template(self._normalize_messages(messages))
+        return apply_chat_template_minja(
+            self._chat_template,
+            normalized,
+            add_generation_prompt=add_generation_prompt,
+        )
 
     def stop_markers(self) -> List[str]:
+        if getattr(self, "_stop_token_texts", None):
+            return list(self._stop_token_texts)
         if self.prompt_renderer == self._PROMPT_RENDERER_CHATML:
             return ["<|im_end|>", "<|endoftext|>"]
         return ["<|eot_id|>", "<|end_of_text|>"]
@@ -211,6 +340,7 @@ class RawEngine:
         k = int(top_k) if top_k is not None else self._DEFAULT_TOP_K
         penalty = float(repeat_penalty) if repeat_penalty is not None else self._DEFAULT_REPEAT_PENALTY
         return temp, p, max(0, k), penalty
+
 
     def create_completion(
         self,

@@ -61,7 +61,13 @@ type Props = {
   onFocusChat: (chatId: string) => void;
   onUpdateNote: (chatId: string, patch: Partial<CanvasNote>) => void;
   onOpenChat: (chatId: string) => void;
-  onCreateChatAt: (pos: { x: number; y: number }) => string;
+  onCreateChatAt: (
+    pos: { x: number; y: number },
+    opts?: {
+      bounds?: { w: number; h: number };
+      avoidZones?: Array<{ x: number; y: number; w: number; h: number }>;
+    }
+  ) => string;
   onOpenCard: (chatId: string) => void;
   onOpenSettings: () => void;
   onDeleteChat: (chatId: string) => void;
@@ -70,6 +76,11 @@ type Props = {
   onResetConfirmDelete: () => void;
   loadingSessions: boolean;
   dockVisible?: boolean;
+  onSpawnHint?: (hint: {
+    anchor: { x: number; y: number };
+    bounds?: { w: number; h: number };
+    avoidZones?: Array<{ x: number; y: number; w: number; h: number }>;
+  }) => void;
 };
 
 const MIN_SCALE = 0.35;
@@ -170,8 +181,10 @@ export function Canvas({
   onResetConfirmDelete,
   loadingSessions,
   dockVisible = true,
+  onSpawnHint,
 }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const dockRef = useRef<HTMLDivElement | null>(null);
   const [vp, setVp] = useState<Viewport>({ x: 0, y: 0, scale: 1 });
   const vpRef = useRef(vp);
   const [groupStackAnim, setGroupStackAnim] = useState<Record<string, GroupStackAnim>>({});
@@ -867,27 +880,77 @@ export function Canvas({
     }
   }
 
-  function createAtClient(clientX: number, clientY: number) {
+  function getDockAvoidZone(): { x: number; y: number; w: number; h: number } | null {
     const root = rootRef.current;
-    if (!root) return;
-    const rect = root.getBoundingClientRect();
+    const dock = dockRef.current;
+    if (!root || !dock) return null;
+    const rootRect = root.getBoundingClientRect();
+    const dockRect = dock.getBoundingClientRect();
     const { x, y, scale } = vpRef.current;
-    const mx = clientX - rect.left;
-    const my = clientY - rect.top;
-    const worldX = (mx - x) / scale;
-    const worldY = (my - y) / scale;
-    const created = onCreateChatAt({ x: worldX, y: worldY });
+    if (!scale) return null;
+    const pad = 12 / scale;
+    const worldX = (dockRect.left - rootRect.left - x) / scale - pad;
+    const worldY = (dockRect.top - rootRect.top - y) / scale - pad;
+    const worldW = dockRect.width / scale + pad * 2;
+    const worldH = dockRect.height / scale + pad * 2;
+    return { x: worldX, y: worldY, w: worldW, h: worldH };
+  }
+
+  function createAtWorld(worldX: number, worldY: number) {
+    const bw = boardRef.current.w;
+    const bh = boardRef.current.h;
+    const bounds = bw && bh ? { w: bw, h: bh } : undefined;
+    const avoidZone = getDockAvoidZone();
+    const created = onCreateChatAt(
+      { x: worldX, y: worldY },
+      bounds || avoidZone ? { bounds, avoidZones: avoidZone ? [avoidZone] : undefined } : undefined
+    );
     // Creating a card from the canvas should not immediately open it.
     // The user can click the card (or open from the Cards menu) when ready.
     void created;
   }
 
-  function createAtCenter() {
-    const root = rootRef.current;
-    if (!root) return;
-    const rect = root.getBoundingClientRect();
-    createAtClient(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  function topLeftAnchor() {
+    const viewW = viewRef.current.w;
+    const viewH = viewRef.current.h;
+    const { x, y, scale } = vpRef.current;
+    if (!viewW || !viewH || !scale) return;
+
+    const margin = 24;
+    const avoidZone = getDockAvoidZone();
+    let anchorX = -x / scale + margin;
+    let anchorY = -y / scale + margin;
+    if (avoidZone) {
+      anchorX = Math.max(anchorX, avoidZone.x + avoidZone.w + margin);
+      anchorY = Math.max(anchorY, avoidZone.y + margin);
+    }
+    return { x: anchorX, y: anchorY };
   }
+
+  function createNearDockButton() {
+    const anchor = topLeftAnchor();
+    if (!anchor) return;
+    createAtWorld(anchor.x, anchor.y);
+  }
+
+  useEffect(() => {
+    if (!onSpawnHint) return;
+    const viewW = viewRef.current.w;
+    const viewH = viewRef.current.h;
+    const { x, y, scale } = vpRef.current;
+    const bw = boardRef.current.w;
+    const bh = boardRef.current.h;
+    if (!viewW || !viewH || !scale) return;
+    const anchor = topLeftAnchor();
+    if (!anchor) return;
+    const bounds = bw && bh ? { w: bw, h: bh } : undefined;
+    const avoidZone = getDockAvoidZone();
+    onSpawnHint({
+      anchor,
+      bounds,
+      avoidZones: avoidZone ? [avoidZone] : undefined,
+    });
+  }, [onSpawnHint, vp.x, vp.y, vp.scale, board.w, board.h, chatListOpen]);
 
   const dpr = typeof window !== "undefined" && window.devicePixelRatio ? window.devicePixelRatio : 1;
   const renderX = Math.round(vp.x * dpr) / dpr;
@@ -963,14 +1026,14 @@ export function Canvas({
   }, [links, noteById, vp.scale, dpr, hiddenChatIds, effectiveGroupColorByChatId, fadingLinkToChatIds]);
 
   const dock = (
-    <div className="canvas-dock" onPointerDown={(e) => e.stopPropagation()}>
+    <div className="canvas-dock" ref={dockRef} onPointerDown={(e) => e.stopPropagation()}>
       <div className="canvas-dock-row">
         <button
           className="canvas-dock-btn"
           onClick={(e) => {
             e.preventDefault();
             e.stopPropagation();
-            createAtCenter();
+            createNearDockButton();
           }}
           type="button"
         >
@@ -1061,30 +1124,30 @@ export function Canvas({
         onPointerCancel={endPan}
         onMouseMove={(e) => updateCursorFromClient(e.clientX, e.clientY)}
       >
-      <div
-        className="canvas-viewport"
-        style={{
-          // Note: we intentionally avoid `scale(...)` on the whole viewport because
-          // WebViews can rasterize transformed layers and make text/borders look blurry.
-          // Instead, notes + the board are laid out at scaled sizes/positions.
-          transform: `translate(${renderX}px, ${renderY}px)`,
-        }}
-        onPointerDown={(e) => {
-          // Reset confirm delete state when clicking on canvas background
-          // Don't reset if clicking on a button or interactive element
-          const target = e.target as HTMLElement;
-          if (confirmDeleteChatId && !target.closest('button')) {
-            onResetConfirmDelete();
-          }
-        }}
-      >
+        <div
+          className="canvas-viewport"
+          style={{
+            // Note: we intentionally avoid `scale(...)` on the whole viewport because
+            // WebViews can rasterize transformed layers and make text/borders look blurry.
+            // Instead, notes + the board are laid out at scaled sizes/positions.
+            transform: `translate(${renderX}px, ${renderY}px)`,
+          }}
+          onPointerDown={(e) => {
+            // Reset confirm delete state when clicking on canvas background
+            // Don't reset if clicking on a button or interactive element
+            const target = e.target as HTMLElement;
+            if (confirmDeleteChatId && !target.closest("button")) {
+              onResetConfirmDelete();
+            }
+          }}
+        >
         {board.w && board.h ? (
           <div
             className="canvas-board"
             style={{
               width: Math.round(board.w * vp.scale * dpr) / dpr,
               height: Math.round(board.h * vp.scale * dpr) / dpr,
-              backgroundSize: `${28 * vp.scale}px ${28 * vp.scale}px`,
+              ["--canvas-grid-size" as any]: `${36 * vp.scale}px ${36 * vp.scale}px`,
             }}
           />
         ) : null}

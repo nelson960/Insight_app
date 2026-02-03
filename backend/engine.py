@@ -47,6 +47,7 @@ from __future__ import annotations
 import anyio
 import codecs
 import json
+import posixpath
 import logging
 import multiprocessing as mp
 import os
@@ -175,6 +176,7 @@ _IPC_ALLOWED_ENDPOINTS: Dict[str, List[str]] = {
         "/settings/model/validate",
         "/settings/llm/apply",
         "/settings/embedding/download",
+        "/settings/embedding/cancel",
         "/settings/raw_engine/start",
         "/settings/raw_engine/stop",
         "/settings/storage/clean_cache",
@@ -197,6 +199,14 @@ def _is_allowed_ipc_endpoint(method: str, endpoint: str) -> bool:
     if not path.startswith("/"):
         return False
     if ".." in path:
+        return False
+    try:
+        path = posixpath.normpath(path)
+    except Exception:
+        return False
+    if not path.startswith("/"):
+        return False
+    if "/../" in path or path.startswith("../"):
         return False
 
     patterns = _IPC_ALLOWED_ENDPOINTS.get(method.upper(), [])
@@ -757,13 +767,7 @@ async def main_async() -> None:
             threading.Thread(target=_warmup_worker, daemon=True, name="warmup-worker").start()
             logger.info("Background warm-up started (non-blocking)")
 
-            # Background-load the chat router after health checks (if a model is configured).
-            try:
-                from backend.api.chat_router_loader import maybe_start_chat_router_load  # type: ignore
-
-                maybe_start_chat_router_load("startup")
-            except Exception:
-                pass
+            # Chat router is now registered at app startup (no background loader needed).
 
         await anyio.to_thread.run_sync(_run_sync)
 
@@ -788,6 +792,15 @@ async def main_async() -> None:
 
                 cmd = msg.get("cmd")
                 if cmd == "shutdown":
+                    try:
+                        from backend.services.raw_engine_server.manager import raw_engine_manager  # type: ignore
+
+                        raw_engine_manager().stop()
+                        from backend.services.connectors.nomic import cancel_embedding_download_process  # type: ignore
+
+                        cancel_embedding_download_process()
+                    except Exception:
+                        pass
                     manager.writer.emit(
                         {"request_id": msg.get("request_id") or str(uuid.uuid4()), "ok": True, "status": 200, "data": {"detail": "shutdown"}}
                     )

@@ -6,8 +6,9 @@
 # 1. Builds the Python backend with PyInstaller
 # 2. Runs smoke tests on the backend
 # 3. Builds the Tauri app (.app bundle)
-# 4. Creates a distributable onedir package
-# 5. Optionally code signs the binaries
+# 4. Fixes the app bundle metadata
+# 5. Creates a distributable onedir package
+# 6. Optionally code signs the binaries
 #
 # Usage:
 #   ./scripts/build_onedir_prod.sh                 # Build everything
@@ -347,6 +348,29 @@ build_tauri_app() {
     echo ""
 }
 
+fix_app_bundle() {
+    header "Fixing App Bundle Metadata"
+
+    local app_path="${TAURI_DIR}/target/release/bundle/macos/Insight.app"
+
+    if [[ ! -d "$app_path" ]]; then
+        warning "App bundle not found: $app_path"
+        return 0
+    fi
+
+    # Remove LSRequiresCarbon if present (safe to ignore failures)
+    if [[ -x /usr/libexec/PlistBuddy ]]; then
+        /usr/libexec/PlistBuddy -c "Delete LSRequiresCarbon" "$app_path/Contents/Info.plist" >/dev/null 2>&1 || true
+    fi
+
+    # Ensure PkgInfo exists
+    printf "APPL????\n" > "$app_path/Contents/PkgInfo"
+    chmod 644 "$app_path/Contents/PkgInfo"
+
+    success "App bundle metadata fixed"
+    echo ""
+}
+
 code_sign_binaries() {
     if [[ "$SKIP_SIGN" == "true" ]]; then
         warning "Skipping code signing"
@@ -495,6 +519,9 @@ main() {
 
     # Build Tauri app (includes copying backend)
     build_tauri_app
+
+    # Fix app bundle metadata (PkgInfo/LSRequiresCarbon)
+    fix_app_bundle
 
     # Code sign binaries
     code_sign_binaries

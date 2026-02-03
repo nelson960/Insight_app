@@ -288,12 +288,23 @@ class IngestionScheduler:
                     if job_id in self._cancelled:
                         logger.info("Skipping cancelled ingestion job %s", job_id)
                         self._metadata_store.update_job_status(job_id, "cancelled")
+                        self._cancelled.discard(job_id)
                         continue
                     cancel_event = threading.Event()
+                    if job_id in self._cancelled:
+                        cancel_event.set()
                     self._running_cancel[job_id] = cancel_event
                 logger.info("Starting async ingestion for job %s (file %s)", job_id, request.file_id)
                 self._metadata_store.update_job_status(job_id, "running")
-                self._pipeline.run(request, cancel_check=cancel_event.is_set)
+                def cancel_check() -> bool:
+                    if cancel_event.is_set():
+                        return True
+                    with self._lock:
+                        return job_id in self._cancelled
+
+                if cancel_check():
+                    raise IngestionCancelled()
+                self._pipeline.run(request, cancel_check=cancel_check)
                 logger.info("Async ingestion completed for job %s", job_id)
                 self._metadata_store.update_job_status(job_id, "completed")
             except IngestionCancelled:

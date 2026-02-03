@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import struct
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 GGUF_MAGIC = b"GGUF"
 
@@ -51,6 +51,38 @@ def _read_uint64(handle) -> int:
     return struct.unpack("<Q", _read_exact(handle, 8))[0]
 
 
+def _read_int8(handle) -> int:
+    return struct.unpack("<b", _read_exact(handle, 1))[0]
+
+
+def _read_uint8(handle) -> int:
+    return struct.unpack("<B", _read_exact(handle, 1))[0]
+
+
+def _read_int16(handle) -> int:
+    return struct.unpack("<h", _read_exact(handle, 2))[0]
+
+
+def _read_uint16(handle) -> int:
+    return struct.unpack("<H", _read_exact(handle, 2))[0]
+
+
+def _read_int32(handle) -> int:
+    return struct.unpack("<i", _read_exact(handle, 4))[0]
+
+
+def _read_int64(handle) -> int:
+    return struct.unpack("<q", _read_exact(handle, 8))[0]
+
+
+def _read_float32(handle) -> float:
+    return struct.unpack("<f", _read_exact(handle, 4))[0]
+
+
+def _read_float64(handle) -> float:
+    return struct.unpack("<d", _read_exact(handle, 8))[0]
+
+
 def _read_str(handle) -> str:
     length = _read_uint64(handle)
     if length <= 0:
@@ -89,6 +121,38 @@ def _skip_value(handle, value_type: int) -> None:
     handle.seek(size, os.SEEK_CUR)
 
 
+def _read_numeric_value(handle, value_type: int) -> Optional[int]:
+    if value_type == GGUF_TYPE_STRING:
+        raw = _read_str(handle)
+        try:
+            return int(raw.strip())
+        except Exception:
+            return None
+    if value_type == GGUF_TYPE_UINT8:
+        return int(_read_uint8(handle))
+    if value_type == GGUF_TYPE_INT8:
+        return int(_read_int8(handle))
+    if value_type == GGUF_TYPE_UINT16:
+        return int(_read_uint16(handle))
+    if value_type == GGUF_TYPE_INT16:
+        return int(_read_int16(handle))
+    if value_type == GGUF_TYPE_UINT32:
+        return int(_read_uint32(handle))
+    if value_type == GGUF_TYPE_INT32:
+        return int(_read_int32(handle))
+    if value_type == GGUF_TYPE_UINT64:
+        return int(_read_uint64(handle))
+    if value_type == GGUF_TYPE_INT64:
+        return int(_read_int64(handle))
+    if value_type == GGUF_TYPE_BOOL:
+        return int(_read_uint8(handle))
+    if value_type == GGUF_TYPE_FLOAT32:
+        return int(_read_float32(handle))
+    if value_type == GGUF_TYPE_FLOAT64:
+        return int(_read_float64(handle))
+    return None
+
+
 def is_gguf(path: Path) -> bool:
     try:
         with path.open("rb") as handle:
@@ -119,6 +183,52 @@ def read_gguf_string_kv(path: Path, key: str) -> Optional[str]:
     return None
 
 
+def read_gguf_int_kv(path: Path, key: str) -> Optional[int]:
+    try:
+        with path.open("rb") as handle:
+            if handle.read(4) != GGUF_MAGIC:
+                return None
+            _ = _read_uint32(handle)  # version
+            _ = _read_uint64(handle)  # n_tensors
+            n_kv = _read_uint64(handle)
+            for _ in range(n_kv):
+                k = _read_str(handle)
+                value_type = _read_uint32(handle)
+                if k == key:
+                    val = _read_numeric_value(handle, value_type)
+                    if val is not None:
+                        return val
+                    _skip_value(handle, value_type)
+                    return None
+                _skip_value(handle, value_type)
+    except Exception:
+        return None
+    return None
+
+
+def read_gguf_int_kv_suffix(path: Path, suffixes: Iterable[str]) -> Optional[int]:
+    try:
+        with path.open("rb") as handle:
+            if handle.read(4) != GGUF_MAGIC:
+                return None
+            _ = _read_uint32(handle)  # version
+            _ = _read_uint64(handle)  # n_tensors
+            n_kv = _read_uint64(handle)
+            for _ in range(n_kv):
+                k = _read_str(handle)
+                value_type = _read_uint32(handle)
+                if isinstance(k, str) and any(k.endswith(sfx) for sfx in suffixes):
+                    val = _read_numeric_value(handle, value_type)
+                    if val is not None:
+                        return val
+                    _skip_value(handle, value_type)
+                    continue
+                _skip_value(handle, value_type)
+    except Exception:
+        return None
+    return None
+
+
 def detect_chat_template_kind(path: Path) -> str:
     template = read_gguf_string_kv(path, "tokenizer.chat_template")
     if not template:
@@ -130,4 +240,10 @@ def detect_chat_template_kind(path: Path) -> str:
     return "unknown"
 
 
-__all__ = ["is_gguf", "read_gguf_string_kv", "detect_chat_template_kind"]
+__all__ = [
+    "is_gguf",
+    "read_gguf_string_kv",
+    "read_gguf_int_kv",
+    "read_gguf_int_kv_suffix",
+    "detect_chat_template_kind",
+]

@@ -1,7 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, Copy, GitBranch, Square, X } from "lucide-react";
-import SendHorizontalIcon from "./icons/SendHorizontalIcon";
+import {
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  GitBranch,
+  Pencil,
+  RefreshCw,
+  Square,
+  X,
+} from "lucide-react";
+import SendUpIcon from "./icons/SendUpIcon";
 import {
   cancelActiveStreamAndWait,
   engineCancel,
@@ -12,16 +22,23 @@ import {
 import { engine } from "../api/engine";
 import { ChatMarkdown, ChatMarkdownStream } from "./ChatMarkdown";
 import {
+  beginAssistantGeneration,
   beginStreamTurn,
   cancelStreamTurn,
   clearChatDraft,
   ensureChatUiLoaded,
   getChatDraft,
   getChatUiSnapshot,
+  getMessageVersionInfo,
+  prepareRegeneration,
+  rollbackRegenerationTurn,
   rollbackStreamTurn,
   setChatDraft,
   subscribeChatUi,
+  switchMessageVersion,
+  updateEditedUserMessage,
 } from "../state/chatUiStore";
+import { AutoResizeTextarea } from "./AutoResizeTextarea"; // Import helper
 
 type Props = {
   chatId: string | null;
@@ -48,6 +65,17 @@ type ContextStatus = {
   last_gen_tokens?: number;
   input_budget_tokens?: number;
   input_budget_reserved?: number;
+  model?: {
+    name?: string | null;
+    size_label?: string | null;
+    architecture?: string | null;
+    ctx_runtime?: number | null;
+    ctx_train?: number | null;
+    file_type?: number | null;
+    quantization_version?: number | null;
+    chat_template_name?: string | null;
+    prompt_renderer?: string | null;
+  };
 };
 
 type MarkdownStreamState = {
@@ -65,6 +93,11 @@ type IngestProgressState = {
 };
 
 const MAX_MD_TAIL_CHARS = 1800;
+
+// Error logging helper
+function logError(context: string, error: unknown): void {
+  console.error(`[ChatWindow/${context}]`, error);
+}
 
 function formatPageRanges(pageRanges: unknown): string | null {
   if (!Array.isArray(pageRanges) || pageRanges.length === 0) return null;
@@ -173,6 +206,7 @@ export function ChatWindow({
   const messages = chatUi.messages;
   const isStreaming = chatUi.isStreaming;
   const activeRequestId = chatUi.activeRequestId;
+  const isCompacting = chatUi.isCompacting;
 
   // Track active streaming message content length for scroll updates
   const activeStreamContentLen = (() => {
@@ -186,6 +220,8 @@ export function ChatWindow({
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const streamError = chatUi.lastError;
+  const errorMsg = error || streamError || null;
   const [toast, setToast] = useState<string | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [branchTarget, setBranchTarget] = useState<{
@@ -216,10 +252,13 @@ export function ChatWindow({
   const inputElRef = useRef<HTMLTextAreaElement | null>(null);
   const INPUT_MAX_HEIGHT_PX = 120;
   const chatPopoverTimerRef = useRef<number | null>(null);
+  const ignoreSelectionUntilRef = useRef<number>(0);
+  const askClickingRef = useRef<boolean>(false);
   const toastTimerRef = useRef<number | null>(null);
   const prestreamTimerRef = useRef<number | null>(null);
   const prestreamRequestIdRef = useRef<string | null>(null);
   const prestreamStartedRef = useRef(false);
+  const ingestAbortControllerRef = useRef<AbortController | null>(null);
 
   // Scroll state: stick-to-bottom pattern with refs
   const stickToBottomRef = useRef<boolean>(true);
@@ -227,6 +266,12 @@ export function ChatWindow({
   const savedPositionsRef = useRef<Map<string, number>>(new Map());
   const prevChatIdRef = useRef<string | null>(null);
   const scrollSaveTimeoutRef = useRef<number | null>(null);
+
+  // Editing and regeneration state
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingContent, setEditingContent] = useState("");
+  const [regeneratingMessageId, setRegeneratingMessageId] = useState<string | null>(null);
+  const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const effectiveSelection = selection === undefined ? localSelection : selection;
 
@@ -387,7 +432,7 @@ export function ChatWindow({
 
     // Pin to bottom during streaming AND after it ends
     scrollToBottom();
-  }, [chatId, isStreaming, activeStreamContentLen, messages.length]);
+  }, [chatId, isStreaming, activeStreamContentLen, messages.length, messages]);
 
   // ChatId switch: save old position, restore new position
   useEffect(() => {
@@ -491,6 +536,7 @@ export function ChatWindow({
   }
 
   function readChatSelectionFromWindow(opts?: { showPopover?: boolean }) {
+    if (askClickingRef.current) return;
     const sel = window.getSelection?.();
     const txt = (sel && typeof sel.toString === "function" ? sel.toString() : "") || "";
     const cleaned = txt.replace(/\s+/g, " ").trim();
@@ -548,7 +594,7 @@ export function ChatWindow({
       const maxX = body.scrollLeft + body.clientWidth - 28;
       const x = Math.max(minX, Math.min(maxX, xRaw));
 
-      const yRaw = rect.top - bodyRect.top + body.scrollTop - 48;
+      const yRaw = rect.top - bodyRect.top + body.scrollTop;
       const minY = body.scrollTop + 8;
       const y = Math.max(minY, yRaw);
       if (chatPopoverTimerRef.current != null) window.clearTimeout(chatPopoverTimerRef.current);
@@ -562,12 +608,17 @@ export function ChatWindow({
   }
 
   useEffect(() => {
-    function onSelectionChangeEvent() {
+    // Store handler in a ref to ensure stable reference for add/remove
+    const handler = () => {
+      if (Date.now() < ignoreSelectionUntilRef.current) return;
+      if (askClickingRef.current) return;
       readChatSelectionFromWindow({ showPopover: false });
-    }
-    document.addEventListener("selectionchange", onSelectionChangeEvent);
-    return () => document.removeEventListener("selectionchange", onSelectionChangeEvent);
-  }, []);
+    };
+    document.addEventListener("selectionchange", handler);
+    return () => {
+      document.removeEventListener("selectionchange", handler);
+    };
+  }, [readChatSelectionFromWindow]);
 
   function commitChatSelectionToInput() {
     if (!pendingChatSelection) return;
@@ -637,6 +688,16 @@ export function ChatWindow({
     });
   }, [chatId]);
 
+  // Cleanup abort controller on unmount
+  useEffect(() => {
+    return () => {
+      if (ingestAbortControllerRef.current) {
+        ingestAbortControllerRef.current.abort();
+        ingestAbortControllerRef.current = null;
+      }
+    };
+  }, []);
+
   async function refreshContextStatus(activeChatId: string) {
     const mySeq = ++contextReqSeqRef.current;
     const res = await engine<ContextStatus>(
@@ -665,9 +726,13 @@ export function ChatWindow({
       clearPrestream();
       waitForStreamToFinish(prev)
         .then(() => {
-          if (chatId) refreshContextStatus(chatId).catch(() => {});
+          if (chatId) refreshContextStatus(chatId).catch((err) => {
+            logError("refreshContextStatus", err);
+          });
         })
-        .catch(() => {});
+        .catch((err) => {
+          logError("waitForStreamToFinish", err);
+        });
     }
   }, [chatId, activeRequestId]);
 
@@ -682,8 +747,11 @@ export function ChatWindow({
     // can consume non-stream responses and make engine_request hang.
     const activeStream = getActiveStream();
     if (!activeStream) {
-      refreshContextStatus(chatId).catch(() => {
-        if (!cancelled) setContextStatus(null);
+      refreshContextStatus(chatId).catch((err) => {
+        if (!cancelled) {
+          logError("refreshContextStatus", err);
+          setContextStatus(null);
+        }
       });
       return () => {
         cancelled = true;
@@ -762,8 +830,8 @@ export function ChatWindow({
       if (!ok) return;
     }
 
-    const LARGE_MODE_THRESHOLD_BYTES = 5 * 1024 * 1024; // keep aligned with backend default (INSIGHT_MAX_MULTI_FILE_BYTES)
-    const LARGE_MODE_ALLOWED_SUFFIXES = new Set([".txt", ".log", ".json"]);
+    const LARGE_MODE_THRESHOLD_BYTES = 10 * 1024 * 1024; // keep aligned with backend default (INSIGHT_MAX_MULTI_FILE_BYTES)
+    const LARGE_MODE_ALLOWED_SUFFIXES = new Set([".txt", ".log", ".json", ".pdf"]);
 
     setError(null);
     try {
@@ -807,7 +875,8 @@ export function ChatWindow({
         const first = largeTypeRejected[0];
         const extra = largeTypeRejected.length > 1 ? ` (+${largeTypeRejected.length - 1} more)` : "";
         setError(
-          `Large file mode supports only .txt/.log/.json. Unsupported: ${first.name}${first.suffix ? ` (${first.suffix})` : ""
+          `Large file mode supports only .txt/.log/.json/.pdf. Unsupported: ${first.name}${
+            first.suffix ? ` (${first.suffix})` : ""
           }.${extra}`
         );
       }
@@ -911,6 +980,14 @@ export function ChatWindow({
       (globalThis.crypto && "randomUUID" in globalThis.crypto
         ? (globalThis.crypto as any).randomUUID()
         : `${Date.now()}-${Math.random()}`) as string;
+    const userMessageId =
+      (globalThis.crypto && "randomUUID" in globalThis.crypto
+        ? (globalThis.crypto as any).randomUUID()
+        : `${Date.now()}-${Math.random()}`) as string;
+    const assistantMessageId =
+      (globalThis.crypto && "randomUUID" in globalThis.crypto
+        ? (globalThis.crypto as any).randomUUID()
+        : `${Date.now()}-${Math.random()}`) as string;
 
     beginStreamTurn({
       chatId,
@@ -918,6 +995,8 @@ export function ChatWindow({
       userText: trimmed,
       attachments: attachedNames.length ? attachedNames : undefined,
       selection: selectionPayload,
+      messageId: assistantMessageId,
+      userMessageId,
     });
     startPrestream(requestId);
 
@@ -950,13 +1029,13 @@ export function ChatWindow({
           const msg = formatIngestFailure(ingestRes as any);
           showToast(msg);
           setError(msg);
-        rollbackStreamTurn(chatId, requestId);
-        setInput(inputBeforeSend);
-        setAttachedPaths(attachedBeforeSend);
-        if (selectionBeforeSend) setSelectionValue(selectionBeforeSend);
-        clearPrestream();
-        return;
-      }
+          rollbackStreamTurn(chatId, requestId);
+          setInput(inputBeforeSend);
+          setAttachedPaths(attachedBeforeSend);
+          if (selectionBeforeSend) setSelectionValue(selectionBeforeSend);
+          clearPrestream();
+          return;
+        }
         const files = Array.isArray(ingestRes.data?.files) ? ingestRes.data.files : [];
         docIdsForTurn = files.map((f) => f.file_id).filter((s) => typeof s === "string" && s);
         const names = files.map((f) => f.filename).filter((s) => typeof s === "string" && s);
@@ -1004,125 +1083,164 @@ export function ChatWindow({
       }
 
       async function waitForIngestionIfNeeded() {
-        // Determine which file_ids we must wait for:
-        // - always wait for newly attached docs
-        // - if a selection includes a file_id, wait for that file_id
-        // - else if docs pane is open, wait for the focused doc (if any)
-        // - else (chat pane only), wait for the latest uploaded file in this chat
-        //   (multi-upload turns already wait for the newly attached docs)
-        const start = Date.now();
-        const maxWaitMs = 180_000;
-        const pollMs = 450;
+        // Cancel any previous ingestion polling
+        if (ingestAbortControllerRef.current) {
+          ingestAbortControllerRef.current.abort();
+        }
 
-        type FileRow = { file_id: string; status?: string; created_at?: any };
+        // Create new abort controller for this operation
+        const abortController = new AbortController();
+        ingestAbortControllerRef.current = abortController;
+        const signal = abortController.signal;
 
-        // Helper to fetch file statuses (IPC; cheap).
-        async function fetchFiles(): Promise<FileRow[]> {
-          const res = await engine<{ files: FileRow[] }>(
-            `/files/chat/${encodeURIComponent(chatId as string)}`,
-            undefined,
-            "GET"
+        try {
+          // Determine which file_ids we must wait for:
+          // - always wait for newly attached docs
+          // - if a selection includes a file_id, wait for that file_id
+          // - else if docs pane is open, wait for the focused doc (if any)
+          // - else (chat pane only), wait for the latest uploaded file in this chat
+          //   (multi-upload turns already wait for the newly attached docs)
+          const start = Date.now();
+          const maxWaitMs = 180_000;
+          const pollMs = 450;
+
+          type FileRow = { file_id: string; status?: string; created_at?: unknown };
+
+          // Helper to fetch file statuses (IPC; cheap).
+          async function fetchFiles(): Promise<FileRow[]> {
+            if (signal.aborted) throw new Error("Aborted");
+            const res = await engine<{ files: FileRow[] }>(
+              `/files/chat/${encodeURIComponent(chatId as string)}`,
+              undefined,
+              "GET"
+            );
+            if (!res.ok) return [];
+            const rows = Array.isArray(res.data?.files) ? res.data.files : [];
+            return rows;
+          }
+
+          function buildStatusMap(rows: FileRow[]) {
+            const m = new Map<string, string>();
+            for (const r of rows) {
+              const fid = r.file_id;
+              if (typeof fid !== "string" || !fid) continue;
+              const st = String(r.status ?? "");
+              m.set(fid, st);
+            }
+            return m;
+          }
+
+          function pickLatestFileId(rows: FileRow[]): string | undefined {
+            let last: string | undefined;
+            let best: { fid: string; ts: number } | null = null;
+            for (const r of rows) {
+              const fid = (r as any)?.file_id;
+              if (typeof fid !== "string" || !fid) continue;
+              last = fid;
+              const createdAt = (r as any)?.created_at;
+              const ts = typeof createdAt === "string" ? Date.parse(createdAt) : NaN;
+              if (!Number.isFinite(ts)) continue;
+              if (!best || ts >= best.ts) best = { fid, ts };
+            }
+            return best?.fid || last;
+          }
+
+          const rows0 = await fetchFiles();
+          const statusById = buildStatusMap(rows0);
+          const latestChatId = pickLatestFileId(rows0);
+
+          // If the docs pane is open but we don't yet have an active file,
+          // fall back to the latest chat file so small-doc mode can engage.
+          if (docPaneOpen && !focusDocForTurn && latestChatId) {
+            focusDocForTurn = latestChatId;
+          }
+
+          let waitIds: string[] = [];
+          if (selectionPayload && (selectionPayload as any).file_id) {
+            waitIds = [String((selectionPayload as any).file_id)];
+          } else if (docPaneOpen && focusDocForTurn) {
+            waitIds = [focusDocForTurn];
+          } else if (!docPaneOpen) {
+            if (docIdsForTurn.length > 1) {
+              waitIds = docIdsForTurn.slice();
+            } else if (latestChatId) {
+              waitIds = [latestChatId];
+            }
+          }
+          if (!docPaneOpen) {
+            for (const fid of docIdsForTurn) {
+              if (!waitIds.includes(fid)) waitIds.push(fid);
+            }
+          }
+          // Only wait for files that are not completed.
+          waitIds = waitIds.filter((fid) => {
+            const st = statusById.get(fid) || "";
+            return st !== "completed";
+          });
+
+          if (!waitIds.length) return;
+
+          const progressIds = Array.from(
+            new Set((docIdsForTurn.length ? docIdsForTurn : waitIds).filter(Boolean))
           );
-          if (!res.ok) return [];
-          const rows = Array.isArray(res.data?.files) ? res.data.files : [];
-          return rows as any;
-        }
+          setIngestProgress({
+            fileIds: progressIds,
+            total: progressIds.length,
+            done: 0,
+            failed: 0,
+          });
 
-        function buildStatusMap(rows: FileRow[]) {
-          const m = new Map<string, string>();
-          for (const r of rows) {
-            const fid = (r as any)?.file_id;
-            if (typeof fid !== "string" || !fid) continue;
-            const st = String((r as any)?.status || "");
-            m.set(fid, st);
+          while (true) {
+            // Check for abort
+            if (signal.aborted) return;
+
+            // Cancelled (Stop clicked) or superseded by another send.
+            if (getChatUiSnapshot(chatId).activeRequestId !== requestId) return;
+
+            const stRows = await fetchFiles();
+            const stMap = buildStatusMap(stRows);
+            let done = 0;
+            let failed = 0;
+            let pending = 0;
+            for (const fid of progressIds) {
+              const st = stMap.get(fid) || "";
+              if (st === "completed") done += 1;
+              else if (st === "failed") {
+                done += 1;
+                failed += 1;
+              } else pending += 1;
+            }
+            setIngestProgress({ fileIds: progressIds, total: progressIds.length, done, failed });
+
+            let pendingWait = 0;
+            for (const fid of waitIds) {
+              const st = stMap.get(fid) || "";
+              if (st !== "completed" && st !== "failed") pendingWait += 1;
+            }
+            if (pendingWait === 0) break;
+
+            if (Date.now() - start > maxWaitMs) {
+              throw new Error("Timed out waiting for document indexing to complete");
+            }
+
+            // Abortable sleep
+            await new Promise<void>((resolve, reject) => {
+              const timeout = setTimeout(() => resolve(), pollMs);
+              signal.addEventListener("abort", () => {
+                clearTimeout(timeout);
+                reject(new Error("Aborted"));
+              }, { once: true });
+            });
           }
-          return m;
-        }
-
-        function pickLatestFileId(rows: FileRow[]): string | undefined {
-          let last: string | undefined;
-          let best: { fid: string; ts: number } | null = null;
-          for (const r of rows) {
-            const fid = (r as any)?.file_id;
-            if (typeof fid !== "string" || !fid) continue;
-            last = fid;
-            const createdAt = (r as any)?.created_at;
-            const ts = typeof createdAt === "string" ? Date.parse(createdAt) : NaN;
-            if (!Number.isFinite(ts)) continue;
-            if (!best || ts >= best.ts) best = { fid, ts };
+        } catch (err) {
+          // If aborted, silently exit (this is expected behavior)
+          if (signal.aborted) return;
+          throw err;
+        } finally {
+          // Clear the ref if this is still the active controller
+          if (ingestAbortControllerRef.current === abortController) {
+            ingestAbortControllerRef.current = null;
           }
-          return best?.fid || last;
-        }
-
-        const rows0 = await fetchFiles();
-        const statusById = buildStatusMap(rows0);
-        const latestChatId = pickLatestFileId(rows0);
-
-        let waitIds: string[] = [];
-        if (selectionPayload && (selectionPayload as any).file_id) {
-          waitIds = [String((selectionPayload as any).file_id)];
-        } else if (docPaneOpen && focusDocForTurn) {
-          waitIds = [focusDocForTurn];
-        } else if (!docPaneOpen) {
-          if (docIdsForTurn.length > 1) {
-            waitIds = docIdsForTurn.slice();
-          } else if (latestChatId) {
-            waitIds = [latestChatId];
-          }
-        }
-        if (!docPaneOpen) {
-          for (const fid of docIdsForTurn) {
-            if (!waitIds.includes(fid)) waitIds.push(fid);
-          }
-        }
-        // Only wait for files that are not completed.
-        waitIds = waitIds.filter((fid) => {
-          const st = statusById.get(fid) || "";
-          return st !== "completed";
-        });
-
-        if (!waitIds.length) return;
-
-        const progressIds = Array.from(
-          new Set((docIdsForTurn.length ? docIdsForTurn : waitIds).filter(Boolean))
-        );
-        setIngestProgress({
-          fileIds: progressIds,
-          total: progressIds.length,
-          done: 0,
-          failed: 0,
-        });
-
-        while (true) {
-          // Cancelled (Stop clicked) or superseded by another send.
-          if (getChatUiSnapshot(chatId).activeRequestId !== requestId) return;
-
-          const stRows = await fetchFiles();
-          const stMap = buildStatusMap(stRows);
-          let done = 0;
-          let failed = 0;
-          let pending = 0;
-          for (const fid of progressIds) {
-            const st = stMap.get(fid) || "";
-            if (st === "completed") done += 1;
-            else if (st === "failed") {
-              done += 1;
-              failed += 1;
-            } else pending += 1;
-          }
-          setIngestProgress({ fileIds: progressIds, total: progressIds.length, done, failed });
-
-          let pendingWait = 0;
-          for (const fid of waitIds) {
-            const st = stMap.get(fid) || "";
-            if (st !== "completed" && st !== "failed") pendingWait += 1;
-          }
-          if (pendingWait === 0) break;
-
-          if (Date.now() - start > maxWaitMs) {
-            throw new Error("Timed out waiting for document indexing to complete");
-          }
-          await new Promise((r) => window.setTimeout(r, pollMs));
         }
       }
 
@@ -1141,6 +1259,8 @@ export function ChatWindow({
         focusDocumentId: focusDocForTurn,
         docPaneOpen,
         selection: selectionPayload,
+        targetAssistantId: assistantMessageId,
+        userMessageId,
       });
     } catch (err: any) {
       console.error("Chat error", err);
@@ -1166,8 +1286,10 @@ export function ChatWindow({
 
     // Immediate UI stop: ignore further tokens and switch back to "Send".
     cancelStreamTurn(chatId);
+    rollbackRegenerationTurn(chatId, rid);
     setIngestProgress(null);
     setIsSending(false);
+    if (regeneratingMessageId) setRegeneratingMessageId(null);
     clearPrestream();
 
     // Scroll to bottom and set stickToBottom to true
@@ -1175,7 +1297,9 @@ export function ChatWindow({
     scrollToBottom();
 
     // Best-effort backend cancel (stops ASGI + llama.cpp compute).
-    engineCancel(rid).catch(() => {});
+    engineCancel(rid).catch((err) => {
+      logError("engineCancel", err);
+    });
   }
 
   function handleKeyDown(
@@ -1200,6 +1324,170 @@ export function ChatWindow({
       console.warn("copy failed", err);
     }
   }
+
+  // Regeneration handler
+  async function regenerateResponse(assistantMessageId: string) {
+    if (!chatId || isStreaming || isSending || !active) return;
+    if (onRequireModel) {
+      const ok = await onRequireModel();
+      if (!ok) return;
+    }
+
+    // Generate request ID first so we can pass it to prepareRegeneration
+    const requestId =
+      (globalThis.crypto && "randomUUID" in globalThis.crypto
+        ? (globalThis.crypto as any).randomUUID()
+        : `${Date.now()}-${Math.random()}`) as string;
+
+    const regenInfo = prepareRegeneration(chatId, assistantMessageId, requestId);
+    if (!regenInfo) {
+      setError("Could not find message to regenerate");
+      return;
+    }
+
+    setRegeneratingMessageId(assistantMessageId);
+    setError(null);
+    setIsSending(true);
+
+    const { userMessage } = regenInfo;
+
+    try {
+      // We don't call beginStreamTurn because the assistant message already exists
+      // Instead, we just trigger a new stream that will populate the existing message
+      startPrestream(requestId);
+
+      const docPaneOpen = !!docsVisible;
+      const focusDocForTurn = docPaneOpen ? activeDocumentId || undefined : undefined;
+
+      await engineStreamChat({
+        chatId,
+        query: userMessage.content,
+        requestId,
+        focusDocumentId: focusDocForTurn,
+        docPaneOpen,
+        selection: userMessage.selection,
+        attachments: userMessage.attachments,
+        skipUserMessage: true,
+        targetAssistantId: assistantMessageId,
+      });
+    } catch (err: any) {
+      console.error("Regeneration error", err);
+      setError(err?.message ?? String(err));
+      rollbackRegenerationTurn(chatId, requestId);
+      clearPrestream();
+      // Rollback logic for regeneration could be added here if needed
+    } finally {
+      setIsSending(false);
+      setRegeneratingMessageId(null);
+    }
+  }
+
+  // Edit message handlers
+  function startEditingMessage(messageId: string, content: string) {
+    setEditingMessageId(messageId);
+    setEditingContent(content);
+    // Focus textarea after render
+    window.setTimeout(() => {
+      editTextareaRef.current?.focus();
+      editTextareaRef.current?.select();
+    }, 50);
+  }
+
+  function cancelEditing() {
+    setEditingMessageId(null);
+    setEditingContent("");
+  }
+
+  async function saveEditedMessage() {
+    if (!chatId || !editingMessageId || isStreaming || isSending) return;
+    const trimmed = editingContent.trim();
+    if (!trimmed) {
+      cancelEditing();
+      return;
+    }
+
+    setError(null);
+    setIsSending(true);
+
+    const requestId =
+      (globalThis.crypto && "randomUUID" in globalThis.crypto
+        ? (globalThis.crypto as any).randomUUID()
+        : `${Date.now()}-${Math.random()}`) as string;
+
+    try {
+      const editRes = await engine(
+        "/chat/messages/edit",
+        {
+          chat_id: chatId,
+          message_id: editingMessageId,
+          content: trimmed,
+          truncate_after: true,
+          resync_kv: true,
+        },
+        "POST"
+      );
+      if (!editRes.ok) {
+        throw new Error(editRes.error || "Failed to persist edited message");
+      }
+
+      const editInfo = updateEditedUserMessage(chatId, editingMessageId, trimmed);
+      if (!editInfo) {
+        throw new Error("Failed to update edited message in UI");
+      }
+
+      cancelEditing();
+
+      // Set the input to the edited content so sendMessage picks it up
+      setInput("");
+
+      const assistantMessageId =
+        (globalThis.crypto && "randomUUID" in globalThis.crypto
+          ? (globalThis.crypto as any).randomUUID()
+          : `${Date.now()}-${Math.random()}`) as string;
+
+      // Begin a new assistant generation turn (without adding a new user message)
+      beginAssistantGeneration({ chatId, requestId, messageId: assistantMessageId });
+      startPrestream(requestId);
+
+      const docPaneOpen = !!docsVisible;
+      const focusDocForTurn = docPaneOpen ? activeDocumentId || undefined : undefined;
+
+      // Use the edited content for the query
+      await engineStreamChat({
+        chatId,
+        query: trimmed,
+        requestId,
+        focusDocumentId: focusDocForTurn,
+        docPaneOpen,
+        selection: undefined,
+        skipUserMessage: true,
+        targetAssistantId: assistantMessageId,
+      });
+    } catch (err: any) {
+      console.error("Edit message error", err);
+      setError(err?.message ?? String(err));
+      clearPrestream();
+      // Rollback if needed
+    } finally {
+      setIsSending(false);
+    }
+  }
+
+  function handleEditKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      saveEditedMessage();
+    } else if (e.key === "Escape") {
+      cancelEditing();
+    }
+  }
+
+  // Version navigation handler
+  function navigateVersion(messageId: string, direction: -1 | 1) {
+    if (!chatId) return;
+    switchMessageVersion(chatId, messageId, direction);
+  }
+
 
   async function branchFromMessage() {
     if (!chatId) return;
@@ -1258,14 +1546,22 @@ export function ChatWindow({
   }
 
   return (
-      <div className={`chat-root ${embedded ? "chat-root-embedded" : ""}`}>
+    <div className={`chat-root ${embedded ? "chat-root-embedded" : ""}`}>
       {showTopbar ? <div className="chat-topbar" aria-hidden="true" /> : null}
 
       <div
         className="chat-messages"
         ref={messagesRef}
-        onMouseUp={() => readChatSelectionFromWindow({ showPopover: true })}
-        onKeyUp={() => readChatSelectionFromWindow({ showPopover: true })}
+        onMouseUp={(e) => {
+          const target = e.target as HTMLElement | null;
+          if (target && target.closest(".chat-selection-popover")) return;
+          readChatSelectionFromWindow({ showPopover: true });
+        }}
+        onKeyUp={(e) => {
+          const target = e.target as HTMLElement | null;
+          if (target && target.closest(".chat-selection-popover")) return;
+          readChatSelectionFromWindow({ showPopover: true });
+        }}
         onScroll={() => {
           if (chatSelectionPos) setChatSelectionPos(null);
         }}
@@ -1273,17 +1569,39 @@ export function ChatWindow({
         {messages.map((m) => (
           <div key={m.id} className={`chat-message chat-message-${m.role}`}>
             <div className="chat-message-role">
-              {m.role === "user" ? "You" : "Insight"}
-              {showPrestream &&
-              isStreaming &&
-              activeRequestId &&
-              m.role === "assistant" &&
-              m.request_id === activeRequestId ? (
-                <div className="chat-prestream chat-prestream-inline" role="status" aria-label="Preparing response">
-                  <span />
-                  <span />
-                  <span />
-                </div>
+              {m.role === "assistant" && activeRequestId && m.request_id === activeRequestId ? (
+                isCompacting ? (
+                  <div className="chat-prestream chat-prestream-inline" role="status" aria-label="Compacting context">
+                    <span className="chat-prestream-label">Compacting…</span>
+                    <div className="chat-prestream-dots" aria-hidden="true">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                  </div>
+                ) : showPrestream && isStreaming ? (
+                  <div className="chat-prestream chat-prestream-inline" role="status" aria-label="Preparing response">
+                    <div className="chat-prestream-dots" aria-hidden="true">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                  </div>
+                ) : null
+              ) : null}
+              {m.role === "assistant" && isStreaming && regeneratingMessageId === m.id ? (
+                <button
+                  type="button"
+                  className="chat-message-action chat-message-action-icon chat-message-action-stop"
+                  aria-label="Stop regeneration"
+                  title="Stop regeneration"
+                  onClick={() => {
+                    stopStreaming();
+                    setRegeneratingMessageId(null);
+                  }}
+                >
+                  <Square className="w-1 h-1" />
+                </button>
               ) : null}
             </div>
             <div className="chat-message-content">
@@ -1304,6 +1622,34 @@ export function ChatWindow({
                 ) : (
                   <ChatMarkdown markdown={m.content} />
                 )
+              ) : editingMessageId === m.id ? (
+                <div className="chat-message-edit-container">
+                  <AutoResizeTextarea
+                    ref={editTextareaRef}
+                    className="chat-message-edit-input"
+                    value={editingContent}
+                    onChange={(e) => setEditingContent(e.target.value)}
+                    onKeyDown={handleEditKeyDown}
+                    rows={1}
+                  />
+                  <div className="chat-message-edit-actions">
+                    <button
+                      type="button"
+                      className="chat-edit-btn chat-edit-btn-cancel"
+                      onClick={cancelEditing}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      className="chat-edit-btn chat-edit-btn-save"
+                      onClick={saveEditedMessage}
+                      disabled={!editingContent.trim()}
+                    >
+                      Send
+                    </button>
+                  </div>
+                </div>
               ) : (
                 m.content
               )}
@@ -1325,9 +1671,12 @@ export function ChatWindow({
               </div>
             )}
 
-            {m.role === "assistant" && Array.isArray((m as any).sources) && (m as any).sources.length >= 1 ? (
+            {m.role === "assistant" &&
+            Array.isArray(m.sources) &&
+            m.sources.length >= 1 &&
+            !(isStreaming && activeRequestId && m.request_id === activeRequestId) ? (
               <div className="chat-message-sources" aria-label="Sources">
-                {(m as any).sources.map((s: any, i: number) => {
+                {m.sources.map((s, i) => {
                   const filename = typeof s?.filename === "string" ? s.filename : "Document";
                   const pages = formatPageRanges(s?.page_ranges);
                   return (
@@ -1355,6 +1704,16 @@ export function ChatWindow({
                 <button
                   type="button"
                   className="chat-message-action chat-message-action-icon"
+                  onClick={() => regenerateResponse(m.id)}
+                  disabled={!m.content || regeneratingMessageId === m.id}
+                  aria-label="Regenerate response"
+                  title="Regenerate response"
+                >
+                  <RefreshCw className={`w-1 h-1 ${regeneratingMessageId === m.id ? "animate-spin" : ""}`} />
+                </button>
+                <button
+                  type="button"
+                  className="chat-message-action chat-message-action-icon"
                   onClick={() => {
                     setBranchError(null);
                     setBranchShareDocs(true);
@@ -1365,6 +1724,61 @@ export function ChatWindow({
                   title="Branch to a new card"
                 >
                   <GitBranch className="w-1 h-1" />
+                </button>
+                {/* Version navigation */}
+                {(() => {
+                  const versionInfo = chatId ? getMessageVersionInfo(chatId, m.id) : null;
+                  if (!versionInfo) return null;
+                  return (
+                    <div className="chat-message-versions" aria-label="Message versions">
+                      <button
+                        type="button"
+                        className="chat-version-nav-btn"
+                        onClick={() => navigateVersion(m.id, -1)}
+                        aria-label="Previous version"
+                        title="Previous version"
+                      >
+                        <ChevronLeft className="w-1 h-1" />
+                      </button>
+                      <span className="chat-version-indicator">
+                        {versionInfo.current}/{versionInfo.total}
+                      </span>
+                      <button
+                        type="button"
+                        className="chat-version-nav-btn"
+                        onClick={() => navigateVersion(m.id, 1)}
+                        aria-label="Next version"
+                        title="Next version"
+                      >
+                        <ChevronRight className="w-1 h-1" />
+                      </button>
+                    </div>
+                  );
+                })()}
+              </div>
+            ) : null}
+
+            {/* User message actions */}
+            {m.role === "user" && !isStreaming && editingMessageId !== m.id ? (
+              <div className="chat-message-actions chat-message-actions-user" aria-label="Message actions">
+                <button
+                  type="button"
+                  className="chat-message-action chat-message-action-icon"
+                  onClick={() => copyMessage(m)}
+                  disabled={!m.content}
+                  aria-label="Copy message"
+                  title={copiedMessageId === m.id ? "Copied" : "Copy"}
+                >
+                  {copiedMessageId === m.id ? <Check className="w-1 h-1" /> : <Copy className="w-1 h-1" />}
+                </button>
+                <button
+                  type="button"
+                  className="chat-message-action chat-message-action-icon"
+                  onClick={() => startEditingMessage(m.id, m.content)}
+                  aria-label="Edit message"
+                  title="Edit message"
+                >
+                  <Pencil className="w-1 h-1" />
                 </button>
               </div>
             ) : null}
@@ -1418,8 +1832,26 @@ export function ChatWindow({
             style={{ left: chatSelectionPos.x, top: chatSelectionPos.y }}
             onClick={commitChatSelectionToInput}
             title="Ask about this selection"
-            onMouseDown={(e) => e.stopPropagation()}
-            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              ignoreSelectionUntilRef.current = Date.now() + 400;
+              askClickingRef.current = true;
+              window.setTimeout(() => {
+                askClickingRef.current = false;
+              }, 400);
+              commitChatSelectionToInput();
+            }}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              ignoreSelectionUntilRef.current = Date.now() + 400;
+              askClickingRef.current = true;
+              window.setTimeout(() => {
+                askClickingRef.current = false;
+              }, 400);
+              commitChatSelectionToInput();
+            }}
           >
             Ask
           </button>
@@ -1439,32 +1871,31 @@ export function ChatWindow({
         </div>
       ) : null}
 
-      {error && <div className="chat-error">{error}</div>}
-
-      {!!attachedPaths.length && (
-        <div className="chat-attachments">
-          {attachedPaths.map((p) => {
-            const name = filenameFromPath(p);
-            return (
-              <div key={p} className="chat-attachment-pill" title={p}>
-                <span className="chat-attachment-name">{name}</span>
-                <button
-                  className="chat-attachment-remove"
-                  onClick={() => removeAttachment(p)}
-                  disabled={isStreaming}
-                  aria-label={`Remove attachment ${name}`}
-                  title="Remove"
-                >
-                  <X className="w-3 h-3" />
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      )}
+      {errorMsg && <div className="chat-error">{errorMsg}</div>}
 
       <div className="chat-input-row">
         <div className="chat-input-shell">
+          {!!attachedPaths.length && (
+            <div className="chat-attachments">
+              {attachedPaths.map((p) => {
+                const name = filenameFromPath(p);
+                return (
+                  <div key={p} className="chat-attachment-pill" title={p}>
+                    <span className="chat-attachment-name">{name}</span>
+                    <button
+                      className="chat-attachment-remove"
+                      onClick={() => removeAttachment(p)}
+                      disabled={isStreaming}
+                      aria-label={`Remove attachment ${name}`}
+                      title="Remove"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
           {effectiveSelection?.text ? (
             <div
               className="chat-input-selection"
@@ -1498,16 +1929,6 @@ export function ChatWindow({
           ) : null}
 
           <div className="chat-input-main">
-            <button
-              className="chat-input-attach"
-              onClick={pickAttachments}
-              disabled={!chatId || isStreaming || !active}
-              aria-label="Attach files"
-              title={attachedPaths.length ? `Attached: ${attachedPaths.length}` : "Attach files"}
-              type="button"
-            >
-              +
-            </button>
             <textarea
               className="chat-input"
               placeholder="Ask Insight anything about your data…"
@@ -1519,98 +1940,146 @@ export function ChatWindow({
               readOnly={!active}
             />
           </div>
-        </div>
-        <button
-          className="chat-send-btn"
-          onClick={isStreaming ? stopStreaming : sendMessage}
-          disabled={
-            !active ||
-            (isStreaming && !activeRequestId) ||
-            (!isStreaming && (isSending || !input.trim()))
-          }
-        >
-          {isStreaming ? <Square className="w-5 h-5" style={{ width: "18px", height: "18px" }} /> : <SendHorizontalIcon size={24} className="" />}
-        </button>
-        <div className="chat-context-wrap">
-          {contextStatus ? (
-            (() => {
-              const used = Number(contextStatus.used_tokens || 0);
-              const cap = Number(contextStatus.capacity_tokens || 0);
-              const pctUsed = Math.max(0, Math.min(100, Number(contextStatus.percent || 0)));
-              const left = Math.max(0, cap - used);
-              const inputBudget = Number(contextStatus.input_budget_tokens || 0);
-              const tps =
-                typeof contextStatus.last_gen_tps === "number" && Number.isFinite(contextStatus.last_gen_tps)
-                  ? contextStatus.last_gen_tps
-                  : null;
-              const speedLine = tps ? `\nSpeed ~${tps.toFixed(1)} tok/s` : "";
-              const inputLine = inputBudget
-                ? `\nMax input ~${formatInt(inputBudget)} tokens`
-                : "\nMax input n/a";
-              const tooltip = `Used ${pctUsed}%\nRemaining ${formatInt(left)} / ${formatInt(cap)} tokens${inputLine}${speedLine}`;
-              const r = 16;
-              const cx = 18;
-              const cy = 18;
-              const circumference = 2 * Math.PI * r;
-              const dashOffset = circumference * (1 - pctUsed / 100);
-              return (
-                <>
-                  <div className="chat-context-hover" aria-label={tooltip}>
+          <div className="chat-input-footer">
+            <button
+              className="chat-input-attach"
+              onClick={pickAttachments}
+              disabled={!chatId || isStreaming || !active}
+              aria-label="Attach files"
+              title={attachedPaths.length ? `Attached: ${attachedPaths.length}` : "Attach files"}
+              type="button"
+            >
+              +
+            </button>
+            <div className="chat-input-actions">
+              <div className="chat-context-wrap">
+                {contextStatus ? (
+                  (() => {
+                    const used = Number(contextStatus.used_tokens || 0);
+                    const cap = Number(contextStatus.capacity_tokens || 0);
+                    const pctUsed = Math.max(0, Math.min(100, Number(contextStatus.percent || 0)));
+                    const left = Math.max(0, cap - used);
+                    const inputBudget = Number(contextStatus.input_budget_tokens || 0);
+                    const model = contextStatus.model || {};
+                    const modelName = model.name || "";
+                    const modelMetaParts = [model.size_label, model.architecture]
+                      .filter(Boolean)
+                      .join(" · ");
+                    const modelLine = modelName
+                      ? `\nModel ${modelName}${modelMetaParts ? ` (${modelMetaParts})` : ""}`
+                      : "";
+                    const tps =
+                      typeof contextStatus.last_gen_tps === "number" &&
+                      Number.isFinite(contextStatus.last_gen_tps)
+                        ? contextStatus.last_gen_tps
+                        : null;
+                    const speedLine = tps ? `\nSpeed ~${tps.toFixed(1)} tok/s` : "";
+                    const inputLine = inputBudget
+                      ? `\nMax input ~${formatInt(inputBudget)} tokens`
+                      : "\nMax input n/a";
+                    const tooltip = `Used ${pctUsed}%\nRemaining ${formatInt(
+                      left
+                    )} / ${formatInt(cap)} tokens${inputLine}${speedLine}${modelLine}`;
+                    const r = 16;
+                    const cx = 18;
+                    const cy = 18;
+                    const circumference = 2 * Math.PI * r;
+                    const dashOffset = circumference * (1 - pctUsed / 100);
+                    return (
+                      <>
+                        <div className="chat-context-hover" aria-label={tooltip}>
+                          <svg
+                            className="chat-context-ring"
+                            viewBox="0 0 36 36"
+                            role="img"
+                            aria-hidden="true"
+                          >
+                            <circle className="chat-context-ring-track" cx={cx} cy={cy} r={r} />
+                            <circle
+                              className="chat-context-ring-progress"
+                              cx={cx}
+                              cy={cy}
+                              r={r}
+                              strokeDasharray={circumference}
+                              strokeDashoffset={dashOffset}
+                              transform={`rotate(-90 ${cx} ${cy})`}
+                            />
+                            <circle className="chat-context-ring-center" cx={cx} cy={cy} r={11} />
+                          </svg>
+                          <div className="chat-context-tooltip" role="tooltip">
+                            <div className="chat-context-tooltip-title">
+                              <span className="chat-context-heading">
+                                {modelName ? "Model" : "Context"}
+                              </span>
+                            </div>
+                            <div className="chat-context-tooltip-body">
+                              {modelName ? (
+                                <div>
+                                  {modelName}
+                                  {modelMetaParts ? (
+                                    <span className="chat-context-muted">
+                                      {" "}
+                                      ({modelMetaParts})
+                                    </span>
+                                  ) : null}
+                                </div>
+                              ) : null}
+                              {modelName ? (
+                                <div className="chat-context-muted">
+                                  <span className="chat-context-heading">Context</span>
+                                </div>
+                              ) : null}
+                              <div>
+                                Used {pctUsed}% · Remaining {formatInt(left)} / {formatInt(cap)}{" "}
+                                tokens
+                              </div>
+                              <div>
+                                Max input ~{inputBudget ? formatInt(inputBudget) : "n/a"} tokens
+                              </div>
+                              {tps ? <div>Speed ~{tps.toFixed(1)} tok/s</div> : null}
+                            </div>
+                          </div>
+                        </div>
+                      </>
+                    );
+                  })()
+                ) : (
+                  <div className="chat-context-hover" aria-label="Context status unavailable">
                     <svg
-                      className="chat-context-ring"
+                      className="chat-context-ring disabled"
                       viewBox="0 0 36 36"
                       role="img"
                       aria-hidden="true"
                     >
-                      <circle
-                        className="chat-context-ring-track"
-                        cx={cx}
-                        cy={cy}
-                        r={r}
-                      />
-                      <circle
-                        className="chat-context-ring-progress"
-                        cx={cx}
-                        cy={cy}
-                        r={r}
-                        strokeDasharray={circumference}
-                        strokeDashoffset={dashOffset}
-                        transform={`rotate(-90 ${cx} ${cy})`}
-                      />
-                      <circle className="chat-context-ring-center" cx={cx} cy={cy} r={11} />
+                      <circle className="chat-context-ring-track" cx={18} cy={18} r={16} />
+                      <circle className="chat-context-ring-progress" cx={18} cy={18} r={16} />
+                      <circle className="chat-context-ring-center" cx={18} cy={18} r={11} />
                     </svg>
                     <div className="chat-context-tooltip" role="tooltip">
                       <div className="chat-context-tooltip-title">Context</div>
-                      <div className="chat-context-tooltip-body">
-                        <div>
-                          Used {pctUsed}% · Remaining {formatInt(left)} / {formatInt(cap)} tokens
-                        </div>
-                        <div>Max input ~{inputBudget ? formatInt(inputBudget) : "n/a"} tokens</div>
-                        {tps ? <div>Speed ~{tps.toFixed(1)} tok/s</div> : null}
-                      </div>
+                      <div className="chat-context-tooltip-body">Unavailable</div>
                     </div>
                   </div>
-                </>
-              );
-            })()
-          ) : (
-            <div className="chat-context-hover" aria-label="Context status unavailable">
-              <svg
-                className="chat-context-ring disabled"
-                viewBox="0 0 36 36"
-                role="img"
-                aria-hidden="true"
-              >
-                <circle className="chat-context-ring-track" cx={18} cy={18} r={16} />
-                <circle className="chat-context-ring-progress" cx={18} cy={18} r={16} />
-                <circle className="chat-context-ring-center" cx={18} cy={18} r={11} />
-              </svg>
-              <div className="chat-context-tooltip" role="tooltip">
-                <div className="chat-context-tooltip-title">Context</div>
-                <div className="chat-context-tooltip-body">Unavailable</div>
+                )}
               </div>
+              <button
+                className="chat-send-btn"
+                onClick={isStreaming ? stopStreaming : sendMessage}
+                disabled={
+                  !active ||
+                  (isStreaming && !activeRequestId) ||
+                  (!isStreaming && (isSending || !input.trim()))
+                }
+                aria-label={isStreaming ? "Stop response" : "Send"}
+              >
+                {isStreaming ? (
+                  <Square className="w-5 h-5" style={{ width: "20px", height: "20px" }} />
+                ) : (
+                  <SendUpIcon size={20} />
+                )}
+              </button>
             </div>
-          )}
+          </div>
         </div>
       </div>
     </div>

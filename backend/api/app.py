@@ -4,7 +4,7 @@ import logging
 import sys
 import threading
 import time
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from starlette.responses import JSONResponse
 
 # Boot trace (optional import)
@@ -199,6 +199,14 @@ def create_app() -> FastAPI:
         print(f"[APP IMPORT] backend.services.logging_config: {_logging_elapsed:.2f}s", file=sys.stderr)
 
     app = FastAPI(title="Insight Backend")
+    # Initialize per-app dependency container and bind it as the default for background work.
+    try:
+        from backend.api.deps import bind_container, create_container
+
+        app.state.deps = create_container()
+        bind_container(app.state.deps)
+    except Exception:
+        app.state.deps = None
 
     if _boot_trace_available:
         try:
@@ -224,21 +232,59 @@ def create_app() -> FastAPI:
         is_ipc = request.headers.get(_IPC_HEADER) == _IPC_VALUE
         if not is_ipc:
             return JSONResponse(status_code=403, content={"ok": False, "error": "ipc_required"})
-        return await call_next(request)
+        token = None
+        try:
+            if getattr(app.state, "deps", None) is not None:
+                from backend.api.deps import set_request_container
+
+                token = set_request_container(app.state.deps)
+            return await call_next(request)
+        finally:
+            if token is not None:
+                from backend.api.deps import reset_request_container
+
+                reset_request_container(token)
+
+    def _normalize_detail(detail):
+        if isinstance(detail, dict):
+            if "error" in detail or "message" in detail:
+                return detail
+            # Preserve existing structure but add a generic error code.
+            return {"error": "http_error", "message": detail.get("detail") or str(detail)}
+        if isinstance(detail, str):
+            return {"error": "http_error", "message": detail}
+        return {"error": "http_error", "message": str(detail)}
+
+    @app.exception_handler(HTTPException)
+    async def _http_exception_handler(_request: Request, exc: HTTPException):
+        detail = _normalize_detail(exc.detail)
+        return JSONResponse(status_code=exc.status_code, content={"detail": detail})
+
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(_request: Request, exc: Exception):
+        logger.exception("Unhandled API error")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": {"error": "internal_error", "message": "Internal server error"}},
+        )
+
+    @app.on_event("shutdown")
+    async def _shutdown_deps() -> None:
+        try:
+            from backend.api.deps import AppDependencies
+
+            AppDependencies.close_all()
+        except Exception:
+            pass
+
+    from backend.api.routers import chat
 
     app.include_router(docs.router)
     app.include_router(files.router)
     app.include_router(search.router)
     app.include_router(settings.router)
+    app.include_router(chat.router)
     app.include_router(diagnostics.router)  # Packaging diagnostics
-
-    # Register the app for background chat-router loading (no startup import).
-    try:
-        from backend.api.chat_router_loader import register_app
-
-        register_app(app)
-    except Exception:
-        pass
 
     # NOTE: Embedding auto-download DISABLED to avoid blocking startup
     # Users must manually install embeddings via Settings → Embeddings

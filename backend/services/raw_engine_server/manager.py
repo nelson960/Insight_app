@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 
-_UVICORN_RE = re.compile(r"Uvicorn running on https?://([^:]+):(\\d+)")
-_FALLBACK_RE = re.compile(r"falling back to (\\d+)")
+_UVICORN_RE = re.compile(r"Uvicorn running on https?://([^:]+):(\d+)")
+_FALLBACK_RE = re.compile(r"falling back to (\d+)")
 
 
 class RawEngineServerManager:
@@ -74,6 +74,8 @@ class RawEngineServerManager:
             exit_code = None
         with self._lock:
             self._exit_code = exit_code
+            if exit_code is not None and exit_code != 0:
+                self._start_error = f"Raw server exited with code {exit_code}"
 
     def status(self) -> Dict[str, Any]:
         with self._lock:

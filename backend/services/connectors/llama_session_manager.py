@@ -20,6 +20,12 @@ import llama_cpp
 from llama_cpp import Llama
 
 from backend.services.storage.sqlite_store import SQLiteMetadataStore
+from backend.services.llama_templates import (
+    apply_chat_template_minja,
+    chat_template_error_message,
+    normalize_messages_for_template,
+    validate_chat_template_for_llm,
+)
 from backend.services.ipc_events import emit_event
 
 try:
@@ -31,11 +37,94 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+_DEFAULT_REASONING_TAGS = (
+    "think",
+    "analysis",
+    "reasoning",
+    "thoughts",
+    "scratchpad",
+    "plan",
+    "reflection",
+)
+
+
+class _ReasoningStripper:
+    def __init__(self, tags: Optional[List[str]] = None) -> None:
+        tag_names = [t.strip().lower() for t in (tags or list(_DEFAULT_REASONING_TAGS)) if t]
+        start_tags = [f"<{t}>" for t in tag_names]
+        end_tags = [f"</{t}>" for t in tag_names]
+        self._start_tags = tuple(start_tags)
+        self._end_tags = tuple(end_tags)
+        self._buf = ""
+        self._in_hidden = False
+        self._max_start = max((len(t) for t in self._start_tags), default=0)
+        self._max_end = max((len(t) for t in self._end_tags), default=0)
+
+    @staticmethod
+    def _find_earliest(buf_lower: str, tags: tuple[str, ...]) -> tuple[int, Optional[str]]:
+        earliest = -1
+        found: Optional[str] = None
+        for tag in tags:
+            idx = buf_lower.find(tag)
+            if idx != -1 and (earliest == -1 or idx < earliest):
+                earliest = idx
+                found = tag
+        return earliest, found
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        self._buf += text
+        out: List[str] = []
+
+        while self._buf:
+            buf_lower = self._buf.lower()
+            if self._in_hidden:
+                idx, tag = self._find_earliest(buf_lower, self._end_tags)
+                if idx == -1:
+                    keep = max(0, self._max_end - 1)
+                    if len(self._buf) > keep:
+                        self._buf = self._buf[-keep:] if keep else ""
+                    break
+                self._buf = self._buf[idx + len(tag or "") :]
+                self._in_hidden = False
+                continue
+
+            idx_start, tag_start = self._find_earliest(buf_lower, self._start_tags)
+            idx_end, tag_end = self._find_earliest(buf_lower, self._end_tags)
+
+            if idx_start == -1 and idx_end == -1:
+                keep = max(0, self._max_start - 1)
+                if len(self._buf) <= keep:
+                    break
+                cut = len(self._buf) - keep
+                out.append(self._buf[:cut])
+                self._buf = self._buf[cut:]
+                break
+
+            if idx_start != -1 and (idx_end == -1 or idx_start < idx_end):
+                idx, tag, kind = idx_start, tag_start, "start"
+            else:
+                idx, tag, kind = idx_end, tag_end, "end"
+
+            if idx > 0:
+                out.append(self._buf[:idx])
+            self._buf = self._buf[idx + len(tag or "") :]
+            if kind == "start":
+                self._in_hidden = True
+
+        return "".join(out)
+
+    def flush(self) -> str:
+        if self._in_hidden:
+            self._buf = ""
+            return ""
+        tail = self._buf
+        self._buf = ""
+        return tail
+
 class LlamaSessionManager:
-    _PROMPT_RENDERER_LLAMA3 = "llama3_manual_v2"
-    _PROMPT_RENDERER_CHATML = "chatml_manual_v1"
-    _PROMPT_RENDERER_UNKNOWN = "unsupported"
-    _PROMPT_RENDERER_ID = _PROMPT_RENDERER_LLAMA3
+    _PROMPT_RENDERER_ID = "minja:unknown"
     _PERSIST_DEBOUNCE_SEC = 0.75
     _SNAPSHOT_DEBOUNCE_SEC = 0.35
     _STATE_KIND_COMPACT = "llama_state_compact_v1"
@@ -44,6 +133,8 @@ class LlamaSessionManager:
     _CONTEXT_MARGIN_PCT = 0.02
     _MAX_INPUT_PCT = 0.65
     _COMPACT_PCT = 0.70
+    _SAFETY_MARGIN = 128
+    _DEFAULT_LLM_TIMEOUT_SEC = 120.0
     """
     Single-model, multi-session manager using llama_cpp KV snapshots.
 
@@ -92,17 +183,45 @@ class LlamaSessionManager:
         except Exception:
             pass
 
-        # Select the prompt renderer based on GGUF metadata markers.
-        # This must happen after model load (so `llm.metadata` exists) and before
-        # we compute model_info() (which surfaces the selected renderer).
-        self._PROMPT_RENDERER_ID = self._detect_prompt_renderer_id()
-        if self._PROMPT_RENDERER_ID == self._PROMPT_RENDERER_UNKNOWN:
-            raise ValueError(
-                "Unsupported chat template for this model. "
-                "Please choose a GGUF with a known chat template (Llama-3 or Qwen/ChatML)."
-            )
+        # Validate + select embedded chat template using llama.cpp's minja renderer.
+        tpl_result = validate_chat_template_for_llm(
+            self.llm,
+            model_path=self.model_path,
+            require_chat_template=True,
+            reject_multimodal=True,
+        )
+        if not tpl_result.ok:
+            raise ValueError(chat_template_error_message(tpl_result.reason))
+        self._chat_template = tpl_result.template
+        self._chat_template_name = tpl_result.template_name or "default"
+        # Treat None as supported; only explicit False triggers fallback.
+        self._template_system_supported = tpl_result.system_supported is not False
+        self._stop_token_ids = list(tpl_result.stop_token_ids or [])
+        self._stop_token_texts = list(tpl_result.stop_token_texts or [])
+        self._PROMPT_RENDERER_ID = f"minja:{self._chat_template_name}"
+        try:
+            preview = (tpl_result.rendered_preview or "").strip()
+            if preview:
+                max_len = 1200
+                shown = preview if len(preview) <= max_len else preview[:max_len] + "\n...[truncated]"
+                logger.info(
+                    "Chat template preview name=%s chars=%d\n%s",
+                    self._chat_template_name,
+                    len(preview),
+                    shown,
+                )
+        except Exception:
+            pass
+        if not self._template_system_supported:
+            logger.warning("Template ignores system messages; will inject system content into user turns")
 
         self._model_info = self._build_model_info()
+        self._model_family = self._infer_model_family()
+        self._model_policy = self._build_model_policy(self._model_family)
+        self._force_system_into_user = bool(self._model_policy.get("force_system_into_user"))
+        self._llm_timeout_sec = self._read_timeout_env("INSIGHT_LLM_TIMEOUT_SEC", self._DEFAULT_LLM_TIMEOUT_SEC)
+        self._strip_reasoning = bool(self._model_policy.get("strip_reasoning", True))
+        self._reasoning_tags = list(self._model_policy.get("reasoning_tags") or list(_DEFAULT_REASONING_TAGS))
         try:
             info = self._model_info
             logger.info(
@@ -119,8 +238,9 @@ class LlamaSessionManager:
 
         # session_id -> {"state": bytes, "messages": List[Dict], ...}
         self.sessions: Dict[str, Dict[str, object]] = {}
+        self._sessions_lock = threading.RLock()
         # Per-session locks must be re-entrant because compaction uses transient model runs
-        # while already inside an ask()/ask_stream() critical section.
+        # while already inside a request critical section.
         self._locks: Dict[str, threading.RLock] = {}
         self._model_lock = threading.Lock()
 
@@ -160,10 +280,12 @@ class LlamaSessionManager:
             self._start_persist_worker()
             self._load_persisted_sessions()
             try:
+                with self._sessions_lock:
+                    loaded_sessions = len(self.sessions)
                 logger.info(
                     "LlamaSessionManager using persist_dir=%s loaded_sessions=%d",
                     self.persist_dir,
-                    len(self.sessions),
+                    loaded_sessions,
                 )
             except Exception:
                 pass
@@ -213,11 +335,78 @@ class LlamaSessionManager:
             except Exception:
                 return None
 
+        def _meta_int_any(keys: List[str]) -> Optional[int]:
+            for k in keys:
+                v = _meta_int(k)
+                if v is not None:
+                    return v
+            return None
+
+        def _meta_int_suffix(suffixes: List[str]) -> Optional[int]:
+            try:
+                meta = getattr(self.llm, "metadata", {}) or {}
+            except Exception:
+                meta = {}
+            for key, value in meta.items():
+                if not isinstance(key, str):
+                    continue
+                if not any(key.endswith(sfx) for sfx in suffixes):
+                    continue
+                try:
+                    return int(value)
+                except Exception:
+                    continue
+            return None
+
+        def _meta_str_suffix(suffixes: List[str]) -> str:
+            try:
+                meta = getattr(self.llm, "metadata", {}) or {}
+            except Exception:
+                meta = {}
+            for key, value in meta.items():
+                if not isinstance(key, str):
+                    continue
+                if not any(key.endswith(sfx) for sfx in suffixes):
+                    continue
+                if value is None:
+                    continue
+                try:
+                    return str(value)
+                except Exception:
+                    continue
+            return ""
+
+        def _meta_float_suffix(suffixes: List[str]) -> Optional[float]:
+            try:
+                meta = getattr(self.llm, "metadata", {}) or {}
+            except Exception:
+                meta = {}
+            for key, value in meta.items():
+                if not isinstance(key, str):
+                    continue
+                if not any(key.endswith(sfx) for sfx in suffixes):
+                    continue
+                try:
+                    return float(value)
+                except Exception:
+                    continue
+            return None
+
         meta_arch = _meta_str("general.architecture")
         meta_name = _meta_str("general.name")
         meta_size = _meta_str("general.size_label")
+        meta_basename = _meta_str("general.basename")
+        meta_org = _meta_str("general.organization")
+        meta_repo = _meta_str("general.repo_url")
         meta_file_type = _meta_int("general.file_type")
         meta_quant_ver = _meta_int("general.quantization_version")
+
+        n_layer = _meta_int_suffix([".block_count"])
+        n_head = _meta_int_suffix([".attention.head_count"])
+        n_head_kv = _meta_int_suffix([".attention.head_count_kv"])
+        n_embd = _meta_int_suffix([".embedding_length"])
+        rope_type = _meta_str_suffix([".rope.type", ".rope.scaling.type"])
+        rope_freq_base = _meta_float_suffix([".rope.freq_base"])
 
         ctx_train: Optional[int] = None
         try:
@@ -225,34 +414,54 @@ class LlamaSessionManager:
         except Exception:
             ctx_train = None
         if ctx_train is None:
-            ctx_train = _meta_int("llama.context_length") or _meta_int("qwen2.context_length")
+            ctx_train = _meta_int_suffix([".context_length"])
 
-        # Chat template kind is inferred from GGUF `tokenizer.chat_template` markers.
-        template = _meta_str("tokenizer.chat_template")
-        if "<|start_header_id|>" in template and "<|eot_id|>" in template:
-            template_kind = "llama3"
-        elif "<|im_start|>" in template and "<|im_end|>" in template:
-            template_kind = "chatml"
-        else:
-            template_kind = "unknown"
+        template_name = str(getattr(self, "_chat_template_name", "") or "default")
+        template_kind = "embedded"
 
         # Tokenizer hints
         tok_model = _meta_str("tokenizer.ggml.model") or _meta_str("tokenizer.ggml.pre")
         add_bos = _meta_str("tokenizer.ggml.add_bos_token")
         bos_id = _meta_int("tokenizer.ggml.bos_token_id")
         eos_id = _meta_int("tokenizer.ggml.eos_token_id")
+        vocab_size: Optional[int] = None
+        try:
+            vocab_size = int(self.llm.n_vocab())  # type: ignore[attr-defined]
+        except Exception:
+            vocab_size = _meta_int("tokenizer.ggml.tokens")
+
+        kv_cache_gib: Optional[float] = None
+        try:
+            if n_layer and n_head and n_head_kv and n_embd and self.ctx_size:
+                head_dim = max(1, int(n_embd // max(1, n_head)))
+                kv_bytes = 4 * n_layer * int(self.ctx_size) * n_head_kv * head_dim
+                kv_cache_gib = kv_bytes / (1024 ** 3)
+        except Exception:
+            kv_cache_gib = None
 
         return {
             "path": str(self.model_path),
             "architecture": meta_arch,
             "name": meta_name,
             "size_label": meta_size,
+            "basename": meta_basename,
+            "organization": meta_org,
+            "repo_url": meta_repo,
             "file_type": meta_file_type,
             "quantization_version": meta_quant_ver,
+            "n_layer": n_layer,
+            "n_head": n_head,
+            "n_head_kv": n_head_kv,
+            "n_embd": n_embd,
+            "rope_type": rope_type or None,
+            "rope_freq_base": rope_freq_base,
+            "vocab_size": vocab_size,
+            "kv_cache_gib": kv_cache_gib,
             "ctx_train": ctx_train,
             "ctx_runtime": int(self.ctx_size) if self.ctx_size else None,
             "chat_template_kind": template_kind,
-            "chat_format": str(getattr(self, "chat_format", "") or ""),
+            "chat_template_name": template_name,
+            "chat_format": "",
             "prompt_renderer": str(getattr(self, "_PROMPT_RENDERER_ID", "") or ""),
             "tokenizer_model": tok_model,
             "add_bos_token": add_bos,
@@ -260,29 +469,39 @@ class LlamaSessionManager:
             "eos_token_id": eos_id,
         }
 
-    def _detect_prompt_renderer_id(self) -> str:
-        """
-        Infer which prompt renderer to use for the loaded model.
-
-        We render prompts ourselves. To keep correctness across models, we detect
-        common chat templates from GGUF metadata:
-        - Llama-3 style: <|start_header_id|> ... <|eot_id|>
-        - ChatML (Qwen/Qwen2.5): <|im_start|> ... <|im_end|>
-        """
+    def _infer_model_family(self) -> str:
         try:
             meta = getattr(self.llm, "metadata", {}) or {}
         except Exception:
             meta = {}
-        try:
-            template = str(meta.get("tokenizer.chat_template") or "")
-        except Exception:
-            template = ""
+        fields = [
+            str(meta.get("general.architecture") or ""),
+            str(meta.get("general.name") or ""),
+            str(meta.get("general.basename") or ""),
+            str(meta.get("general.organization") or ""),
+        ]
+        joined = " ".join(f.lower() for f in fields if f)
+        if "deepseek" in joined:
+            return "deepseek"
+        if "gpt-oss" in joined or "gpt oss" in joined:
+            return "gpt-oss"
+        if "qwen" in joined:
+            return "qwen"
+        if "mistral" in joined:
+            return "mistral"
+        if "llama 3" in joined or "llama-3" in joined:
+            return "llama3"
+        return "unknown"
 
-        if "<|im_start|>" in template and "<|im_end|>" in template:
-            return self._PROMPT_RENDERER_CHATML
-        if "<|start_header_id|>" in template and "<|eot_id|>" in template:
-            return self._PROMPT_RENDERER_LLAMA3
-        return self._PROMPT_RENDERER_UNKNOWN
+    def _build_model_policy(self, family: str) -> Dict[str, object]:
+        policy: Dict[str, object] = {
+            "force_system_into_user": False,
+            "strip_reasoning": True,
+            "reasoning_tags": list(_DEFAULT_REASONING_TAGS),
+        }
+        if family == "deepseek":
+            policy["force_system_into_user"] = True
+        return policy
 
     def cancel_request(self, request_id: str) -> bool:
         """
@@ -321,9 +540,10 @@ class LlamaSessionManager:
 
         dirty_sessions = 0
         try:
-            for s in self.sessions.values():
-                if isinstance(s, dict) and bool(s.get("_state_dirty")):
-                    dirty_sessions += 1
+            with self._sessions_lock:
+                for s in self.sessions.values():
+                    if isinstance(s, dict) and bool(s.get("_state_dirty")):
+                        dirty_sessions += 1
         except Exception:
             dirty_sessions = max(dirty_sessions, 1)
 
@@ -349,7 +569,7 @@ class LlamaSessionManager:
         with self._model_lock:
             self.llm.reset()
             messages: List[Dict[str, str]] = []
-            if system_prompt:
+            if system_prompt is not None:
                 messages.append({"role": "system", "content": system_prompt})
             # Ensure session KV matches our rendered prompt format (system wrapper included).
             self._prefill_chat_messages(messages)
@@ -363,7 +583,8 @@ class LlamaSessionManager:
             "_prompt_tokens": prompt_tokens,
             "prompt_renderer": self._PROMPT_RENDERER_ID,
         }
-        self.sessions[session_id] = session_payload
+        with self._sessions_lock:
+            self.sessions[session_id] = session_payload
         self._persist_session(session_id, session_payload)
         return session_id
 
@@ -371,14 +592,15 @@ class LlamaSessionManager:
         """
         Deterministically return an existing session or create one with the given ID.
         """
-        if session_id in self.sessions:
-            return session_id
+        with self._sessions_lock:
+            if session_id in self.sessions:
+                return session_id
 
         self._locks.setdefault(session_id, threading.RLock())
         with self._model_lock:
             self.llm.reset()
             messages: List[Dict[str, str]] = []
-            if system_prompt:
+            if system_prompt is not None:
                 messages.append({"role": "system", "content": system_prompt})
             self._prefill_chat_messages(messages)
             state_obj = self._save_state_compact()
@@ -391,7 +613,8 @@ class LlamaSessionManager:
             "_prompt_tokens": prompt_tokens,
             "prompt_renderer": self._PROMPT_RENDERER_ID,
         }
-        self.sessions[session_id] = session_payload
+        with self._sessions_lock:
+            self.sessions[session_id] = session_payload
         self._persist_session(session_id, session_payload)
         return session_id
 
@@ -418,7 +641,8 @@ class LlamaSessionManager:
         with lock:
             # Ensure the session exists and has a system message.
             self.get_or_create_session(session_id, system_prompt=system_prompt)
-            session = self.sessions.get(session_id)
+            with self._sessions_lock:
+                session = self.sessions.get(session_id)
             if session is None:
                 raise RuntimeError(f"Failed to create session {session_id}")
 
@@ -438,338 +662,13 @@ class LlamaSessionManager:
                 self._ensure_session_loaded(session_id, session)
                 self._commit_messages_to_session(session_id, session, normalized)
 
-            self.sessions[session_id] = session
-            self._persist_session(session_id, session)
-
-    def ask_stream(
-        self,
-        session_id: str,
-        message: str,
-        *,
-        max_tokens: int = 256,
-        temperature: float = 0.2,
-        request_id: Optional[str] = None,
-    ):
-        """
-        Streaming chat entry: yields tokens and updates the KV snapshot after completion.
-        """
-        logger.info(
-            "ask_stream start chat=%s request_id=%s prompt_chars=%d",
-            session_id,
-            request_id or "-",
-            len(message or ""),
-        )
-        lock = self._locks.setdefault(session_id, threading.RLock())
-        with lock:
-            session = self.sessions.get(session_id)
-            if session is None:
-                raise ValueError(f"Unknown session: {session_id}")
-            self._ensure_prompt_renderer(session_id, session)
-
-            if self.persist_dir:
-                kv_path = self.persist_dir / f"{session_id}.kv"
-                if not kv_path.exists():
-                    logger.warning("KV missing for %s, resetting to system-only state", session_id)
-                    system_messages = [m for m in session.get("messages", []) if m.get("role") == "system"]
-                    with self._model_lock:
-                        self.llm.reset()
-                        self._prefill_chat_messages(system_messages)
-                        fresh_state = self._save_state_compact()
-                        prompt = self._render_prompt(system_messages, add_generation_prompt=False)
-                        prompt_tokens = self._tokenize_prompt(prompt)
-                    session = {
-                        "state": fresh_state,
-                        "messages": system_messages,
-                        "compacted": False,
-                        "_prompt_tokens": prompt_tokens,
-                        "prompt_renderer": self._PROMPT_RENDERER_ID,
-                    }
-                    self.sessions[session_id] = session
-                    self._persist_session(session_id, session)
-
-            message = self._preflight_compact_and_budget(
-                session_id,
-                session,
-                message,
-                reserved_max_tokens=max_tokens,
-            )
-
-            reply_parts: List[str] = []
-            cancelled = False
-            with self._model_lock:
-                # Hold the global model lock for the entire streaming generation.
-                # llama_cpp is not safe to interleave with other calls while a stream
-                # iterator is active.
-                self._ensure_session_loaded(session_id, session)
-                # If the previous turn deferred the expensive KV snapshot, take it now so
-                # `base_state` always matches the current clean transcript.
-                if bool(session.get("_state_dirty")):
-                    session["state"] = self._save_state_compact()
-                    session["_state_dirty"] = False
-                    session.pop("_state_dirty_at", None)
-                base_state = session.get("state")
-                clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
-                clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
-                if not clean_tokens:
-                    clean_prompt = self._render_prompt(clean_messages, add_generation_prompt=False)
-                    clean_tokens = self._tokenize_prompt(clean_prompt)
-                run_messages: List[Dict[str, str]] = list(clean_messages)
-                run_messages.append({"role": "user", "content": message})
-
-                # Avoid llama.cpp hard failures when prompt_tokens + max_tokens > ctx_size.
-                run_prompt = self._render_prompt(run_messages, add_generation_prompt=True)
-                run_tokens = self._tokenize_prompt(run_prompt)
-                if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
-                    delta = run_tokens[len(clean_tokens) :]
-                    if delta:
-                        self._eval_tokens(delta)
-                else:
-                    self.llm.reset()
-                    self._eval_tokens(run_tokens)
-
-                prompt_tokens = len(run_tokens)
-                max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
-
-                logger.info(
-                    "ask_stream llama start chat=%s msgs=%d max_tokens=%d",
-                    session_id,
-                    len(run_messages),
-                    max_tokens,
-                )
-                with self._abort_lock:
-                    # Activate abort only for the duration of this generation.
-                    self._abort_request_id = request_id
-                    self._abort_event = threading.Event() if request_id else None
-
-                try:
-                    stream = self._create_completion_from_state(
-                        prompt_tokens=run_tokens,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stream=True,
-                        stop=self._stop_markers(),
-                    )
-
-                    for chunk in stream:
-                        token = (chunk.get("choices") or [{}])[0].get("text") or ""
-                        if not token:
-                            continue
-                        if not reply_parts:
-                            logger.info("ask_stream first token chat=%s request_id=%s", session_id, request_id or "-")
-                        logger.debug(
-                            "stream token (len=%d): %s",
-                            len(token),
-                            token[:80].replace("\n", "\\n"),
-                        )
-                        reply_parts.append(token)
-                        yield token
-                except Exception as exc:
-                    # If Stop was requested, llama.cpp abort callback will terminate generation.
-                    # Treat this as a clean cancellation.
-                    with self._abort_lock:
-                        if self._abort_event is not None and self._abort_event.is_set():
-                            cancelled = True
-                    if cancelled:
-                        logger.info("ask_stream cancelled chat=%s request_id=%s", session_id, request_id or "-")
-                    else:
-                        logger.exception("ask_stream error chat=%s request_id=%s", session_id, request_id or "-")
-                        raise
-                finally:
-                    # 🔔 fast UI signal that token streaming ended
-                    try:
-                        emit_event(
-                            "llm_stream_end",
-                            chat_id=session_id,
-                            request_id=request_id or "",
-                        )
-                    except Exception:
-                        pass
-                    with self._abort_lock:
-                        self._abort_request_id = None
-                        self._abort_event = None
-
-                reply = "".join(reply_parts)
-                logger.info(
-                    "ask_stream llama done chat=%s request_id=%s tokens=%d cancelled=%s",
-                    session_id,
-                    request_id or "-",
-                    len(reply_parts),
-                    cancelled,
-                )
-
-                # Restore clean KV before committing.
-                try:
-                    self.llm.reset()
-                    if base_state is not None:
-                        self._load_state_compact(base_state)
-                    self._active_session_id = session_id
-                except Exception:
-                    self._active_session_id = None
-
-                commit_messages: List[Dict[str, str]] = list(clean_messages)
-                commit_messages.append({"role": "user", "content": message})
-                if reply:
-                    commit_messages.append({"role": "assistant", "content": reply})
-                self._commit_messages_to_session(session_id, session, commit_messages)
-
-            self.sessions[session_id] = session
+            with self._sessions_lock:
+                self.sessions[session_id] = session
             self._persist_session(session_id, session)
 
     # -------------------------------------------------------------------------
     # Clean KV + ephemeral context pack API (preferred for RAG/doc chat)
     # -------------------------------------------------------------------------
-
-    def ask_with_context(
-        self,
-        session_id: str,
-        *,
-        user_text: str,
-        run_user_text: Optional[str] = None,
-        context_pack: str = "",
-        max_tokens: int = 256,
-        temperature: float = 0.2,
-    ) -> str:
-        """
-        Chat that keeps the persistent KV clean.
-
-        - Persistent (saved to session messages + KV): system + clean user + clean assistant
-        - Ephemeral (used only for this turn, not persisted): context_pack
-
-        Implementation: fork -> generate -> restore -> commit (append-only).
-        """
-        lock = self._locks.setdefault(session_id, threading.RLock())
-        with lock:
-            session = self.sessions.get(session_id)
-            if session is None:
-                raise ValueError(f"Unknown session: {session_id}")
-            self._ensure_prompt_renderer(session_id, session)
-
-            # One-time migration: older sessions persisted "turn_prompt" blobs into
-            # user messages, which pollutes KV and mixes context across turns.
-            # For v2, we keep KV clean and inject retrieval/doc context ephemerally.
-            self._ensure_clean_kv_mode(session_id, session)
-
-            if self.persist_dir:
-                kv_path = self.persist_dir / f"{session_id}.kv"
-                if not kv_path.exists():
-                    logger.warning("KV missing for %s, resetting to system-only state", session_id)
-                    system_messages = [m for m in session.get("messages", []) if m.get("role") == "system"]
-                    with self._model_lock:
-                        self.llm.reset()
-                        self._prefill_chat_messages(system_messages)
-                        fresh_state = self._save_state_compact()
-                        prompt = self._render_prompt(system_messages, add_generation_prompt=False)
-                        prompt_tokens = self._tokenize_prompt(prompt)
-                    session = {
-                        "state": fresh_state,
-                        "messages": system_messages,
-                        "compacted": False,
-                        "_prompt_tokens": prompt_tokens,
-                        "prompt_renderer": self._PROMPT_RENDERER_ID,
-                    }
-                    self.sessions[session_id] = session
-                    self._persist_session(session_id, session)
-
-            clean_user = (user_text or "").strip()
-            if not clean_user:
-                return ""
-
-            # Dirty run may include selection excerpts or other per-turn guidance.
-            # This must NOT be persisted into the clean session transcript/KV.
-            run_user = (run_user_text or clean_user).strip()
-            if not run_user:
-                run_user = clean_user
-
-            context_pack = (context_pack or "").strip()
-            context_pack = self._budget_context_pack(
-                session_id,
-                session,
-                user_text=run_user,
-                context_pack=context_pack,
-                reserved_max_tokens=max_tokens,
-            )
-
-            with self._model_lock:
-                self._ensure_session_loaded(session_id, session)
-                if bool(session.get("_state_dirty")):
-                    session["state"] = self._save_state_compact()
-                    session["_state_dirty"] = False
-                    session.pop("_state_dirty_at", None)
-                base_state = session.get("state")
-                clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
-                clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
-                if not clean_tokens:
-                    clean_prompt = self._render_prompt(clean_messages, add_generation_prompt=False)
-                    clean_tokens = self._tokenize_prompt(clean_prompt)
-
-                run_messages: List[Dict[str, str]] = list(clean_messages)
-                if context_pack:
-                    run_messages.append({"role": "system", "content": self._format_context_pack(context_pack)})
-                run_messages.append({"role": "user", "content": run_user})
-
-                run_prompt = self._render_prompt(run_messages, add_generation_prompt=True)
-                run_tokens = self._tokenize_prompt(run_prompt)
-                if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
-                    delta = run_tokens[len(clean_tokens) :]
-                    if delta:
-                        self._eval_tokens(delta)
-                else:
-                    self.llm.reset()
-                    self._eval_tokens(run_tokens)
-
-                prompt_tokens = len(run_tokens)
-                requested_max_tokens = int(max_tokens)
-                max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
-
-                # If the model hits max_tokens, the reply can look abruptly cut off.
-                # For "normal" answers, allow a larger hard cap so the model can reach
-                # an end-of-turn stop token naturally.
-                hard_total = int(max_tokens)
-                if int(max_tokens) >= 384 and self.ctx_size:
-                    margin = 128
-                    available_total = int(self.ctx_size) - int(prompt_tokens) - int(margin)
-                    if available_total > 0:
-                        hard_total = min(int(max_tokens) * 2, 1024, int(available_total))
-                logger.info(
-                    "ask_with_context output_budget chat=%s prompt_tokens=%d requested=%d clamped=%d hard_total=%d ctx=%d",
-                    session_id,
-                    prompt_tokens,
-                    requested_max_tokens,
-                    int(max_tokens),
-                    int(hard_total),
-                    int(self.ctx_size or 0),
-                )
-                session["last_output_budget"] = int(hard_total)
-                session["last_reserved_output"] = int(max_tokens)
-
-                out = self._create_completion_from_state(
-                    prompt_tokens=run_tokens,
-                    max_tokens=int(hard_total),
-                    temperature=temperature,
-                    stream=False,
-                    stop=self._stop_markers(),
-                )
-                reply = (out.get("choices") or [{}])[0].get("text") or ""
-
-                # Restore clean KV before committing.
-                try:
-                    self.llm.reset()
-                    if base_state is not None:
-                        self._load_state_compact(base_state)
-                    self._active_session_id = session_id
-                except Exception:
-                    # If restore fails, fallback to a rebuild commit below.
-                    self._active_session_id = None
-
-                commit_messages: List[Dict[str, str]] = list(clean_messages)
-                commit_messages.append({"role": "user", "content": clean_user})
-                if reply:
-                    commit_messages.append({"role": "assistant", "content": reply})
-
-                self._commit_messages_to_session(session_id, session, commit_messages)
-                self.sessions[session_id] = session
-                self._persist_session(session_id, session)
-                return reply
 
     def ask_stream_with_context(
         self,
@@ -781,28 +680,31 @@ class LlamaSessionManager:
         max_tokens: int = 256,
         temperature: float = 0.2,
         request_id: Optional[str] = None,
+        skip_user_message: bool = False,
     ):
         """
-        Streaming variant of `ask_with_context()`.
+        Streaming chat that keeps the persistent KV clean.
 
         Yields tokens from the "dirty" run (which includes ephemeral context pack),
         but commits only clean user + assistant text to persistent KV on completion.
         """
         logger.info(
-            "ask_stream_with_context start chat=%s request_id=%s user_chars=%d run_user_chars=%d ctx_chars=%d",
+            "ask_stream_with_context start chat=%s request_id=%s skip_user=%s user_chars=%d run_user_chars=%d ctx_chars=%d",
             session_id,
             request_id or "-",
+            bool(skip_user_message),
             len(user_text or ""),
             len(run_user_text or ""),
             len(context_pack or ""),
         )
         lock = self._locks.setdefault(session_id, threading.RLock())
         with lock:
-            session = self.sessions.get(session_id)
+            with self._sessions_lock:
+                session = self.sessions.get(session_id)
             if session is None:
                 raise ValueError(f"Unknown session: {session_id}")
 
-            # One-time migration to "clean KV" mode; see ask_with_context docstring.
+            # One-time migration to "clean KV" mode; see docstring above.
             self._ensure_clean_kv_mode(session_id, session)
 
             if self.persist_dir:
@@ -823,7 +725,8 @@ class LlamaSessionManager:
                         "_prompt_tokens": prompt_tokens,
                         "prompt_renderer": self._PROMPT_RENDERER_ID,
                     }
-                    self.sessions[session_id] = session
+                    with self._sessions_lock:
+                        self.sessions[session_id] = session
                     self._persist_session(session_id, session)
 
             clean_user = (user_text or "").strip()
@@ -833,6 +736,13 @@ class LlamaSessionManager:
             run_user = (run_user_text or clean_user).strip()
             if not run_user:
                 run_user = clean_user
+
+            run_user = self._preflight_compact_and_budget(
+                session_id,
+                session,
+                run_user,
+                reserved_max_tokens=max_tokens,
+            )
 
             context_pack = (context_pack or "").strip()
             context_pack = self._budget_context_pack(
@@ -844,6 +754,7 @@ class LlamaSessionManager:
             )
 
             reply_parts: List[str] = []
+            stripper = _ReasoningStripper(self._reasoning_tags) if getattr(self, "_strip_reasoning", True) else None
             cancelled = False
 
             with self._model_lock:
@@ -880,7 +791,19 @@ class LlamaSessionManager:
 
                 with self._abort_lock:
                     self._abort_request_id = request_id
-                    self._abort_event = threading.Event() if request_id else None
+                    self._abort_event = threading.Event()
+
+                timeout_timer: Optional[threading.Timer] = None
+                timeout_state: Dict[str, bool] = {"timed_out": False}
+                created_timeout_event = False
+                try:
+                    timeout_timer, timeout_state, created_timeout_event = self._start_llm_timeout(
+                        float(self._llm_timeout_sec or 0.0),
+                    )
+                except Exception:
+                    timeout_timer = None
+                    timeout_state = {"timed_out": False}
+                    created_timeout_event = False
 
                 t_gen_start: Optional[float] = None
                 t_first_token: Optional[float] = None
@@ -921,18 +844,38 @@ class LlamaSessionManager:
                     # meaningful and the throughput reflects user-perceived streaming.
                     t_gen_start = time.perf_counter()
                     for chunk in stream:
+                        if timeout_state.get("timed_out"):
+                            raise TimeoutError("LLM generation timed out")
                         token = (chunk.get("choices") or [{}])[0].get("text") or ""
                         if not token:
                             continue
+                        visible = stripper.feed(token) if stripper else token
+                        if not visible:
+                            continue
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
-                        reply_parts.append(token)
-                        yield token
+                        reply_parts.append(visible)
+                        yield visible
+                    tail = stripper.flush() if stripper else ""
+                    if tail:
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter()
+                        reply_parts.append(tail)
+                        yield tail
+                    if timeout_state.get("timed_out"):
+                        raise TimeoutError("LLM generation timed out")
                 except Exception:
                     with self._abort_lock:
                         if self._abort_event is not None and self._abort_event.is_set():
                             cancelled = True
-                    if cancelled:
+                    if timeout_state.get("timed_out"):
+                        cancelled = True
+                        logger.warning(
+                            "ask_stream_with_context timed out chat=%s request_id=%s",
+                            session_id,
+                            request_id or "-",
+                        )
+                    elif cancelled:
                         logger.info("ask_stream_with_context cancelled chat=%s request_id=%s", session_id, request_id or "-")
                     else:
                         logger.exception(
@@ -942,6 +885,7 @@ class LlamaSessionManager:
                         )
                         raise
                 finally:
+                    self._stop_llm_timeout(timeout_timer, created_timeout_event)
                     if t_gen_end is None:
                         t_gen_end = time.perf_counter()
                     # 🔔 NEW: notify UI immediately when streaming stops
@@ -1010,13 +954,15 @@ class LlamaSessionManager:
                     self._active_session_id = None
 
                 commit_messages: List[Dict[str, str]] = list(clean_messages)
-                commit_messages.append({"role": "user", "content": clean_user})
+                if not skip_user_message:
+                    commit_messages.append({"role": "user", "content": clean_user})
                 if reply:
                     commit_messages.append({"role": "assistant", "content": reply})
 
                 self._commit_messages_to_session(session_id, session, commit_messages)
 
-            self.sessions[session_id] = session
+            with self._sessions_lock:
+                self.sessions[session_id] = session
             self._persist_session(session_id, session)
 
     # -------------------------------------------------------------------------
@@ -1043,10 +989,60 @@ class LlamaSessionManager:
             # Streaming will still work, but Stop won't stop model compute.
             logger.warning("Failed to install llama.cpp abort callback: %s", exc)
 
+    @staticmethod
+    def _read_timeout_env(key: str, default: float) -> float:
+        raw = os.environ.get(key)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        try:
+            val = float(raw)
+        except Exception:
+            return float(default)
+        return float(val) if float(val) >= 0 else 0.0
+
+    def _start_llm_timeout(self, timeout_sec: float) -> tuple[Optional[threading.Timer], Dict[str, bool], bool]:
+        state = {"timed_out": False}
+        if not timeout_sec or timeout_sec <= 0:
+            return None, state, False
+
+        created_event = False
+        with self._abort_lock:
+            if self._abort_event is None:
+                self._abort_event = threading.Event()
+                created_event = True
+
+        def _fire() -> None:
+            state["timed_out"] = True
+            with self._abort_lock:
+                if self._abort_event is not None:
+                    self._abort_event.set()
+
+        timer = threading.Timer(float(timeout_sec), _fire)
+        timer.daemon = True
+        timer.start()
+        return timer, state, created_event
+
+    def _stop_llm_timeout(self, timer: Optional[threading.Timer], created_event: bool) -> None:
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        if created_event:
+            with self._abort_lock:
+                if self._abort_request_id is None:
+                    self._abort_event = None
+
     def _format_context_pack(self, context_pack: str) -> str:
         # This is injected as a system message for a single generation only.
         # Keep this string stable so tokenization/prefix-matching behaves predictably.
-        return "CONTEXT PACK (ephemeral; do not store in history):\n" + (context_pack or "").strip()
+        rules = (
+            "RULES:\n"
+            "- Answer ONLY using the text inside this CONTEXT PACK or the user-provided selection.\n"
+            "- If the answer is not explicitly supported by the provided text, say you don't know.\n"
+            "- Do not use outside knowledge or make assumptions.\n\n"
+        )
+        return "CONTEXT PACK (ephemeral; do not store in history):\n" + rules + (context_pack or "").strip()
 
     def _budget_context_pack(
         self,
@@ -1075,22 +1071,15 @@ class LlamaSessionManager:
         if ctx_size <= 0:
             return context_pack
 
-        margin = int(ctx_size * self._CONTEXT_MARGIN_PCT)
-        reserved_output = int(ctx_size * self._OUTPUT_RESERVE_PCT)
-
-        # Compact if the clean session is already near full.
-        self._maybe_compact(session_id, session, force=False)
+        margin = int(self._SAFETY_MARGIN)
+        reserved_output = int(reserved_max_tokens) + int(self._SAFETY_MARGIN)
 
         # If even the clean turn (user + reserved output) won't fit, force-compaction once.
         for attempt in range(2):
             history: List[Dict[str, str]] = list(session.get("messages", []))
             # Include an empty system message to account for chat-template overhead of the pack.
             probe = history + [{"role": "system", "content": ""}, {"role": "user", "content": user_text}]
-            try:
-                with self._model_lock:
-                    base_tokens = self._count_chat_prompt_tokens(probe)
-            except Exception:
-                base_tokens = self._estimate_tokens(probe)
+            base_tokens = self._count_projected_prompt_tokens(probe)
 
             available = int(ctx_size) - int(base_tokens) - int(reserved_output) - int(margin)
             if available <= 0:
@@ -1109,11 +1098,7 @@ class LlamaSessionManager:
                 {"role": "system", "content": self._format_context_pack(trimmed)},
                 {"role": "user", "content": user_text},
             ]
-            try:
-                with self._model_lock:
-                    prompt_tokens = self._count_chat_prompt_tokens(candidate_msgs)
-            except Exception:
-                prompt_tokens = self._estimate_tokens(candidate_msgs)
+            prompt_tokens = self._count_projected_prompt_tokens(candidate_msgs)
             if prompt_tokens + reserved_output + margin <= self.ctx_size:
                 return trimmed
             available = max(1, int(available * 0.7))
@@ -1199,7 +1184,16 @@ class LlamaSessionManager:
         # Be conservative: large batches near the end of the context can trigger shape mismatches.
         step = max(1, min(n_batch, 512))
         for i in range(0, len(tokens), step):
-            self.llm.eval(tokens[i : i + step])
+            try:
+                self.llm.eval(tokens[i : i + step])
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "llama_decode returned -3" in msg:
+                    raise ValueError(
+                        "Model decode failed (likely GPU/Metal out of memory). "
+                        "Try lowering GPU layers or use a smaller model."
+                    ) from exc
+                raise
 
     def _create_completion_from_state(
         self,
@@ -1223,6 +1217,11 @@ class LlamaSessionManager:
         """
         stop = stop or []
         stop_token_ids: set[int] = set()
+        for tid in getattr(self, "_stop_token_ids", []) or []:
+            try:
+                stop_token_ids.add(int(tid))
+            except Exception:
+                pass
         for s in stop:
             if not isinstance(s, str) or not s:
                 continue
@@ -1302,12 +1301,44 @@ class LlamaSessionManager:
         self._eval_tokens(tokens)
 
     def _render_prompt(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool) -> str:
-        renderer = str(getattr(self, "_PROMPT_RENDERER_ID", "") or self._PROMPT_RENDERER_LLAMA3)
-        if renderer == self._PROMPT_RENDERER_CHATML:
-            return self._render_chatml_prompt(messages, add_generation_prompt=add_generation_prompt)
-        if renderer == self._PROMPT_RENDERER_UNKNOWN:
-            raise ValueError("Unsupported chat template for this model.")
-        return self._render_llama3_prompt(messages, add_generation_prompt=add_generation_prompt)
+        if not getattr(self, "_chat_template", None):
+            raise ValueError("Missing chat template for this model.")
+        normalized = normalize_messages_for_template(messages)
+        if (not self._template_system_supported) or bool(getattr(self, "_force_system_into_user", False)):
+            normalized = self._coerce_system_into_user(normalized)
+        return apply_chat_template_minja(
+            self._chat_template,
+            normalized,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+    def _coerce_system_into_user(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        Some GGUF templates ignore system messages. To preserve system intent,
+        merge system content into the first user turn and blank system content.
+        """
+        system_chunks: List[str] = []
+        out: List[Dict[str, str]] = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content") or ""
+            if role == "system":
+                if content.strip():
+                    system_chunks.append(content.strip())
+                out.append({"role": "system", "content": ""})
+            else:
+                out.append({"role": role or "user", "content": content})
+
+        if system_chunks:
+            preamble = "\n\n".join(system_chunks)
+            for msg in out:
+                if msg.get("role") == "user":
+                    msg["content"] = f"{preamble}\n\n{msg.get('content') or ''}".strip()
+                    break
+            else:
+                out.append({"role": "user", "content": preamble})
+
+        return out
 
     def _stop_markers(self) -> List[str]:
         """
@@ -1315,70 +1346,10 @@ class LlamaSessionManager:
 
         NOTE: `_create_completion_from_state()` also always stops on the model EOS token id.
         """
-        renderer = str(getattr(self, "_PROMPT_RENDERER_ID", "") or self._PROMPT_RENDERER_LLAMA3)
-        if renderer == self._PROMPT_RENDERER_CHATML:
-            # ChatML/Qwen-style turns end with <|im_end|>. Some models also use <|endoftext|>.
-            return ["<|im_end|>", "<|endoftext|>"]
-        return ["<|eot_id|>", "<|end_of_text|>"]
-
-    def _render_chatml_prompt(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool) -> str:
-        """
-        Minimal ChatML prompt renderer (Qwen/Qwen2.5 instruct).
-
-        Matches GGUF chat templates of the form:
-          <|im_start|>{role}\n{content}<|im_end|>\n
-        """
-        system_message = ""
-        has_system = False
-        rest = list(messages or [])
-        if rest and rest[0].get("role") == "system":
-            has_system = True
-            system_message = rest[0].get("content") or ""
-            rest = rest[1:]
-
-        out: List[str] = []
-        # Always include a system block for stability (even if empty).
-        out.append("<|im_start|>system\n")
-        out.append(system_message)
-        out.append("<|im_end|>\n")
-
-        for msg in rest:
-            role = (msg.get("role") or "user").strip()
-            content = msg.get("content") or ""
-            out.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
-
-        if add_generation_prompt:
-            out.append("<|im_start|>assistant\n")
-
-        return "".join(out)
-
-    def _render_llama3_prompt(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool) -> str:
-        """
-        Minimal Llama-3 prompt renderer compatible with llama.cpp tokenizers.
-
-        Keep this minimal + stable to maximize prefix-matching.
-        """
-        system_message = ""
-        rest = list(messages or [])
-        if rest and rest[0].get("role") == "system":
-            system_message = rest[0].get("content") or ""
-            rest = rest[1:]
-
-        out: List[str] = []
-        out.append("<|begin_of_text|>")
-        out.append("<|start_header_id|>system<|end_header_id|>\n\n")
-        out.append(system_message)
-        out.append("<|eot_id|>")
-
-        for msg in rest:
-            role = (msg.get("role") or "user").strip()
-            content = msg.get("content") or ""
-            out.append(f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>")
-
-        if add_generation_prompt:
-            out.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
-
-        return "".join(out)
+        texts = list(getattr(self, "_stop_token_texts", []) or [])
+        if texts:
+            return texts
+        return []
 
     def _looks_like_legacy_turn_prompt(self, messages: List[Dict[str, str]]) -> bool:
         """
@@ -1433,7 +1404,8 @@ class LlamaSessionManager:
             session["_prompt_tokens"] = self._tokenize_prompt(prompt)
 
         session["prompt_renderer"] = self._PROMPT_RENDERER_ID
-        self.sessions[session_id] = session
+        with self._sessions_lock:
+            self.sessions[session_id] = session
         self._persist_session(session_id, session)
 
     def _ensure_clean_kv_mode(self, session_id: str, session: Dict[str, object]) -> None:
@@ -1480,119 +1452,28 @@ class LlamaSessionManager:
         session["messages"] = new_msgs
         session["compacted"] = True
         session["kv_mode"] = "clean_v2"
-        self.sessions[session_id] = session
+        with self._sessions_lock:
+            self.sessions[session_id] = session
         self._persist_session(session_id, session)
 
-    def ask(
-        self,
-        session_id: str,
-        message: str,
-        *,
-        max_tokens: int = 256,
-        temperature: float = 0.2,
-    ) -> str:
-        """
-        Main chat entry: appends user+assistant messages and updates the KV snapshot.
-        """
-        lock = self._locks.setdefault(session_id, threading.RLock())
-        with lock:
-            session = self.sessions.get(session_id)
-            if session is None:
-                raise ValueError(f"Unknown session: {session_id}")
-
-            # If the persisted KV file was removed externally, reset this session.
-            if self.persist_dir:
-                kv_path = self.persist_dir / f"{session_id}.kv"
-                if not kv_path.exists():
-                    logger.warning("KV missing for %s, resetting to system-only state", session_id)
-                    system_messages = [m for m in session.get("messages", []) if m.get("role") == "system"]
-                    with self._model_lock:
-                        self.llm.reset()
-                        self._prefill_chat_messages(system_messages)
-                        fresh_state = self._save_state_compact()
-                        prompt = self._render_prompt(system_messages, add_generation_prompt=False)
-                        prompt_tokens = self._tokenize_prompt(prompt)
-                    session = {
-                        "state": fresh_state,
-                        "messages": system_messages,
-                        "compacted": False,
-                        "_prompt_tokens": prompt_tokens,
-                        "prompt_renderer": self._PROMPT_RENDERER_ID,
-                    }
-                    self.sessions[session_id] = session
-                    self._persist_session(session_id, session)
-
-            message = self._preflight_compact_and_budget(
-                session_id,
-                session,
-                message,
-                reserved_max_tokens=max_tokens,
-            )
-
-            with self._model_lock:
-                try:
-                    # Load KV only if we are switching sessions
-                    self._ensure_session_loaded(session_id, session)
-                    if bool(session.get("_state_dirty")):
-                        session["state"] = self._save_state_compact()
-                        session["_state_dirty"] = False
-                        session.pop("_state_dirty_at", None)
-                    base_state = session.get("state")
-                    clean_messages: List[Dict[str, str]] = list(session.get("messages", []))
-                    clean_tokens: List[int] = list(session.get("_prompt_tokens") or [])
-                    if not clean_tokens:
-                        clean_prompt = self._render_prompt(clean_messages, add_generation_prompt=False)
-                        clean_tokens = self._tokenize_prompt(clean_prompt)
-                    run_messages: List[Dict[str, str]] = list(clean_messages)
-                    run_messages.append({"role": "user", "content": message})
-
-                    # Avoid llama.cpp hard failures when prompt_tokens + max_tokens > ctx_size.
-                    run_prompt = self._render_prompt(run_messages, add_generation_prompt=True)
-                    run_tokens = self._tokenize_prompt(run_prompt)
-                    if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
-                        delta = run_tokens[len(clean_tokens) :]
-                        if delta:
-                            self._eval_tokens(delta)
-                    else:
-                        self.llm.reset()
-                        self._eval_tokens(run_tokens)
-
-                    prompt_tokens = len(run_tokens)
-                    max_tokens = self._clamp_max_tokens(session_id, prompt_tokens, max_tokens)
-
-                    out = self._create_completion_from_state(
-                        prompt_tokens=run_tokens,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stream=False,
-                        stop=self._stop_markers(),
-                    )
-                    reply = (out.get("choices") or [{}])[0].get("text") or ""
-
-                    # Restore clean KV before committing.
-                    try:
-                        self.llm.reset()
-                        if base_state is not None:
-                            self._load_state_compact(base_state)
-                        self._active_session_id = session_id
-                    except Exception:
-                        self._active_session_id = None
-
-                    commit_messages: List[Dict[str, str]] = list(clean_messages)
-                    commit_messages.append({"role": "user", "content": message})
-                    if reply:
-                        commit_messages.append({"role": "assistant", "content": reply})
-                    self._commit_messages_to_session(session_id, session, commit_messages)
-
-                    self.sessions[session_id] = session
-                    self._persist_session(session_id, session)
-                    return reply
-                except Exception as exc:
-                    logger.error("ask failed for chat=%s: %s", session_id, exc)
-                    raise
-
     def get_context_status(self, session_id: str) -> Dict[str, object]:
-        session = self.sessions.get(session_id)
+        with self._sessions_lock:
+            session = self.sessions.get(session_id)
+        if session is None:
+            # Best-effort: hydrate from SQLite transcript (for restored chats after restart).
+            ui_msgs = self._fetch_ui_transcript(session_id, max_messages=80)
+            if ui_msgs:
+                try:
+                    self.seed_session_messages(session_id, messages=ui_msgs, system_prompt=None)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.get_or_create_session(session_id, system_prompt=None)
+                except Exception:
+                    pass
+            with self._sessions_lock:
+                session = self.sessions.get(session_id)
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
         messages = session.get("messages", [])
@@ -1609,7 +1490,24 @@ class LlamaSessionManager:
             "capacity_tokens": capacity,
             "percent": round(percent * 100, 2),
             "compacted": bool(session.get("compacted", False)),
+            "compacting": bool(session.get("compacting", False)),
         }
+        try:
+            info = dict(self._model_info or {})
+        except Exception:
+            info = {}
+        if info:
+            status["model"] = {
+                "name": info.get("name"),
+                "size_label": info.get("size_label"),
+                "architecture": info.get("architecture"),
+                "ctx_runtime": info.get("ctx_runtime"),
+                "ctx_train": info.get("ctx_train"),
+                "file_type": info.get("file_type"),
+                "quantization_version": info.get("quantization_version"),
+                "chat_template_name": info.get("chat_template_name") or info.get("chat_template_kind"),
+                "prompt_renderer": info.get("prompt_renderer"),
+            }
         last_tps = session.get("last_gen_tps")
         if isinstance(last_tps, (int, float)) and math.isfinite(float(last_tps)) and float(last_tps) > 0:
             status["last_gen_tps"] = float(last_tps)
@@ -1633,7 +1531,8 @@ class LlamaSessionManager:
         return status
 
     def fork_session(self, session_id: str) -> str:
-        session = self.sessions.get(session_id)
+        with self._sessions_lock:
+            session = self.sessions.get(session_id)
         if session is None:
             raise ValueError(f"Unknown session to fork: {session_id}")
         new_session_id = str(uuid.uuid4())
@@ -1645,7 +1544,8 @@ class LlamaSessionManager:
             "compacted": session.get("compacted", False),
             "_prompt_tokens": list(session.get("_prompt_tokens") or []),
         }
-        self.sessions[new_session_id] = fork_payload
+        with self._sessions_lock:
+            self.sessions[new_session_id] = fork_payload
         self._locks.setdefault(new_session_id, threading.RLock())
         self._persist_session(new_session_id, fork_payload)
         return new_session_id
@@ -1653,7 +1553,8 @@ class LlamaSessionManager:
     def reset_session(self, session_id: str) -> None:
         lock = self._locks.setdefault(session_id, threading.RLock())
         with lock:
-            session = self.sessions.get(session_id)
+            with self._sessions_lock:
+                session = self.sessions.get(session_id)
             if session is None:
                 raise ValueError(f"Unknown session: {session_id}")
             system_messages = [m for m in session.get("messages", []) if m.get("role") == "system"]
@@ -1668,13 +1569,15 @@ class LlamaSessionManager:
                 session["prompt_renderer"] = self._PROMPT_RENDERER_ID
             session["messages"] = system_messages
             session["compacted"] = False
-            self.sessions[session_id] = session
+            with self._sessions_lock:
+                self.sessions[session_id] = session
             self._persist_session(session_id, session)
 
     def delete_session(self, session_id: str) -> None:
         lock = self._locks.setdefault(session_id, threading.RLock())
         with lock:
-            self.sessions.pop(session_id, None)
+            with self._sessions_lock:
+                self.sessions.pop(session_id, None)
             with self._persist_mutex:
                 self._persist_pending.pop(session_id, None)
                 self._persist_scheduled.discard(session_id)
@@ -1696,30 +1599,8 @@ class LlamaSessionManager:
                         p.unlink()
 
     def list_sessions(self) -> List[str]:
-        return list(self.sessions.keys())
-
-    # -------------------------------------------------------------------------
-    # Raw / transient / ephemeral calls
-    # -------------------------------------------------------------------------
-
-    def ask_raw(self, session_id: str, text: str, *, max_tokens: int = 256, temperature: float = 0.2) -> str:
-        """
-        Invoke the model with a raw prompt (no chat template), using the KV state for the session.
-        """
-        lock = self._locks.setdefault(session_id, threading.RLock())
-        with lock:
-            session = self.sessions.get(session_id)
-            if session is None:
-                raise ValueError(f"Unknown session: {session_id}")
-            with self._model_lock:
-                self._ensure_session_loaded(session_id, session)
-                out = self.llm(text, max_tokens=max_tokens, temperature=temperature)
-                reply = out["choices"][0]["text"]
-                session["state"] = self._save_state_compact()
-                self._active_session_id = session_id
-            self.sessions[session_id] = session
-            self._persist_session(session_id, session)
-            return reply
+        with self._sessions_lock:
+            return list(self.sessions.keys())
 
     def run_transient(self, session_id: str, prompt: str, *, max_tokens: int = 256, temperature: float = 0.2) -> str:
         """
@@ -1728,7 +1609,8 @@ class LlamaSessionManager:
         """
         lock = self._locks.setdefault(session_id, threading.RLock())
         with lock:
-            session = self.sessions.get(session_id)
+            with self._sessions_lock:
+                session = self.sessions.get(session_id)
             if session is None:
                 raise ValueError(f"Unknown session: {session_id}")
 
@@ -1737,49 +1619,24 @@ class LlamaSessionManager:
                 # We explicitly do NOT rely on current _active_session_id here,
                 # since we want a clean run that won't contaminate the chat history.
                 self.llm.reset()
-                out = self.llm(prompt, max_tokens=max_tokens, temperature=temperature)
-                reply = out["choices"][0]["text"]
+                timeout_timer, timeout_state, created_timeout_event = self._start_llm_timeout(
+                    float(self._llm_timeout_sec or 0.0),
+                )
+                try:
+                    out = self.llm(prompt, max_tokens=max_tokens, temperature=temperature)
+                    if timeout_state.get("timed_out"):
+                        raise TimeoutError("LLM generation timed out")
+                    reply = out["choices"][0]["text"]
+                except Exception as exc:
+                    if timeout_state.get("timed_out"):
+                        raise TimeoutError("LLM generation timed out") from exc
+                    raise
+                finally:
+                    self._stop_llm_timeout(timeout_timer, created_timeout_event)
                 # restore original state
                 self._load_state_compact(original_state)
                 self._active_session_id = session_id
             return reply
-
-    def run_ephemeral(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        *,
-        max_tokens: int = 256,
-        temperature: float = 0.2,
-    ) -> str:
-        """
-        Run a one-off chat-completion without touching any session state.
-        The model is reset before and after to avoid contaminating KV cache.
-        """
-        with self._model_lock:
-            try:
-                self.llm.reset()
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ]
-                prompt = self._render_prompt(messages, add_generation_prompt=True)
-                out = self.llm(
-                    prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=0.9,
-                    repeat_penalty=1.15,
-                    frequency_penalty=0.6,
-                    stop=["SUMMARY_END"],
-                )
-                return ((out.get("choices") or [{}])[0].get("text") or "").strip()
-            finally:
-                try:
-                    self.llm.reset()
-                except Exception:
-                    pass
-                self._active_session_id = None
 
     # -------------------------------------------------------------------------
     # Persistence helpers
@@ -1911,7 +1768,8 @@ class LlamaSessionManager:
                 if state_obj is None and messages:
                     session_payload["_state_dirty"] = True
                     session_payload["_state_dirty_at"] = time.monotonic()
-                self.sessions[session_id] = session_payload
+                with self._sessions_lock:
+                    self.sessions[session_id] = session_payload
                 self._locks.setdefault(session_id, threading.RLock())
             except Exception:
                 logger.warning("Failed to load persisted session from %s", path, exc_info=True)
@@ -1982,7 +1840,8 @@ class LlamaSessionManager:
                 while True:
                     lock = self._locks.setdefault(session_id, threading.RLock())
                     with lock:
-                        session = self.sessions.get(session_id)
+                        with self._sessions_lock:
+                            session = self.sessions.get(session_id)
                         if not isinstance(session, dict):
                             break
                         if not bool(session.get("_state_dirty")):
@@ -1995,19 +1854,21 @@ class LlamaSessionManager:
 
                     lock = self._locks.setdefault(session_id, threading.RLock())
                     with lock:
-                        session = self.sessions.get(session_id)
+                        with self._sessions_lock:
+                            session = self.sessions.get(session_id)
                         if not isinstance(session, dict) or not bool(session.get("_state_dirty")):
                             break
-                        # Snapshotting requires that this session is currently loaded.
-                        if self._active_session_id != session_id:
-                            break
                         with self._model_lock:
+                            # Snapshotting requires that this session is currently loaded.
+                            if self._active_session_id != session_id:
+                                break
                             # Active session already loaded; capture a compact snapshot.
                             session["state"] = self._save_state_compact()
                             session["_state_dirty"] = False
                             session.pop("_state_dirty_at", None)
                             self._active_session_id = session_id
-                        self.sessions[session_id] = session
+                        with self._sessions_lock:
+                            self.sessions[session_id] = session
                         self._persist_session(session_id, session)
                     break
             finally:
@@ -2295,7 +2156,8 @@ class LlamaSessionManager:
         # risk), so we only snapshot if we can acquire the lock immediately.
         prev_id = self._active_session_id
         if prev_id and prev_id != session_id:
-            prev = self.sessions.get(prev_id)
+            with self._sessions_lock:
+                prev = self.sessions.get(prev_id)
             if isinstance(prev, dict) and bool(prev.get("_state_dirty")):
                 prev_lock = self._locks.get(prev_id) or self._locks.setdefault(prev_id, threading.RLock())
                 acquired = False
@@ -2312,7 +2174,8 @@ class LlamaSessionManager:
                         prev["state"] = self._save_state_compact()
                         prev["_state_dirty"] = False
                         prev.pop("_state_dirty_at", None)
-                        self.sessions[prev_id] = prev
+                        with self._sessions_lock:
+                            self.sessions[prev_id] = prev
                         self._persist_session(prev_id, prev)
                     finally:
                         try:
@@ -2373,6 +2236,17 @@ class LlamaSessionManager:
                 total_words += len((m.get("content", "") or "").split())
             return int(total_words * 1.3)
 
+    def _count_projected_prompt_tokens(self, messages: List[Dict[str, str]]) -> int:
+        """
+        Count tokens for the exact prompt used in generation (add_generation_prompt=True).
+        This keeps preflight/budgeting in sync with the real run prompt.
+        """
+        try:
+            with self._model_lock:
+                return self._count_chat_prompt_tokens(messages, add_generation_prompt=True)
+        except Exception:
+            return self._estimate_tokens(messages)
+
     def _clamp_max_tokens(self, session_id: str, prompt_tokens: int, requested_max: int) -> int:
         """
         Clamp generation tokens so prompt_tokens + max_tokens stays within ctx_size.
@@ -2382,7 +2256,7 @@ class LlamaSessionManager:
         if not self.ctx_size:
             return requested_max
         # Leave a small safety margin to avoid exact-boundary errors.
-        margin = 128
+        margin = int(self._SAFETY_MARGIN)
         available = self.ctx_size - prompt_tokens - margin
         if available <= 0:
             # No room left for generation; fail loudly with actionable info.
@@ -2505,24 +2379,33 @@ class LlamaSessionManager:
         if not self.ctx_size:
             return message
 
-        # First, compact if the existing session is already near full.
-        self._maybe_compact(session_id, session, force=False)
-
-        margin = 128
+        margin = int(self._SAFETY_MARGIN)
         attempts = 0
         forced = False
         while attempts < 4:
             history: List[Dict[str, str]] = list(session.get("messages", []))
             prospective = history + [{"role": "user", "content": message}]
-            try:
-                with self._model_lock:
-                    prompt_tokens = self._count_chat_prompt_tokens(prospective)
-            except Exception:
-                prompt_tokens = self._estimate_tokens(prospective)
+            prompt_tokens = self._count_projected_prompt_tokens(prospective)
 
-            # If prompt itself fits, generation tokens will be clamped later.
-            if prompt_tokens + margin < self.ctx_size:
+            logger.info(
+                "preflight_budget chat=%s prompt_tokens=%d reserved=%d margin=%d ctx=%d",
+                session_id,
+                int(prompt_tokens),
+                int(reserved_max_tokens),
+                int(margin),
+                int(self.ctx_size or 0),
+            )
+
+            # If projected prompt + reserved output fits, we are safe.
+            if prompt_tokens + int(reserved_max_tokens) + margin < self.ctx_size:
                 return message
+
+            # Trigger compaction based on projected prompt size (history + pending + gen prompt).
+            if not forced and prompt_tokens >= (self._COMPACT_PCT * self.ctx_size):
+                self._maybe_compact(session_id, session, force=True)
+                forced = True
+                attempts += 1
+                continue
 
             # Prompt is too large even before generation: first try forced compaction once.
             if not forced:
@@ -2532,7 +2415,13 @@ class LlamaSessionManager:
                 continue
 
             # Still too large: drop the heavy sections from this turn prompt and/or truncate.
-            message = self._shrink_turn_prompt_to_fit(session_id, session, message, margin=margin)
+            message = self._shrink_turn_prompt_to_fit(
+                session_id,
+                session,
+                message,
+                reserved_max_tokens=int(reserved_max_tokens),
+                margin=margin,
+            )
             attempts += 1
 
         raise ValueError(
@@ -2562,6 +2451,7 @@ class LlamaSessionManager:
         session: Dict[str, object],
         message: str,
         *,
+        reserved_max_tokens: int = 0,
         margin: int = 128,
     ) -> str:
         """
@@ -2571,9 +2461,8 @@ class LlamaSessionManager:
 
         def fits(candidate: str) -> bool:
             prospective = history + [{"role": "user", "content": candidate}]
-            with self._model_lock:
-                tokens = self._count_chat_prompt_tokens(prospective)
-            return tokens + margin < self.ctx_size
+            tokens = self._count_projected_prompt_tokens(prospective)
+            return tokens + int(reserved_max_tokens) + int(margin) < self.ctx_size
 
         candidate = (message or "").strip()
         if not candidate:
@@ -2596,13 +2485,9 @@ class LlamaSessionManager:
             pass
 
         # Last resort: truncate the per-turn prompt to the remaining budget.
-        try:
-            with self._model_lock:
-                base = self._count_chat_prompt_tokens(history + [{"role": "user", "content": ""}])
-        except Exception:
-            base = self._estimate_tokens(history) + 8
+        base = self._count_projected_prompt_tokens(history + [{"role": "user", "content": ""}])
 
-        available = max(0, int(self.ctx_size) - int(margin) - int(base))
+        available = max(0, int(self.ctx_size) - int(margin) - int(reserved_max_tokens) - int(base))
         if available <= 0:
             raise ValueError(
                 f"Chat history too large for context window (chat={session_id} ctx={self.ctx_size})"
@@ -2637,12 +2522,21 @@ class LlamaSessionManager:
         # Prefer clean UI transcript for compaction (avoids summarizing injected RAG/doc blobs).
         ui_msgs = self._fetch_ui_transcript(session_id, max_messages=120)
         convo_msgs = ui_msgs if ui_msgs else [m for m in messages if m.get("role") != "system"]
+        did_compact = False
+        started_event = False
 
         # If conversation is too short, do a lightweight rebuild in force-mode
         # to strip injected per-turn blobs from the stored prompt history.
         if len(convo_msgs) <= 4:
             if not force:
                 return
+            did_compact = True
+            session["compacting"] = True
+            try:
+                emit_event("compaction_start", chat_id=session_id)
+                started_event = True
+            except Exception:
+                pass
             new_msgs: List[Dict[str, str]] = []
             new_msgs.extend(system_msgs)
             new_msgs.extend(convo_msgs)
@@ -2659,9 +2553,16 @@ class LlamaSessionManager:
             session["state"] = new_state
             session["messages"] = new_msgs
             session["compacted"] = bool(session.get("compacted", False))
-            self.sessions[session_id] = session
+            session["compacting"] = False
+            with self._sessions_lock:
+                self.sessions[session_id] = session
             self._active_session_id = session_id
             self._persist_session(session_id, session)
+            if started_event:
+                try:
+                    emit_event("compaction_end", chat_id=session_id, compacted=bool(session.get("compacted", False)))
+                except Exception:
+                    pass
             return
 
         # Build summary from older turns (all but last 2 exchanges)
@@ -2671,18 +2572,18 @@ class LlamaSessionManager:
             cleaned_source = summary_source
         else:
             cleaned_source = self._clean_history(summary_source)
+        did_compact = True
+        session["compacting"] = True
+        try:
+            emit_event("compaction_start", chat_id=session_id)
+            started_event = True
+        except Exception:
+            pass
         summary_text = self._compact_with_summarizer(session_id, cleaned_source)
-        summary_msg = (
-            {"role": "assistant", "content": f"Conversation summary:\n{summary_text}".strip()}
-            if summary_text
-            else None
-        )
         tail_msgs = convo_msgs[-4:]  # keep last 2 exchanges
 
         new_msgs: List[Dict[str, str]] = []
         new_msgs.extend(system_msgs)
-        if summary_msg:
-            new_msgs.append(summary_msg)
         new_msgs.extend(tail_msgs)
 
         # Reset KV and rebuild in a single pass using the chat template
@@ -2701,6 +2602,7 @@ class LlamaSessionManager:
         session["state"] = new_state
         session["messages"] = new_msgs
         session["compacted"] = True
+        session["compacting"] = False
         if summary_text:
             # Store in-session summary metadata
             session["ltm_summary"] = summary_text
@@ -2724,9 +2626,15 @@ class LlamaSessionManager:
                     )
 
 
-        self.sessions[session_id] = session
+        with self._sessions_lock:
+            self.sessions[session_id] = session
         self._active_session_id = session_id
         self._persist_session(session_id, session)
+        if started_event:
+            try:
+                emit_event("compaction_end", chat_id=session_id, compacted=True)
+            except Exception:
+                pass
 
     def _compact_with_summarizer(self, session_id: str, summary_source: List[Dict[str, str]]) -> str:
         """

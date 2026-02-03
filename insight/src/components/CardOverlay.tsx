@@ -29,7 +29,7 @@ const DEFAULT_LAYOUT: CardLayout = {
   showChat: true,
   showDocs: true,
   chatOnRight: true,
-  splitRatio: 0.5,
+  splitRatio: 0.6,
 };
 
 export function CardOverlay({
@@ -374,7 +374,7 @@ export function CardOverlay({
                     </button>
                   ) : null}
                   <button
-                    className="canvas-dock-btn card-menu-btn btn-large-icon"
+                    className="canvas-dock-btn card-menu-btn"
                     type="button"
                     onClick={(e) => {
                       e.preventDefault();
@@ -385,7 +385,7 @@ export function CardOverlay({
                     }}
                     title="Create new card"
                   >
-                    <NewCardIcon className="w-7 h-7" />
+                    <NewCardIcon className="w-4 h-4" />
                   </button>
                 </div>
                 <div className="canvas-chatlist" role="menu" aria-label="Cards">

@@ -34,6 +34,7 @@ type DocSearchResponse = {
   matches: Array<{ from: number; to: number; snippet: string }>;
 };
 
+
 type Props = {
   chatId: string;
   refreshSeq?: number;
@@ -309,6 +310,8 @@ export function DocumentsPane({
   const [selectionPos, setSelectionPos] = useState<{ x: number; y: number } | null>(null);
   const [pendingSelection, setPendingSelection] = useState<{ file_id: string; text: string } | null>(null);
   const popoverTimerRef = useRef<number | null>(null);
+  const ignoreSelectionUntilRef = useRef<number>(0);
+  const askClickingRef = useRef<boolean>(false);
 
   const [isDropHover, setIsDropHover] = useState(false);
   const dropCounterRef = useRef(0);
@@ -337,6 +340,7 @@ export function DocumentsPane({
 
   const infoPopoverRef = useRef<HTMLDivElement | null>(null);
   const infoAnchorRef = useRef<HTMLElement | null>(null);
+  const paneBodyRef = useRef<HTMLDivElement | null>(null);
   const [infoPos, setInfoPos] = useState<{ x: number; y: number } | null>(null);
   const [confirmDeleteFileId, setConfirmDeleteFileId] = useState<string | null>(null);
 
@@ -487,6 +491,7 @@ export function DocumentsPane({
     }
     return next;
   }
+
 
   async function reloadActiveDoc(fileId: string, forceReload = false) {
     setIsLoadingDoc(true);
@@ -791,7 +796,14 @@ export function DocumentsPane({
   }
 
   function readSelectionFromWindow(opts?: { showPopover?: boolean }) {
+    if (askClickingRef.current) return;
     if (isEditing) return;
+    if (isRawLarge) {
+      setSelectionText("");
+      setSelectionPos(null);
+      setPendingSelection(null);
+      return;
+    }
     if (!effectiveActiveFileId) return;
     const sel = window.getSelection?.();
     const txt = (sel && typeof sel.toString === "function" ? sel.toString() : "") || "";
@@ -836,7 +848,7 @@ export function DocumentsPane({
       const maxX = body.scrollLeft + body.clientWidth - 28;
       const x = Math.max(minX, Math.min(maxX, xRaw));
 
-      const yRaw = rect.top - bodyRect.top + body.scrollTop - 48;
+      const yRaw = rect.top - bodyRect.top + body.scrollTop;
       const minY = body.scrollTop + 8;
       const y = Math.max(minY, yRaw);
       if (popoverTimerRef.current != null) window.clearTimeout(popoverTimerRef.current);
@@ -852,6 +864,8 @@ export function DocumentsPane({
   useEffect(() => {
     if (isEditing) return;
     function onSelectionChangeEvent() {
+      if (Date.now() < ignoreSelectionUntilRef.current) return;
+      if (askClickingRef.current) return;
       readSelectionFromWindow({ showPopover: false });
     }
     document.addEventListener("selectionchange", onSelectionChangeEvent);
@@ -873,10 +887,26 @@ export function DocumentsPane({
   );
 
   const wordCount = useMemo(() => {
+    if (activeFile) {
+      const source = typeof activeFile.source === "string" ? activeFile.source : "";
+      const sizeBytes = Number(activeFile.size_bytes || 0);
+      if (source.includes("raw_large") || sizeBytes > 10 * 1024 * 1024) {
+        return null;
+      }
+    }
     const text = plainTextFromProseMirror(doc);
     const n = countWords(text);
     return n > 0 ? n : null;
-  }, [doc]);
+  }, [doc, activeFile]);
+
+  const isRawLarge = useMemo(() => {
+    if (!activeFile) return false;
+    const source = typeof activeFile.source === "string" ? activeFile.source : "";
+    const sizeBytes = Number(activeFile.size_bytes || 0);
+    return source.includes("raw_large") || sizeBytes > 10 * 1024 * 1024;
+  }, [activeFile]);
+
+  const docForRender = isRawLarge ? null : doc;
 
   const effectiveSearchOpen = isSearchOpen || !!searchQuery.trim() || (isEditing && !!replaceQuery.trim());
 
@@ -1022,7 +1052,11 @@ export function DocumentsPane({
     setInfoPos((prev) => {
       if (prev) return null;
       const rect = anchor.getBoundingClientRect();
+      const paneRect = paneBodyRef.current?.getBoundingClientRect();
       infoAnchorRef.current = anchor;
+      if (paneRect) {
+        return { x: rect.right - paneRect.left, y: rect.bottom - paneRect.top };
+      }
       return { x: rect.right, y: rect.bottom };
     });
   }
@@ -1084,25 +1118,29 @@ export function DocumentsPane({
 
     const raf = window.requestAnimationFrame(() => {
       const popRect = popover.getBoundingClientRect();
-      const boundaryEl = anchor.closest(".canvas-root") as HTMLElement | null;
+      const boundaryEl = paneBodyRef.current || (anchor.closest(".docs-pane-body") as HTMLElement | null);
       const boundaryRect = boundaryEl
         ? boundaryEl.getBoundingClientRect()
         : new DOMRect(0, 0, window.innerWidth, window.innerHeight);
 
       const pad = 14;
-      const minX = boundaryRect.left + pad;
-      const maxX = boundaryRect.right - pad;
-      const minY = boundaryRect.top + pad;
-      const maxY = boundaryRect.bottom - pad;
+      const minX = pad;
+      const maxX = boundaryRect.width - pad;
+      const minY = pad;
+      const maxY = boundaryRect.height - pad;
 
       let nextX = infoPos.x;
       let nextY = infoPos.y;
 
-      if (popRect.left < minX) nextX += minX - popRect.left;
-      else if (popRect.right > maxX) nextX -= popRect.right - maxX;
+      const popLeft = popRect.left - boundaryRect.left;
+      const popRight = popLeft + popRect.width;
+      if (popLeft < minX) nextX += minX - popLeft;
+      else if (popRight > maxX) nextX -= popRight - maxX;
 
-      if (popRect.top < minY) nextY += minY - popRect.top;
-      else if (popRect.bottom > maxY) nextY -= popRect.bottom - maxY;
+      const popTop = popRect.top - boundaryRect.top;
+      const popBottom = popTop + popRect.height;
+      if (popTop < minY) nextY += minY - popTop;
+      else if (popBottom > maxY) nextY -= popBottom - maxY;
 
       nextX = Math.round(nextX);
       nextY = Math.round(nextY);
@@ -1183,14 +1221,18 @@ export function DocumentsPane({
       .catch((e: any) => setError(e?.message ?? String(e)));
   }
 
+
   return (
     <div className="docs-pane">
-      <div className="docs-pane-body">
+      <div className="docs-pane-body" ref={paneBodyRef}>
         <div className="docs-tabs" role="tablist" aria-label="Files">
           {files.map((f) => {
             const active = f.file_id === effectiveActiveFileId;
             return (
-              <div key={f.file_id} className={`docs-tab ${active ? "active" : ""}`}>
+              <div
+                key={f.file_id}
+                className={`docs-tab ${active ? "active" : ""}`}
+              >
                 <button
                   className="docs-tab-main"
                   type="button"
@@ -1624,32 +1666,36 @@ export function DocumentsPane({
 	                {/* Info popover is rendered next to the info button for both view and edit modes. */}
 	              </div>
 
-              {isLoadingFiles ? <div className="docs-reader-loading">Loading…</div> : null}
+              {isLoadingFiles && !isRawLarge ? <div className="docs-reader-loading">Loading…</div> : null}
 
-              {!isLoadingDoc && !doc && activeFile.status && activeFile.status !== "completed" ? (
+              {!isRawLarge && !isLoadingDoc && !doc && activeFile.status && activeFile.status !== "completed" ? (
                 <div className="docs-reader-loading">Processing… extracted text will appear here once ready.</div>
               ) : null}
 
-              <div
-                className="docs-reader-body"
-                ref={bodyRef}
-                onMouseUp={isEditing ? undefined : () => readSelectionFromWindow({ showPopover: true })}
-                onKeyUp={isEditing ? undefined : () => readSelectionFromWindow({ showPopover: true })}
-                onScroll={
-                  isEditing
-                    ? undefined
-                    : () => {
-                        if (selectionPos) setSelectionPos(null);
-                      }
-                }
-              >
-                {!isLoadingDoc && !doc && activeFile.status === "completed" ? (
+                <div
+                  className="docs-reader-body"
+                  ref={bodyRef}
+                  onMouseUp={isEditing || isRawLarge ? undefined : () => readSelectionFromWindow({ showPopover: true })}
+                  onKeyUp={isEditing || isRawLarge ? undefined : () => readSelectionFromWindow({ showPopover: true })}
+                  onScroll={
+                    isEditing || isRawLarge
+                      ? undefined
+                      : () => {
+                          if (selectionPos) setSelectionPos(null);
+                        }
+                  }
+                >
+                {!isRawLarge && !isLoadingDoc && !doc && activeFile.status === "completed" ? (
                   <div className="docs-reader-loading">No extractable text found for this file.</div>
                 ) : null}
 
-                {isLoadingDoc ? <div className="docs-reader-loading">Loading…</div> : null}
+                {!isRawLarge && isLoadingDoc ? <div className="docs-reader-loading">Loading…</div> : null}
 
-                {doc ? (
+                {isRawLarge ? (
+                  <div className="docs-reader-loading">Preview not available for large files.</div>
+                ) : null}
+
+                {!isRawLarge && docForRender ? (
                   <>
                     {selectionText && selectionPos && !isEditing ? (
                       <button
@@ -1658,14 +1704,32 @@ export function DocumentsPane({
                         style={{ left: selectionPos.x, top: selectionPos.y }}
                         onClick={commitSelectionToChat}
                         title="Ask about this selection"
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onPointerDown={(e) => e.stopPropagation()}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          ignoreSelectionUntilRef.current = Date.now() + 400;
+                          askClickingRef.current = true;
+                          window.setTimeout(() => {
+                            askClickingRef.current = false;
+                          }, 400);
+                          commitSelectionToChat();
+                        }}
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          ignoreSelectionUntilRef.current = Date.now() + 400;
+                          askClickingRef.current = true;
+                          window.setTimeout(() => {
+                            askClickingRef.current = false;
+                          }, 400);
+                          commitSelectionToChat();
+                        }}
                       >
                         Ask
                       </button>
                     ) : null}
 	                    <DocEditor
-	                      doc={doc}
+	                      doc={docForRender}
 	                      editable={isEditing}
 	                      searchMatches={searchMatches}
 	                      activeMatchIndex={activeMatchIndex}

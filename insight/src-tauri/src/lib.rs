@@ -357,6 +357,11 @@ fn engine_cancel_request(
 }
 
 #[tauri::command]
+fn engine_emit_event(event_name: String, payload: Value, app: tauri::AppHandle) -> Result<(), String> {
+    app.emit(&event_name, payload).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn get_session_messages(chat_id: String) -> Result<Value, String> {
     let workspace = get_workspace_dir()?;
     let db_path = workspace.join("db.sqlite");
@@ -366,26 +371,30 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
 
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open db.sqlite: {e}"))?;
     let mut stmt = conn
-        .prepare("SELECT role, content_json, citations_json, created_at FROM messages WHERE chat_id=? ORDER BY created_at ASC")
+        .prepare("SELECT id, role, content_json, citations_json, created_at FROM messages WHERE chat_id=? ORDER BY created_at ASC")
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
     let mut out: Vec<Value> = Vec::new();
     let rows = stmt
         .query_map([chat_id], |row| {
-            let role: String = row.get(0)?;
-            let content_json: String = row.get(1)?;
-            let citations_json: Option<String> = row.get(2)?;
-            let created_at: String = row.get(3)?;
-            Ok((role, content_json, citations_json, created_at))
+            let id: String = row.get(0)?;
+            let role: String = row.get(1)?;
+            let content_json: String = row.get(2)?;
+            let citations_json: Option<String> = row.get(3)?;
+            let created_at: String = row.get(4)?;
+            Ok((id, role, content_json, citations_json, created_at))
         })
         .map_err(|e| format!("Query failed: {e}"))?;
 
     for row in rows.flatten() {
-        let (role, content_json, citations_json, created_at) = row;
+        let (id, role, content_json, citations_json, created_at) = row;
         let content: String;
         let mut attachments: Vec<String> = Vec::new();
         let mut selection: Option<Value> = None;
         let mut focus_document_id: Option<String> = None;
+        let mut versions: Option<Vec<String>> = None;
+        let mut active_version_index: Option<usize> = None;
+        let mut version_sources: Option<Vec<Value>> = None;
         match serde_json::from_str::<serde_json::Value>(&content_json) {
             Ok(v) => {
                 if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
@@ -410,13 +419,34 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
                 if let Some(fid) = v.get("focus_document_id").and_then(|x| x.as_str()) {
                     focus_document_id = Some(fid.to_string());
                 }
+                if let Some(vers) = v.get("versions").and_then(|a| a.as_array()) {
+                    let list: Vec<String> = vers
+                        .iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect();
+                    if !list.is_empty() {
+                        versions = Some(list);
+                    }
+                }
+                if let Some(idx) = v.get("activeVersionIndex").and_then(|i| i.as_u64()) {
+                    active_version_index = Some(idx as usize);
+                }
+                if let Some(arr) = v.get("versionSources").and_then(|a| a.as_array()) {
+                    if let Some(idx) = active_version_index {
+                        if let Some(entry) = arr.get(idx) {
+                            if entry.is_array() {
+                                version_sources = Some(entry.as_array().cloned().unwrap_or_default());
+                            }
+                        }
+                    }
+                }
             }
             Err(_) => {
                 // Fallback: treat as plain text
                 content = content_json.clone();
             }
         }
-        let mut msg = serde_json::json!({ "role": role, "content": content, "created_at": created_at });
+        let mut msg = serde_json::json!({ "id": id, "role": role, "content": content, "created_at": created_at });
         if !attachments.is_empty() {
             msg["attachments"] = serde_json::json!(attachments);
         }
@@ -426,7 +456,15 @@ fn get_session_messages(chat_id: String) -> Result<Value, String> {
         if let Some(fid) = focus_document_id {
             msg["focus_document_id"] = serde_json::json!(fid);
         }
-        if let Some(raw) = citations_json {
+        if let Some(vers) = versions {
+            msg["versions"] = serde_json::json!(vers);
+        }
+        if let Some(idx) = active_version_index {
+            msg["activeVersionIndex"] = serde_json::json!(idx);
+        }
+        if let Some(vs) = version_sources {
+            msg["sources"] = serde_json::json!(vs);
+        } else if let Some(raw) = citations_json {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -730,7 +768,8 @@ pub fn run() {
             print_current_webview,
             export_pdf_file,
             engine_stream_request,
-            engine_cancel_request
+            engine_cancel_request,
+            engine_emit_event
         ])
         .build(tauri::generate_context!())
         .expect("error running Tauri application");

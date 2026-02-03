@@ -107,11 +107,13 @@ export async function engine<T = any>(
     });
     return res;
   } catch (err: any) {
+    // Provide more detailed error info for debugging
+    const errorInfo = err?.message ?? (typeof err === "string" ? err : JSON.stringify(err)) ?? "Unknown engine error";
     return {
       ok: false,
       status: 500,
       data: null as T,
-      error: err?.message ?? "Unknown engine error",
+      error: errorInfo,
     };
   }
 }
@@ -130,8 +132,65 @@ export async function engineStreamChat(opts: {
   focusDocumentId?: string | null;
   docPaneOpen?: boolean;
   selection?: { text: string; file_id?: string; page?: number } | null;
+  skipUserMessage?: boolean;
+  targetAssistantId?: string;
+  userMessageId?: string;
 }) {
   const { chatId, query, requestId, paths, documents, attachments, focusDocumentId, docPaneOpen, selection } = opts;
+  try {
+    const healthRes = await engine<{ ok: boolean; checks?: { chat_router_ready?: boolean } }>(
+      "/settings/health",
+      undefined,
+      "GET"
+    );
+    if (!healthRes.ok) {
+      throw new Error("Health check failed");
+    }
+    const checks = (healthRes.data as any)?.checks || {};
+    const issues = Array.isArray((healthRes.data as any)?.issues) ? (healthRes.data as any).issues : [];
+    const fatalIssue = issues.find((issue: any) => issue?.severity === "error");
+    if (fatalIssue) {
+      throw new Error(
+        fatalIssue?.fix || fatalIssue?.message || "Engine is not ready. Please check Settings."
+      );
+    }
+    if (checks.chat_router_ready === false) {
+      if (checks.chat_router_error) {
+        throw new Error(
+          "Chat engine failed to start. Restart Insight. If it persists, re-apply the model in Settings."
+        );
+      }
+      if (!checks.chat_router_loading) {
+        // Give the backend a brief moment to register the chat router.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 350));
+          const retry = await engine<any>("/settings/health", undefined, "GET");
+          if (!retry.ok) break;
+          const retryChecks = (retry.data as any)?.checks || {};
+          if (retryChecks.chat_router_error) {
+            throw new Error(
+              "Chat engine failed to start. Restart Insight. If it persists, re-apply the model in Settings."
+            );
+          }
+          if (retryChecks.chat_router_ready || retryChecks.chat_router_loading) {
+            break;
+          }
+        }
+      }
+      // If chat router is still loading or not yet registered, allow the request to proceed.
+    }
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "Engine health check failed";
+    await invoke("engine_emit_event", {
+      eventName: "llm-error",
+      payload: {
+        request_id: requestId,
+        chat_id: chatId,
+        error: errorMessage,
+      },
+    });
+    throw new Error(errorMessage);
+  }
   await ensureStreamBridge();
   activeStream = { requestId, chatId };
   return invoke("engine_stream_request", {
@@ -146,6 +205,9 @@ export async function engineStreamChat(opts: {
       ...(documents && documents.length ? { documents } : {}),
       ...(attachments && attachments.length ? { attachments } : {}),
       ...(paths && paths.length ? { paths } : {}),
+      ...(opts.userMessageId ? { user_message_id: opts.userMessageId } : {}),
+      skip_user_message: opts.skipUserMessage,
+      target_assistant_id: opts.targetAssistantId,
     },
   });
 }

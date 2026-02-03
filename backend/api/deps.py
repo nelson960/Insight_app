@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
 
@@ -28,54 +29,100 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _AppContainer:
+    def __init__(self) -> None:
+        self._workspace: Optional[Workspace] = None
+        self._sqlite_store: Optional[SQLiteMetadataStore] = None
+        self._vector_index: Optional[QdrantVectorIndex] = None
+        self._storage_lock = threading.Lock()
+        self._ingestion_pipeline: Optional[IngestionPipeline] = None
+        self._planner_service: Optional[PlannerService] = None
+        self._key_manager: Optional[KeyManager] = None
+        self._ingestion_scheduler: Optional[IngestionScheduler] = None
+        self._query_embedder: Optional[Callable[[str], Sequence[float]]] = None
+        self._session_manager: Optional[LlamaSessionManager] = None
+        self._rag_store: Optional[RagStore] = None
+        self._ltm_store: Optional[Any] = None
+        self._search_service: Optional[FileSearchService] = None
+        self._doc_search_service: Optional[DocSearchService] = None
+        self._nomic_model_dir: Optional[Path] = None
+
+
+_current_container: ContextVar[Optional[_AppContainer]] = ContextVar("insight_deps", default=None)
+_default_container: Optional[_AppContainer] = None
+
+
+def _get_container() -> _AppContainer:
+    container = _current_container.get()
+    if container is not None:
+        return container
+    global _default_container
+    if _default_container is None:
+        _default_container = _AppContainer()
+    return _default_container
+
+
+def bind_container(container: Optional[_AppContainer]) -> None:
+    global _default_container
+    _default_container = container
+
+
+def create_container() -> _AppContainer:
+    return _AppContainer()
+
+
+def set_request_container(container: Optional[_AppContainer]):
+    return _current_container.set(container)
+
+
+def reset_request_container(token) -> None:
+    _current_container.reset(token)
+
+
+def peek_sqlite_store() -> Optional["SQLiteMetadataStore"]:
+    return _get_container()._sqlite_store
+
+
+def peek_session_manager() -> Optional["LlamaSessionManager"]:
+    return _get_container()._session_manager
+
+
 class AppDependencies:
-    _workspace: Optional[Workspace] = None
-    _sqlite_store: Optional[SQLiteMetadataStore] = None
-    _vector_index: Optional[QdrantVectorIndex] = None
-    _storage_lock = threading.Lock()
-    _ingestion_pipeline: Optional[IngestionPipeline] = None
-    _planner_service: Optional[PlannerService] = None
-    _key_manager: Optional[KeyManager] = None
-    _ingestion_scheduler: Optional[IngestionScheduler] = None
-    _query_embedder: Optional[Callable[[str], Sequence[float]]] = None
-    _session_manager: Optional[LlamaSessionManager] = None
-    _rag_store: Optional[RagStore] = None
-    _ltm_store: Optional[Any] = None
-    _search_service: Optional[FileSearchService] = None
-    _doc_search_service: Optional[DocSearchService] = None
-    _nomic_model_dir: Optional[Path] = None
 
     @classmethod
     def workspace(cls) -> Workspace:
-        if cls._workspace is None:
-            cls._workspace = get_workspace()
-        return cls._workspace
+        container = _get_container()
+        if container._workspace is None:
+            container._workspace = get_workspace()
+        return container._workspace
 
     @classmethod
     def sqlite_store(cls) -> SQLiteMetadataStore:
-        if cls._sqlite_store is None:
-            with cls._storage_lock:
-                if cls._sqlite_store is None:
+        container = _get_container()
+        if container._sqlite_store is None:
+            with container._storage_lock:
+                if container._sqlite_store is None:
                     from backend.services.storage.sqlite_store import SQLiteConfig, create_sqlite_store
 
-                    cls._sqlite_store = create_sqlite_store(cls.workspace().db, config=SQLiteConfig())
-        return cls._sqlite_store
+                    container._sqlite_store = create_sqlite_store(cls.workspace().db, config=SQLiteConfig())
+        return container._sqlite_store
 
     @classmethod
     def vector_index(cls) -> QdrantVectorIndex:
-        if cls._vector_index is None:
+        container = _get_container()
+        if container._vector_index is None:
             # Protect local Qdrant initialization from concurrent calls.
-            with cls._storage_lock:
-                if cls._vector_index is None:
+            with container._storage_lock:
+                if container._vector_index is None:
                     from backend.services.storage import QdrantConfig, create_qdrant_index
 
-                    cls._vector_index = create_qdrant_index(
+                    container._vector_index = create_qdrant_index(
                         config=QdrantConfig(
                             collection_name="insight_chunks",
                             path=str(cls.workspace().qdrant),
                         )
                     )
-        return cls._vector_index
+        return container._vector_index
 
     @classmethod
     def storage(cls) -> tuple[SQLiteMetadataStore, QdrantVectorIndex]:
@@ -83,7 +130,8 @@ class AppDependencies:
 
     @classmethod
     def ingestion_pipeline(cls) -> IngestionPipeline:
-        if cls._ingestion_pipeline is None:
+        container = _get_container()
+        if container._ingestion_pipeline is None:
             from backend.services.ingestion import (
                 IngestionPipelineConfig,
                 create_ingestion_pipeline,
@@ -91,7 +139,7 @@ class AppDependencies:
 
             sqlite_store = cls.sqlite_store()
             vector_index = cls.vector_index()
-            cls._ingestion_pipeline = create_ingestion_pipeline(
+            container._ingestion_pipeline = create_ingestion_pipeline(
                 metadata_store=sqlite_store,
                 vector_index=vector_index,
                 pipeline_config=IngestionPipelineConfig(embedding_model="nomic-embed-text-v1.5", embedding_version=1),
@@ -101,20 +149,22 @@ class AppDependencies:
                 use_onnx_embeddings=True,
                 nomic_auto_download=False,
             )
-        return cls._ingestion_pipeline
+        return container._ingestion_pipeline
 
     @classmethod
     def ingestion_scheduler(cls) -> IngestionScheduler:
-        if cls._ingestion_scheduler is None:
+        container = _get_container()
+        if container._ingestion_scheduler is None:
             from backend.services.ingestion.scheduler import IngestionScheduler
 
             sqlite_store = cls.sqlite_store()
-            cls._ingestion_scheduler = IngestionScheduler(cls.ingestion_pipeline(), sqlite_store)
-        return cls._ingestion_scheduler
+            container._ingestion_scheduler = IngestionScheduler(cls.ingestion_pipeline(), sqlite_store)
+        return container._ingestion_scheduler
 
     @classmethod
     def planner_service(cls) -> PlannerService:
-        if cls._planner_service is None:
+        container = _get_container()
+        if container._planner_service is None:
             from backend.services.planner.orchestrator import InsightOrchestrator
             from backend.services.planner.service import PlannerService
 
@@ -125,12 +175,13 @@ class AppDependencies:
                 ltm_store=cls.ltm_store(),
                 metadata_store=sqlite_store,
             )
-            cls._planner_service = PlannerService(orchestrator=orchestrator)
-        return cls._planner_service
+            container._planner_service = PlannerService(orchestrator=orchestrator)
+        return container._planner_service
 
     @classmethod
     def session_manager(cls) -> LlamaSessionManager:
-        if cls._session_manager is None:
+        container = _get_container()
+        if container._session_manager is None:
             from backend.services.connectors.llama_session_manager import LlamaSessionManager
 
             if _boot_trace_available:
@@ -162,6 +213,31 @@ class AppDependencies:
                         pass
                 raise FileNotFoundError(error)
 
+            # Require a validated model record (no silent fallback).
+            try:
+                from backend.services.llama_templates import model_record_is_current
+
+                record = sqlite_store.get_setting("llm_model_record_json")
+                if not model_record_is_current(record, model_path):
+                    error = (
+                        "Model validation record missing or outdated. "
+                        "Open Settings → Model and apply to validate this GGUF."
+                    )
+                    if _boot_trace_available:
+                        try:
+                            log_boot_step(
+                                "session_manager_error",
+                                error="model_record_missing_or_stale",
+                                model_path=str(model_path),
+                            )
+                        except Exception:
+                            pass
+                    raise FileNotFoundError(error)
+            except FileNotFoundError:
+                raise
+            except Exception as exc:
+                logger.warning("Model record check failed: %s", exc)
+
             if _boot_trace_available:
                 try:
                     log_boot_step("session_manager_loading", model_path=str(model_path))
@@ -183,10 +259,10 @@ class AppDependencies:
             except Exception:
                 gpu_layers = 99
 
-            persist_dir = Path(get_workspace().base) / "kv_sessions"
+            persist_dir = Path(cls.workspace().base) / "kv_sessions"
 
             try:
-                cls._session_manager = LlamaSessionManager(
+                container._session_manager = LlamaSessionManager(
                     str(model_path),
                     ctx_size=ctx_size,
                     gpu_layers=gpu_layers,
@@ -206,11 +282,12 @@ class AppDependencies:
                     except Exception:
                         pass
                 raise
-        return cls._session_manager
+        return container._session_manager
 
     @classmethod
     def rag_store(cls) -> RagStore:
-        if cls._rag_store is None:
+        container = _get_container()
+        if container._rag_store is None:
             from backend.services.retrieval import RetrievalService
             from backend.services.retrieval.rag_store import RagStore
 
@@ -221,56 +298,69 @@ class AppDependencies:
                 collection_name=vector_index.collection_name,
                 metadata_store=sqlite_store,
             )
-            cls._rag_store = RagStore(retrieval_service=retrieval, embedder=cls.query_embedder())
-        return cls._rag_store
+            container._rag_store = RagStore(retrieval_service=retrieval, embedder=cls.query_embedder())
+        return container._rag_store
 
     @classmethod
     def ltm_store(cls) -> LongTermMemoryStore:
-        if cls._ltm_store is None:
+        container = _get_container()
+        if container._ltm_store is None:
             from backend.services.memory.ltm_qdrant_store import LtmQdrantStore
+            from backend.services.memory.ltm_sqlite_store import LtmSqliteStore
             from backend.services.memory.ltm_store import LongTermMemoryStore
 
             try:
                 client = cls.vector_index().client  # reuse same Qdrant client to avoid lock conflicts
-                cls._ltm_store = LtmQdrantStore(client=client, embedder=cls.query_embedder())
+                container._ltm_store = LtmQdrantStore(client=client, embedder=cls.query_embedder())
             except Exception as exc:
-                logger.warning("Falling back to in-memory LTM store: %s", exc)
-                cls._ltm_store = LongTermMemoryStore(
-                    metadata_store=cls.sqlite_store(),
-                    embedder=cls.query_embedder(),
-                )
-        return cls._ltm_store
+                logger.warning("Falling back to SQLite LTM store: %s", exc)
+                try:
+                    container._ltm_store = LtmSqliteStore(
+                        metadata_store=cls.sqlite_store(),
+                        embedder=cls.query_embedder(),
+                    )
+                except Exception as exc2:
+                    logger.warning("Falling back to in-memory LTM store: %s", exc2)
+                    container._ltm_store = LongTermMemoryStore(
+                        metadata_store=cls.sqlite_store(),
+                        embedder=cls.query_embedder(),
+                    )
+        return container._ltm_store
 
     @classmethod
     def key_manager(cls) -> KeyManager:
-        if cls._key_manager is None:
+        container = _get_container()
+        if container._key_manager is None:
             from backend.services.security.key_manager import KeyManager
 
-            cls._key_manager = KeyManager(cls.workspace())
-        return cls._key_manager
+            container._key_manager = KeyManager(cls.workspace())
+        return container._key_manager
 
     @classmethod
     def search_service(cls) -> FileSearchService:
-        if cls._search_service is None:
+        container = _get_container()
+        if container._search_service is None:
             from backend.services.search.service import FileSearchService
 
             sqlite_store = cls.sqlite_store()
-            cls._search_service = FileSearchService(sqlite_store)
-        return cls._search_service
+            container._search_service = FileSearchService(sqlite_store)
+        return container._search_service
 
     @classmethod
     def doc_search_service(cls) -> DocSearchService:
-        if cls._doc_search_service is None:
+        container = _get_container()
+        if container._doc_search_service is None:
             from backend.services.search.doc_search import DocSearchService
 
             sqlite_store = cls.sqlite_store()
-            cls._doc_search_service = DocSearchService(sqlite_store)
-        return cls._doc_search_service
+            container._doc_search_service = DocSearchService(sqlite_store)
+        return container._doc_search_service
 
     @classmethod
     def query_embedder(cls) -> Optional[Callable[[str], Sequence[float]]]:
-        if cls._query_embedder is not None:
-            return cls._query_embedder
+        container = _get_container()
+        if container._query_embedder is not None:
+            return container._query_embedder
 
         if _boot_trace_available:
             try:
@@ -310,8 +400,8 @@ class AppDependencies:
                     log_boot_error("onnx_connector_init", exc)
                 except Exception:
                     pass
-            cls._query_embedder = None
-            return cls._query_embedder
+            container._query_embedder = None
+            return container._query_embedder
 
         model_name = "nomic-embed-text-v1.5"
 
@@ -321,8 +411,8 @@ class AppDependencies:
                 raise RuntimeError("Local query embedder returned empty vector.")
             return vectors[0]
 
-        cls._query_embedder = _embed
-        return cls._query_embedder
+        container._query_embedder = _embed
+        return container._query_embedder
 
     @classmethod
     def nomic_model_dir(cls) -> Path:
@@ -335,8 +425,9 @@ class AppDependencies:
         3) bundled repo model dir under `backend/em_models`, if it contains required assets (NEVER _MEIPASS in packaged mode)
         4) workspace-local model dir (will be auto-downloaded on first use)
         """
-        if cls._nomic_model_dir is not None:
-            return cls._nomic_model_dir
+        container = _get_container()
+        if container._nomic_model_dir is not None:
+            return container._nomic_model_dir
 
         workspace_dir = Path(cls.workspace().base) / "em_models" / "nomic-embed-text"
         project_root = Path(__file__).resolve().parents[2]
@@ -364,28 +455,28 @@ class AppDependencies:
                 pass
 
         if _has_required_assets(workspace_dir):
-            cls._nomic_model_dir = workspace_dir
+            container._nomic_model_dir = workspace_dir
             if _boot_trace_available:
                 try:
                     log_boot_step("nomic_model_dir_selected", source="workspace", path=str(workspace_dir))
                 except Exception:
                     pass
         elif bundled_dir and _has_required_assets(bundled_dir):
-            cls._nomic_model_dir = bundled_dir
+            container._nomic_model_dir = bundled_dir
             if _boot_trace_available:
                 try:
                     log_boot_step("nomic_model_dir_selected", source="bundled", path=str(bundled_dir))
                 except Exception:
                     pass
         else:
-            cls._nomic_model_dir = workspace_dir
+            container._nomic_model_dir = workspace_dir
             if _boot_trace_available:
                 try:
                     log_boot_step("nomic_model_dir_selected", source="workspace_will_download", path=str(workspace_dir))
                 except Exception:
                     pass
 
-        return cls._nomic_model_dir
+        return container._nomic_model_dir
 
     @classmethod
     def busy_state(cls) -> dict[str, object]:
@@ -395,7 +486,8 @@ class AppDependencies:
         """
         from backend.services.storage.sqlite_store import SQLiteConfig, SQLiteMetadataStore
 
-        store = cls._sqlite_store
+        container = _get_container()
+        store = container._sqlite_store
         close_store = False
         if store is None:
             try:
@@ -417,9 +509,9 @@ class AppDependencies:
 
         ingestion_state: dict[str, int] | None = None
         active_jobs_mem = 0
-        if cls._ingestion_scheduler is not None:
+        if container._ingestion_scheduler is not None:
             try:
-                ingestion_state = cls._ingestion_scheduler.busy_state()
+                ingestion_state = container._ingestion_scheduler.busy_state()
                 active_jobs_mem = int(ingestion_state.get("queued", 0)) + int(ingestion_state.get("running", 0))
             except Exception:
                 ingestion_state = None
@@ -429,9 +521,9 @@ class AppDependencies:
 
         llm_state: dict[str, object] | None = None
         llm_busy = False
-        if cls._session_manager is not None:
+        if container._session_manager is not None:
             try:
-                llm_state = cls._session_manager.busy_state()
+                llm_state = container._session_manager.busy_state()
                 llm_busy = bool(llm_state.get("busy"))
             except Exception as exc:
                 llm_busy = True
@@ -464,45 +556,79 @@ class AppDependencies:
         if not confirm:
             raise ValueError("Reset not confirmed.")
 
+        container = _get_container()
         # Stop model/session workers first (they can hold open files under kv_sessions).
-        if cls._session_manager is not None:
+        if container._session_manager is not None:
             try:
-                cls._session_manager._shutdown_snapshot_worker()
+                container._session_manager._shutdown_snapshot_worker()
             except Exception:
                 pass
             try:
-                cls._session_manager._shutdown_persist_worker()
+                container._session_manager._shutdown_persist_worker()
             except Exception:
                 pass
-            cls._session_manager = None
+            container._session_manager = None
 
         # Close Qdrant local file lock.
-        if cls._vector_index is not None:
+        if container._vector_index is not None:
             try:
-                cls._vector_index.client.close()
+                container._vector_index.client.close()
             except Exception:
                 pass
-            cls._vector_index = None
+            container._vector_index = None
 
         # Close SQLite connection.
-        if cls._sqlite_store is not None:
+        if container._sqlite_store is not None:
             try:
-                cls._sqlite_store.close()
+                container._sqlite_store.close()
             except Exception:
                 pass
-            cls._sqlite_store = None
+            container._sqlite_store = None
 
         # Drop other cached singletons.
-        cls._ingestion_pipeline = None
-        cls._planner_service = None
-        cls._key_manager = None
-        cls._ingestion_scheduler = None
-        cls._query_embedder = None
-        cls._rag_store = None
-        cls._ltm_store = None
-        cls._search_service = None
-        cls._doc_search_service = None
+        container._ingestion_pipeline = None
+        container._planner_service = None
+        container._key_manager = None
+        container._ingestion_scheduler = None
+        container._query_embedder = None
+        container._rag_store = None
+        container._ltm_store = None
+        container._search_service = None
+        container._doc_search_service = None
 
         ws = cls.workspace()
         ws.reset(confirm=True, keep_em_models=keep_em_models)
-        cls._workspace = None
+        container._workspace = None
+
+    @classmethod
+    def close_all(cls) -> None:
+        """
+        Best-effort shutdown of background workers and storage connections.
+
+        This does NOT delete user data; it only releases resources.
+        """
+        container = _get_container()
+        if container._ingestion_scheduler is not None:
+            try:
+                container._ingestion_scheduler.shutdown()
+            except Exception:
+                pass
+        if container._session_manager is not None:
+            try:
+                container._session_manager._shutdown_snapshot_worker()
+            except Exception:
+                pass
+            try:
+                container._session_manager._shutdown_persist_worker()
+            except Exception:
+                pass
+        if container._vector_index is not None:
+            try:
+                container._vector_index.client.close()
+            except Exception:
+                pass
+        if container._sqlite_store is not None:
+            try:
+                container._sqlite_store.close()
+            except Exception:
+                pass

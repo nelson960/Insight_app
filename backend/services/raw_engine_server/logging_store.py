@@ -33,6 +33,18 @@ class LogStore:
             if entry_id:
                 self._index[entry_id] = entry
 
+    def clear(self) -> bool:
+        with self._lock:
+            self._recent.clear()
+            self._index.clear()
+            try:
+                if self.path.exists():
+                    self.path.unlink()
+            except Exception:
+                logger.exception("raw_engine log clear failed")
+                return False
+        return True
+
     def recent(self, limit: int = 50) -> List[Dict[str, Any]]:
         limit = max(1, min(limit, 500))
         with self._lock:

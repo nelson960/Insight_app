@@ -6,6 +6,8 @@ import math
 import os
 import re
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -14,6 +16,74 @@ from backend.services.retrieval.rag_store import RagStore
 from backend.services.storage.sqlite_store import SQLiteMetadataStore
 
 logger = logging.getLogger(__name__)
+
+# Cache line offsets for large text files to avoid re-scanning from the start
+# on every window read. This is best-effort and bounded.
+_LINE_INDEX_LOCK = threading.Lock()
+_LINE_INDEX_CACHE: dict[str, dict[str, object]] = {}
+_LINE_INDEX_MAX_ENTRIES = 4
+_LINE_INDEX_MAX_BYTES = int(os.environ.get("INSIGHT_RAW_WINDOW_INDEX_MAX_BYTES", str(25 * 1024 * 1024)))
+
+
+def _evict_line_index_cache() -> None:
+    if len(_LINE_INDEX_CACHE) <= _LINE_INDEX_MAX_ENTRIES:
+        return
+    # Evict least-recently-used entries.
+    oldest_key = None
+    oldest_ts = None
+    for key, rec in _LINE_INDEX_CACHE.items():
+        ts = rec.get("last_used")
+        if not isinstance(ts, (int, float)):
+            ts = 0.0
+        if oldest_ts is None or ts < oldest_ts:
+            oldest_ts = ts
+            oldest_key = key
+    if oldest_key:
+        _LINE_INDEX_CACHE.pop(oldest_key, None)
+
+
+def _build_line_offsets(path: Path) -> list[int]:
+    offsets: list[int] = [0]
+    pos = 0
+    with path.open("rb") as f:
+        for raw in f:
+            pos += len(raw)
+            offsets.append(pos)
+    return offsets
+
+
+def _get_line_offsets(path: Path) -> list[int] | None:
+    try:
+        st = path.stat()
+    except Exception:
+        return None
+    if st.st_size > _LINE_INDEX_MAX_BYTES:
+        return None
+    key = str(path)
+    now = time.monotonic()
+    with _LINE_INDEX_LOCK:
+        rec = _LINE_INDEX_CACHE.get(key)
+        if rec:
+            if rec.get("mtime") == st.st_mtime and rec.get("size") == st.st_size:
+                rec["last_used"] = now
+                offsets = rec.get("offsets")
+                if isinstance(offsets, list):
+                    return offsets
+            else:
+                _LINE_INDEX_CACHE.pop(key, None)
+    try:
+        offsets = _build_line_offsets(path)
+    except Exception:
+        return None
+    with _LINE_INDEX_LOCK:
+        _LINE_INDEX_CACHE[key] = {
+            "mtime": st.st_mtime,
+            "size": st.st_size,
+            "offsets": offsets,
+            "last_used": now,
+        }
+        _evict_line_index_cache()
+    return offsets
 
 
 @dataclass(frozen=True)
@@ -114,6 +184,42 @@ def read_raw_window(
     line_start = max(1, int(line_start))
     line_end = max(line_start, int(line_end))
     max_bytes = max(4096, int(max_bytes or 256_000))
+
+    offsets = _get_line_offsets(p)
+    if offsets:
+        line_start = max(1, min(line_start, len(offsets)))
+        line_end = max(line_start, min(line_end, len(offsets)))
+        start_idx = line_start - 1
+        end_idx = line_end - 1
+        try:
+            with p.open("rb") as f:
+                f.seek(offsets[start_idx])
+                out_lines: list[str] = []
+                total = 0
+                current = line_start
+                while current <= line_end:
+                    raw = f.readline()
+                    if not raw:
+                        break
+                    total += len(raw)
+                    if total > max_bytes:
+                        out_lines.append("… (truncated)")
+                        break
+                    try:
+                        out_lines.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+                    except Exception:
+                        out_lines.append(raw.decode(errors="replace").rstrip("\n"))
+                    current += 1
+                return "\n".join(out_lines).strip()
+        except Exception:
+            logger.warning(
+                "read_raw_window failed (indexed) path=%s lines=%s-%s",
+                path,
+                line_start,
+                line_end,
+                exc_info=True,
+            )
+            # Fall through to streaming read.
 
     out_lines: list[str] = []
     total = 0

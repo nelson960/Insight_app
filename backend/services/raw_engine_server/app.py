@@ -42,6 +42,15 @@ def create_app() -> FastAPI:
             "total_tokens": prompt_tokens + completion_tokens,
         }
 
+    def _embeddings_ready() -> bool:
+        if config.embedding_path is None:
+            return False
+        base = config.embedding_path
+        try:
+            return bool((base / "tokenizer.json").exists() and (base / "onnx" / "model.onnx").exists())
+        except Exception:
+            return False
+
     def _log_entry(entry: Dict[str, Any]) -> None:
         log_store.record(entry)
 
@@ -61,6 +70,12 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health() -> Dict[str, Any]:
+        chat_busy = not engine.acquire_chat()
+        if not chat_busy:
+            engine.release_chat()
+        embeddings_busy = not engine.acquire_embeddings()
+        if not embeddings_busy:
+            engine.release_embeddings()
         return {
             "ok": True,
             "status": "ok",
@@ -69,7 +84,17 @@ def create_app() -> FastAPI:
             "uptime_sec": round(engine.uptime(), 2),
             "ctx_size": engine.ctx_size,
             "prompt_renderer": engine.model_info.get("prompt_renderer"),
+            "embeddings_ready": _embeddings_ready(),
+            "embedding_model": config.embedding_model,
+            "embedding_path_present": bool(config.embedding_path),
+            "chat_busy": chat_busy,
+            "embeddings_busy": embeddings_busy,
         }
+
+    @app.get("/v1/model/info")
+    async def model_info() -> Dict[str, Any]:
+        return {"ok": True, "model": engine.model_info}
+
 
     @app.post("/v1/embeddings")
     async def embeddings(request: EmbeddingsRequest) -> Dict[str, Any]:
@@ -110,6 +135,13 @@ def create_app() -> FastAPI:
         if not entry:
             raise HTTPException(status_code=404, detail="log_not_found")
         return entry
+
+    @app.delete("/v1/logs")
+    async def logs_clear() -> Dict[str, Any]:
+        ok = log_store.clear()
+        if not ok:
+            raise HTTPException(status_code=500, detail="log_clear_failed")
+        return {"ok": True}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest, raw_request: Request) -> Any:

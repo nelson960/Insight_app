@@ -5,6 +5,7 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,14 @@ def _normalize_file_ingestion_status(status: FileIngestionStatus | str) -> str:
     return str(status)
 
 
+class _ThreadLocalConnectionProxy:
+    def __init__(self, store: "SQLiteMetadataStore") -> None:
+        self._store = store
+
+    def __getattr__(self, name: str):
+        return getattr(self._store._get_connection(), name)
+
+
 class SQLiteMetadataStore:
     """
     Persistent SQLite store for ingestion metadata, chunk payloads, and basic job tracking.
@@ -61,11 +70,28 @@ class SQLiteMetadataStore:
         self._db_path = Path(db_path)
         self._config = config or SQLiteConfig()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
+        self._local = threading.local()
+        self._conn_lock = threading.Lock()
+        self._connections: set[sqlite3.Connection] = set()
+        self._connection = _ThreadLocalConnectionProxy(self)
         self._lock = threading.Lock()
         self._initialize()
         logger.info("SQLiteMetadataStore ready at %s", self._db_path)
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path, check_same_thread=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute(f"PRAGMA journal_mode={self._config.journal_mode}")
+                conn.execute(f"PRAGMA busy_timeout={self._config.busy_timeout_ms}")
+            except Exception:
+                pass
+            self._local.conn = conn
+            with self._conn_lock:
+                self._connections.add(conn)
+        return conn
 
     # ------------------------------------------------------------------ #
     # Schema setup
@@ -181,6 +207,26 @@ class SQLiteMetadataStore:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS ltm_memories (
+                id TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                user_id TEXT,
+                type TEXT NOT NULL,
+                text TEXT,
+                embedding BLOB,
+                embedding_dim INTEGER,
+                embedder_id TEXT,
+                confidence REAL,
+                hash TEXT,
+                metadata_json TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                UNIQUE (chat_id, type, hash)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS doc_pages (
                 chat_id TEXT NOT NULL,
                 file_id TEXT NOT NULL,
@@ -200,6 +246,9 @@ class SQLiteMetadataStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_created ON chunks(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_files_chat ON chat_files(chat_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_files_file ON chat_files(file_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ltm_memories_chat ON ltm_memories(chat_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ltm_memories_type ON ltm_memories(type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ltm_memories_created ON ltm_memories(created_at)")
         conn.execute(f"PRAGMA journal_mode={self._config.journal_mode}")
         conn.execute(f"PRAGMA busy_timeout={self._config.busy_timeout_ms}")
 
@@ -305,8 +354,9 @@ class SQLiteMetadataStore:
     def get_setting(self, key: str, default: Any = None) -> Any:
         if not key:
             return default
-        cursor = self._connection.execute("SELECT value_json FROM app_settings WHERE key=?", (key,))
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self._connection.execute("SELECT value_json FROM app_settings WHERE key=?", (key,))
+            row = cursor.fetchone()
         if not row:
             return default
         raw = row["value_json"]
@@ -339,21 +389,30 @@ class SQLiteMetadataStore:
             self._connection.commit()
 
     def list_settings(self) -> dict[str, Any]:
-        cursor = self._connection.execute("SELECT key, value_json FROM app_settings")
-        out: dict[str, Any] = {}
-        for row in cursor.fetchall():
-            k = row["key"]
-            raw = row["value_json"]
-            try:
-                out[k] = json.loads(raw) if raw is not None else None
-            except Exception:
-                out[k] = None
-        return out
+        with self._lock:
+            cursor = self._connection.execute("SELECT key, value_json FROM app_settings")
+            out: dict[str, Any] = {}
+            for row in cursor.fetchall():
+                k = row["key"]
+                raw = row["value_json"]
+                try:
+                    out[k] = json.loads(raw) if raw is not None else None
+                except Exception:
+                    out[k] = None
+            # Ensure the cursor is fully consumed and transaction is complete
+            cursor.close()
+            return out
 
     def close(self) -> None:
         try:
-            with self._lock:
-                self._connection.close()
+            with self._conn_lock:
+                conns = list(self._connections)
+                self._connections.clear()
+            for conn in conns:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -392,6 +451,83 @@ class SQLiteMetadataStore:
                 ),
             )
             self._connection.commit()
+
+    def get_message(self, message_id: str) -> Optional[Dict[str, Any]]:
+        cursor = self._connection.execute(
+            "SELECT id, role, content_json, created_at, model, mode, citations_json FROM messages WHERE id=?",
+            (message_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "role": row["role"],
+            "content_json": row["content_json"],
+            "created_at": row["created_at"],
+            "model": row["model"],
+            "mode": row["mode"],
+            "citations_json": row["citations_json"],
+        }
+
+    def get_message_with_chat(self, message_id: str) -> Optional[Dict[str, Any]]:
+        cursor = self._connection.execute(
+            "SELECT id, chat_id, role, content_json, created_at FROM messages WHERE id=?",
+            (message_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "chat_id": row["chat_id"],
+            "role": row["role"],
+            "content_json": row["content_json"],
+            "created_at": row["created_at"],
+        }
+
+    def update_message_content(self, message_id: str, content_json: str) -> None:
+        with self._lock:
+            self._connection.execute(
+                "UPDATE messages SET content_json=? WHERE id=?",
+                (content_json, message_id),
+            )
+            self._connection.commit()
+
+    def update_message_citations(self, message_id: str, citations_json: Optional[str]) -> None:
+        with self._lock:
+            self._connection.execute(
+                "UPDATE messages SET citations_json=? WHERE id=?",
+                (citations_json, message_id),
+            )
+            self._connection.commit()
+
+    def delete_messages_after(self, message_id: str) -> int:
+        """
+        Delete all messages in the same chat that were created after the given message.
+        Returns number of deleted rows (best effort).
+        """
+        with self._lock:
+            cursor = self._connection.execute(
+                "SELECT rowid, chat_id, created_at FROM messages WHERE id=?",
+                (message_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return 0
+            rowid = row["rowid"]
+            chat_id = row["chat_id"]
+            created_at = row["created_at"]
+            cur = self._connection.execute(
+                """
+                DELETE FROM messages
+                WHERE chat_id=?
+                  AND (created_at > ? OR (created_at = ? AND rowid > ?))
+                """,
+                (chat_id, created_at, created_at, rowid),
+            )
+            self._connection.commit()
+            return int(cur.rowcount or 0)
 
     def insert_message_documents(self, _message_id: str, _file_ids: Sequence[str]) -> None:  # pragma: no cover - not used
         return
@@ -440,8 +576,9 @@ class SQLiteMetadataStore:
             sql += " LIMIT ?"
             params.append(limit)
 
-        cursor = self._connection.execute(sql, tuple(params))
-        rows = cursor.fetchall()
+        with self._lock:
+            cursor = self._connection.execute(sql, tuple(params))
+            rows = cursor.fetchall()
         out: List[Dict[str, str]] = []
         for row in rows:
             role = (row["role"] or "user").strip()
@@ -1475,6 +1612,126 @@ class SQLiteMetadataStore:
         placeholders = ",".join(["?"] * len(ids))
         with self._lock:
             cur = self._connection.execute(f"DELETE FROM jobs WHERE file_id IN ({placeholders})", ids)
+            self._connection.commit()
+            return int(cur.rowcount or 0)
+
+    # ------------------------------------------------------------------ #
+    # Long-term memory helpers
+    # ------------------------------------------------------------------ #
+    def insert_ltm_memory(
+        self,
+        *,
+        memory_id: str,
+        chat_id: str,
+        text: str,
+        embedding: bytes,
+        embedding_dim: int,
+        embedder_id: Optional[str],
+        memory_type: str,
+        created_at: Optional[int] = None,
+        confidence: Optional[float] = None,
+        user_id: Optional[str] = None,
+        hash_value: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        created_at = int(created_at if created_at is not None else time.time())
+        updated_at = created_at
+        metadata_json = json.dumps(metadata) if metadata else None
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO ltm_memories (
+                    id, chat_id, user_id, type, text, embedding, embedding_dim, embedder_id,
+                    confidence, hash, metadata_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    memory_id,
+                    chat_id,
+                    user_id,
+                    memory_type,
+                    text,
+                    embedding,
+                    embedding_dim,
+                    embedder_id,
+                    confidence,
+                    hash_value,
+                    metadata_json,
+                    created_at,
+                    updated_at,
+                ),
+            )
+            self._connection.commit()
+
+    def list_ltm_memories(
+        self,
+        chat_id: str,
+        *,
+        memory_type: str = "memory",
+        limit: int = 50,
+        order_desc: bool = True,
+    ) -> list[dict[str, Any]]:
+        order = "DESC" if order_desc else "ASC"
+        cursor = self._connection.execute(
+            f"""
+            SELECT id, chat_id, user_id, type, text, embedding, embedding_dim, embedder_id,
+                   confidence, hash, metadata_json, created_at, updated_at
+            FROM ltm_memories
+            WHERE chat_id=? AND type=?
+            ORDER BY created_at {order}
+            LIMIT ?
+            """,
+            (chat_id, memory_type, int(limit)),
+        )
+        rows = cursor.fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            meta_raw = item.get("metadata_json")
+            if meta_raw:
+                try:
+                    item["metadata"] = json.loads(meta_raw)
+                except Exception:
+                    item["metadata"] = None
+            else:
+                item["metadata"] = None
+            results.append(item)
+        return results
+
+    def delete_ltm_memories(self, memory_ids: Sequence[str]) -> int:
+        ids = [mid for mid in memory_ids if isinstance(mid, str) and mid]
+        if not ids:
+            return 0
+        placeholders = ",".join(["?"] * len(ids))
+        with self._lock:
+            cur = self._connection.execute(f"DELETE FROM ltm_memories WHERE id IN ({placeholders})", ids)
+            self._connection.commit()
+            return int(cur.rowcount or 0)
+
+    def delete_ltm_for_chat(self, chat_id: str) -> int:
+        with self._lock:
+            cur = self._connection.execute("DELETE FROM ltm_memories WHERE chat_id=?", (chat_id,))
+            self._connection.commit()
+            return int(cur.rowcount or 0)
+
+    def prune_ltm_memories(self, chat_id: str, *, memory_type: str = "memory", keep: int = 5) -> int:
+        keep = int(keep)
+        if keep <= 0:
+            return 0
+        with self._lock:
+            cur = self._connection.execute(
+                """
+                DELETE FROM ltm_memories
+                WHERE chat_id = ? AND type = ? AND id NOT IN (
+                    SELECT id FROM ltm_memories
+                    WHERE chat_id = ? AND type = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                )
+                """,
+                (chat_id, memory_type, chat_id, memory_type, keep),
+            )
             self._connection.commit()
             return int(cur.rowcount or 0)
 

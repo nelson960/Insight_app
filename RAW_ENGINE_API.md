@@ -12,35 +12,6 @@ If the configured port is busy, the server will try the next available port and 
 
 ---
 
-## Runtime & Config
-
-### Environment Variables
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `INSIGHT_ENGINE_HOST` | `127.0.0.1` | Bind host |
-| `INSIGHT_ENGINE_PORT` | `11435` | Bind port |
-| `INSIGHT_ENGINE_MODEL_PATH` | (none) | **Required**. GGUF model path. If unset, tries `llm_model_path` from SQLite settings. |
-| `INSIGHT_ENGINE_CTX` | model default | Context length (tokens) |
-| `INSIGHT_ENGINE_THREADS` | model default | CPU threads |
-| `INSIGHT_ENGINE_GPU_LAYERS` | model default | GPU layers |
-| `INSIGHT_ENGINE_MAX_TOKENS` | `1024` | Default output cap |
-| `INSIGHT_LOG_DIR` | `~/.insight/engine_logs` | JSONL log dir |
-| `INSIGHT_LOG_PROMPTS` | `0` | Store full prompts (0/1) |
-| `INSIGHT_LOG_COMPLETIONS` | `0` | Store full outputs (0/1) |
-| `INSIGHT_LOG_PREVIEW_CHARS` | `400` | Preview chars stored in logs |
-| `INSIGHT_ENGINE_EMBEDDING_PATH` | (optional) | Optional embedding model path |
-| `INSIGHT_ENGINE_EMBEDDING_MODEL` | `nomic-embed-text-v1.5` | Embed model name |
-| `INSIGHT_ENGINE_EMBEDDING_AUTO_DOWNLOAD` | `1` | Auto-download embeddings |
-
-### Runtime Notes
-
-- Chat model selection is fixed at startup (no per-request model switching).
-- Embeddings model selection is fixed at startup; request `model` is echoed in responses but not used to select a model.
-- Dependencies: chat requires `llama_cpp`; embeddings require `onnxruntime` and `tokenizers` plus the model files. Auto-download needs network access.
-
----
-
 # Endpoints
 
 ## 1) `GET /health`
@@ -56,7 +27,12 @@ If the configured port is busy, the server will try the next available port and 
   "model": "Qwen2.5 7B Instruct",
   "uptime_sec": 123.4,
   "ctx_size": 32768,
-  "prompt_renderer": "qwen2"
+  "prompt_renderer": "qwen2",
+  "embeddings_ready": true,
+  "embedding_model": "nomic-embed-text-v1.5",
+  "embedding_path_present": true,
+  "chat_busy": false,
+  "embeddings_busy": false
 }
 ```
 
@@ -67,7 +43,48 @@ curl -s http://127.0.0.1:11435/health | jq
 
 ---
 
-## 2) `POST /v1/chat/completions`
+## 2) `GET /v1/model/info`
+
+Full model metadata (same fields shown in Settings).
+
+**Response**
+```json
+{
+  "ok": true,
+  "model": {
+    "name": "DeepSeek R1 Distill Llama 8B",
+    "architecture": "llama",
+    "size_label": "8B",
+    "file_type": 2,
+    "quantization_version": 2,
+    "ctx_train": 131072,
+    "ctx_runtime": 32768,
+    "n_layer": 32,
+    "n_head": 32,
+    "n_head_kv": 8,
+    "n_embd": 4096,
+    "rope_type": "yarn",
+    "rope_freq_base": 500000,
+    "vocab_size": 128256,
+    "tokenizer_model": "gpt2",
+    "kv_cache_gib": 4.0,
+    "bos_token_id": 128000,
+    "eos_token_id": 128001,
+    "prompt_renderer": "minja:default",
+    "chat_template_name": "default",
+    "path": "/models/model.gguf"
+  }
+}
+```
+
+**Example**
+```bash
+curl -s http://127.0.0.1:11435/v1/model/info | jq
+```
+
+---
+
+## 3) `POST /v1/chat/completions`
 
 OpenAI-ish chat endpoint. Supports streaming via SSE.
 
@@ -166,7 +183,7 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
 
 ---
 
-## 3) `POST /v1/embeddings`
+## 4) `POST /v1/embeddings`
 
 Returns vector embeddings.
 
@@ -208,7 +225,7 @@ curl -s http://127.0.0.1:11435/v1/embeddings \
 
 ---
 
-## 4) `GET /v1/logs/recent?limit=50`
+## 5) `GET /v1/logs/recent?limit=50`
 
 Returns recent log entries.
 
@@ -240,7 +257,7 @@ curl -s "http://127.0.0.1:11435/v1/logs/recent?limit=10" | jq
 
 ---
 
-## 5) `GET /v1/logs/{id}`
+## 6) `GET /v1/logs/{id}`
 
 Returns a single log record.
 
@@ -253,6 +270,22 @@ curl -s http://127.0.0.1:11435/v1/logs/req_abc | jq
 - 404 `log_not_found`
 
 ---
+
+## 7) `DELETE /v1/logs`
+
+Clears the raw engine log file.
+
+**Response**
+```json
+{
+  "ok": true
+}
+```
+
+**Example**
+```bash
+curl -X DELETE http://127.0.0.1:11435/v1/logs
+```
 
 # Streaming Notes
 
@@ -276,19 +309,6 @@ Busy responses look like:
 ```
 
 HTTP 429.
-
----
-
-# Running Multiple Models
-
-To run multiple chat models, start multiple raw-engine processes on different ports with different `INSIGHT_ENGINE_MODEL_PATH`, then call each base URL with curl.  
-Each process loads its own model (higher RAM/VRAM). For different embedding models, run separate processes with different `INSIGHT_ENGINE_EMBEDDING_MODEL`/`INSIGHT_ENGINE_EMBEDDING_PATH`.
-
-Example:
-```bash
-INSIGHT_ENGINE_MODEL_PATH=/models/llama3.gguf INSIGHT_ENGINE_PORT=11435 python backend/raw_engine_server.py
-INSIGHT_ENGINE_MODEL_PATH=/models/qwen2.gguf INSIGHT_ENGINE_PORT=11436 python backend/raw_engine_server.py
-```
 
 ---
 

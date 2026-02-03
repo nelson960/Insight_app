@@ -57,6 +57,35 @@ def get_doc_page(chat_id: str, file_id: str):
             "bootstrapped": False,
         }
 
+    policy_raw = record.get("policy_json")
+    policy: Dict[str, Any] = {}
+    if isinstance(policy_raw, str) and policy_raw.strip():
+        try:
+            policy = json.loads(policy_raw) or {}
+        except Exception:
+            policy = {}
+
+    # Raw-large files do not render a cached preview. Return a minimal placeholder.
+    if not blocks and bool(policy.get("raw_large")):
+        placeholder = blocks_to_prosemirror_doc(
+            [
+                {
+                    "text": "Preview not available for large files. Ask a question to search the content.",
+                }
+            ]
+        )
+        return {
+            "chat_id": chat_id,
+            "file_id": file_id,
+            "title": title,
+            "doc": placeholder,
+            "updated_at": source_updated_at,
+            "source_file_updated_at": source_updated_at,
+            "source_is_stale": False,
+            "is_user_edited": False,
+            "bootstrapped": False,
+        }
+
     doc = blocks_to_prosemirror_doc(blocks)
     store.upsert_doc_page(
         chat_id,
