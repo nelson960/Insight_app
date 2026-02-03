@@ -51,6 +51,7 @@ import posixpath
 import logging
 import multiprocessing as mp
 import os
+import secrets
 import sys
 import threading
 import time
@@ -64,6 +65,26 @@ from urllib.parse import urlparse
 
 # Must be safe to run in spawned child contexts.
 mp.freeze_support()
+
+
+# ---------------------------------------------------------------------------
+# IPC auth token (per-process)
+# ---------------------------------------------------------------------------
+
+_IPC_TOKEN_ENV = "INSIGHT_IPC_TOKEN"
+_IPC_TOKEN: str | None = None
+
+
+def _get_ipc_token() -> str:
+    global _IPC_TOKEN
+    if _IPC_TOKEN:
+        return _IPC_TOKEN
+    token = os.getenv(_IPC_TOKEN_ENV)
+    if not token:
+        token = secrets.token_hex(16)
+        os.environ[_IPC_TOKEN_ENV] = token
+    _IPC_TOKEN = token
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +347,9 @@ def _build_headers(headers: Dict[str, Any]) -> List[Tuple[bytes, bytes]]:
 
     if not any(str(k).lower() == "x-insight-ipc" for k in headers.keys()):
         out.append((b"x-insight-ipc", b"1"))
+
+    if not any(str(k).lower() == "x-insight-ipc-token" for k in headers.keys()):
+        out.append((b"x-insight-ipc-token", _get_ipc_token().encode("utf-8")))
 
     for k, v in headers.items():
         out.append((str(k).lower().encode("utf-8"), str(v).encode("utf-8")))
@@ -834,7 +858,19 @@ async def main_async() -> None:
         pass
 
 
+def _should_run_raw_server() -> bool:
+    if "--raw-server" in sys.argv:
+        return True
+    mode = (os.getenv("INSIGHT_ENGINE_MODE") or "").strip().lower()
+    return mode in {"raw", "raw_server", "raw-engine", "raw_engine"}
+
+
 def main() -> None:
+    if _should_run_raw_server():
+        from backend.raw_engine_server import main as raw_main  # type: ignore
+
+        raw_main()
+        return
     anyio.run(main_async)
 
 

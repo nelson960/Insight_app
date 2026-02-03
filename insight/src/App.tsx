@@ -1028,7 +1028,7 @@ function App() {
             onResetConfirmDelete={() => setConfirmDeleteChatId(null)}
             loadingSessions={loading}
             onSpawnHint={handleSpawnHint}
-            dockVisible={!overlayCardId && !overlayChatId}
+            dockVisible={!overlayCardId && !overlayChatId || overlayChatClosing || overlayCardClosing}
           />
           <FirstRunSetupModal
             open={setupOpen}

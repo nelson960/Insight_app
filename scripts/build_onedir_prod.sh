@@ -264,6 +264,53 @@ build_backend() {
     echo ""
 }
 
+sync_backend_sidecar() {
+    header "Syncing Backend Sidecar"
+
+    local arch
+    arch=$(detect_architecture)
+    local binary_name
+    binary_name=$(get_binary_name "$arch")
+
+    local src_dir="$BACKEND_DIST"
+    local src_exe="${BACKEND_DIST}/insight-engine"
+    if [[ ! -d "$src_dir" || ! -f "$src_exe" ]]; then
+        error "Backend dist not found or invalid: $src_exe"
+        error "Run PyInstaller build first (or omit --no-pyinstaller)."
+        exit 2
+    fi
+
+    local dest_dir="${TAURI_DIR}/bin/${binary_name}"
+    local dest_exe="${dest_dir}/insight-engine"
+
+    bold "Updating sidecar directory..."
+    info "Source: $src_dir"
+    info "Destination: $dest_dir"
+
+    mkdir -p "$dest_dir"
+    rm -rf "${dest_dir:?}/"* 2>/dev/null || true
+    if ! cp -R "$src_dir"/. "$dest_dir/"; then
+        error "Failed to copy backend dist into sidecar directory"
+        exit 5
+    fi
+    chmod +x "$dest_exe" 2>/dev/null || true
+
+    if ! verify_binary "$dest_dir"; then
+        error "Sidecar binary is invalid after sync"
+        exit 5
+    fi
+
+    if [[ "$dest_exe" -ot "$src_exe" ]]; then
+        error "Sidecar is older than backend dist; refusing to continue"
+        info "Sidecar: $(stat -f \"%Sm\" "$dest_exe")"
+        info "Backend: $(stat -f \"%Sm\" "$src_exe")"
+        exit 5
+    fi
+
+    success "Sidecar synced and verified"
+    echo ""
+}
+
 run_smoke_tests() {
     if [[ "$SKIP_SMOKETEST" == "true" ]]; then
         warning "Skipping smoke tests"
@@ -513,6 +560,9 @@ main() {
 
     # Build backend
     build_backend
+
+    # Sync backend sidecar (always use freshest dist output)
+    sync_backend_sidecar
 
     # Run smoke tests
     run_smoke_tests

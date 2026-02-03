@@ -34,7 +34,7 @@ def _select_port(host: str, port: int, *, max_tries: int = 20) -> int:
     raise RuntimeError(f"No available port found in range {port}-{port + max_tries - 1}")
 
 
-if __name__ == "__main__":
+def main() -> None:
     config = EngineConfig.from_env()
     _warn_dual_process()
     selected_port = _select_port(config.host, config.port)
@@ -45,3 +45,7 @@ if __name__ == "__main__":
         )
         config.port = selected_port
     uvicorn.run(app, host=config.host, port=config.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

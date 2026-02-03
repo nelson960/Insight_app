@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -232,6 +233,9 @@ def create_app() -> FastAPI:
         is_ipc = request.headers.get(_IPC_HEADER) == _IPC_VALUE
         if not is_ipc:
             return JSONResponse(status_code=403, content={"ok": False, "error": "ipc_required"})
+        ipc_token = os.getenv("INSIGHT_IPC_TOKEN")
+        if ipc_token and request.headers.get("x-insight-ipc-token") != ipc_token:
+            return JSONResponse(status_code=403, content={"ok": False, "error": "ipc_token_invalid"})
         token = None
         try:
             if getattr(app.state, "deps", None) is not None:

@@ -187,6 +187,14 @@ def _enforce_rag_ready(payload: dict) -> None:
         )
 
 
+def _ipc_token_required() -> Optional[str]:
+    token = os.getenv("INSIGHT_IPC_TOKEN")
+    if not token:
+        return None
+    token = token.strip()
+    return token or None
+
+
 @router.post("")
 async def chat_entry(
     request: Request,
@@ -231,9 +239,24 @@ async def chat_entry(
 
 @router.websocket("/stream")
 async def chat_stream(websocket: WebSocket):
+    # IPC guard (WebSockets bypass HTTP middleware)
+    if websocket.headers.get("x-insight-ipc") != "1":
+        await websocket.close(code=1008)
+        return
+    ipc_token = _ipc_token_required()
+    if ipc_token and websocket.headers.get("x-insight-ipc-token") != ipc_token:
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     try:
         payload = await websocket.receive_json()
+        try:
+            _enforce_rag_ready(payload)
+        except HTTPException as exc:
+            await websocket.send_json({"event": "error", "detail": exc.detail})
+            await websocket.close(code=1008)
+            return
         req = _build_request(payload)
     except Exception as exc:  # pragma: no cover
         await websocket.send_json({"event": "error", "detail": str(exc)})

@@ -1,0 +1,24 @@
+fastapi
+uvicorn
+anyio
+qdrant-client
+onnxruntime
+tokenizers
+llama-cpp-python
+huggingface_hub
+numpy
+pandas
+aiofiles
+python-multipart
+PyYAML
+requests
+certifi
+
+# Optional extractors / OCR
+pymupdf
+python-docx
+python-pptx
+pillow
+pytesseract
+beautifulsoup4
+sentence-transformers

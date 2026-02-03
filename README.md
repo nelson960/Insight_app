@@ -39,21 +39,21 @@ Recent hardening fixes after a full review:
 ## Demo
 
 <p align="center">
-  <img src="pics/Screenshot 2026-01-13 at 5.58.45 PM.png" width="900" alt="Compare & explain across two documents with scope control" />
+  <img src="pics/Chat.png" width="900" alt="Compare & explain across two documents with scope control" />
 </p>
 <p align="center"><b>Compare & explain across two documents with scope control</b></p>
 
 <br/>
 
 <p align="center">
-  <img src="pics/Screenshot 2026-01-13 at 6.04.35 PM.png" width="900" alt="Canvas workspace with linked cards" />
+  <img src="pics/Canvas.png" width="900" alt="Canvas workspace with linked cards" />
 </p>
 <p align="center"><b>Canvas workspace with linked cards</b></p>
 
 <br/>
 
 <p align="center">
-  <img src="pics/Screenshot 2026-01-13 at 6.05.55 PM.png" width="900" alt="Settings: local Raw API server running on localhost" />
+  <img src="pics/Raw Server.png" width="900" alt="Settings: local Raw API server running on localhost" />
 </p>
 <p align="center"><b>Settings: local Raw API server running on localhost</b></p>
 
@@ -295,9 +295,10 @@ The **raw engine server** provides Path 2 access to the swappable local LLM back
 
 **Core concept:** Same swappable GGUF model layer, different interface. Models changed via `INSIGHT_ENGINE_MODEL_PATH` are immediately available to both the desktop app (IPC) and external tools (HTTP).
 
-- **Endpoints:** `/chat` (text generation), `/embeddings` (optional, llama.cpp/ONNX-backed)
+- **Endpoints:** `/v1/chat/completions` (text generation), `/v1/embeddings` (optional, llama.cpp/ONNX-backed)
 - **Streaming:** Server-Sent Events supported
 - **Bind address:** `127.0.0.1:11435` (localhost-only, no network exposure)
+- **Auth (optional):** set `INSIGHT_ENGINE_TOKEN` and pass `x-insight-token: <token>`
 - **Lifecycle:** managed via Settings UI (start/stop/status)
 - **Model access:** shares the same GGUF model layer as the desktop app
 - **Chat templates:** auto-detected from GGUF metadata (e.g., Llama 3, Qwen-style templates)
@@ -308,10 +309,9 @@ The **raw engine server** provides Path 2 access to the swappable local LLM back
 **Basic chat completion:**
 
 ```bash
-curl http://127.0.0.1:11435/chat \
+curl http://127.0.0.1:11435/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "local",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": false
   }'
@@ -320,10 +320,9 @@ curl http://127.0.0.1:11435/chat \
 **Streaming:**
 
 ```bash
-curl http://127.0.0.1:11435/chat \
+curl http://127.0.0.1:11435/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "local",
     "messages": [{"role": "user", "content": "Explain RAG"}],
     "stream": true
   }'
@@ -370,7 +369,9 @@ All data is stored under `~/.insight/`:
 - `insight/` — Tauri + React desktop app
 - `backend/` — FastAPI IPC engine, retrieval + llama.cpp orchestration
   - `services/raw_engine_server/` — Standalone local HTTP inference server (SSE)
-- `docs/` — build notes, packaging
+- `ONEDIR_BUILD_GUIDE.md` — build notes, packaging
+- `RAW_ENGINE_API.md` — raw engine API reference
+- `FRESH_MACHINE_CHECKLIST.md` — setup checklist
 
 ---
 
@@ -394,18 +395,18 @@ cd insight
 pnpm install
 pnpm tauri dev
 
-# Python Engine (separate terminal)
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-INSIGHT_WORKSPACE_DIR=~/.insight-dev python backend/engine.py
+# Backend engine is spawned automatically by the Tauri dev app.
+# If you need a custom interpreter, set PYTHON_BIN before running tauri dev.
+# Avoid starting a second engine process or you'll hit Qdrant/SQLite locks.
+# Example:
+# PYTHON_BIN=/opt/miniconda3/envs/ml/bin/python pnpm tauri dev
 ```
 
 ---
 
 ## License
 
-Licensed under the Apache License, Version 1.0.
+Licensed under the MIT License.
 
 ## Acknowledgments
 

@@ -496,8 +496,8 @@ cat ~/.insight/logs/backend_stderr_*.log
 
 **Diagnosis:**
 ```bash
-# Check download status
-curl http://localhost:XXXX/diagnostics/packaging | jq '.embedding_models'
+# Check packaging/dependency status
+cat ~/.insight/logs/boot_summary_latest.json | jq '.dependencies'
 
 # Check certificate
 ls -la ~/.insight/em_models/nomic-embed-text/tokenizer.json

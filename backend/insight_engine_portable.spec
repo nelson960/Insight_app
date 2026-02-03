@@ -169,6 +169,15 @@ hiddenimports.extend([
     "backend.services.health",
     "backend.services.gguf_metadata",
     "backend.services.ipc_events",
+    "backend.raw_engine_server",
+    "backend.services.raw_engine_server",
+    "backend.services.raw_engine_server.app",
+    "backend.services.raw_engine_server.config",
+    "backend.services.raw_engine_server.engine",
+    "backend.services.raw_engine_server.logging_store",
+    "backend.services.raw_engine_server.manager",
+    "backend.services.raw_engine_server.schemas",
+    "backend.services.raw_engine_server.sse",
     "backend.engine",
 ])
 

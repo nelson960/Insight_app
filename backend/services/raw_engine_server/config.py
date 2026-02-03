@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ipaddress
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +11,7 @@ from backend.core.workspace import get_workspace
 from backend.runtime_utils import is_packaged
 from backend.services.storage.sqlite_store import SQLiteMetadataStore
 
+logger = logging.getLogger(__name__)
 
 def _env_bool(name: str, default: bool = False) -> bool:
     val = os.getenv(name)
@@ -25,6 +28,18 @@ def _env_int(name: str) -> Optional[int]:
         return int(val)
     except ValueError:
         return None
+
+
+def _is_loopback_host(host: str) -> bool:
+    if not host:
+        return False
+    lowered = host.strip().lower()
+    if lowered in {"localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(lowered).is_loopback
+    except ValueError:
+        return False
 
 
 def _has_required_assets(base: Path) -> bool:
@@ -48,6 +63,7 @@ class EngineConfig:
     embedding_path: Optional[Path]
     embedding_model: str
     embedding_auto_download: bool
+    auth_token: Optional[str]
 
     @staticmethod
     def _load_model_path_from_settings() -> str:
@@ -109,6 +125,15 @@ class EngineConfig:
         host = os.getenv("INSIGHT_ENGINE_HOST", "127.0.0.1")
         if is_packaged() and host not in {"127.0.0.1", "localhost", "::1"}:
             host = "127.0.0.1"
+        auth_token = os.getenv("INSIGHT_ENGINE_TOKEN")
+        if auth_token is not None:
+            auth_token = auth_token.strip() or None
+        if not _is_loopback_host(host) and not auth_token:
+            logger.warning(
+                "INSIGHT_ENGINE_HOST=%s is non-loopback without INSIGHT_ENGINE_TOKEN; forcing 127.0.0.1",
+                host,
+            )
+            host = "127.0.0.1"
         log_dir = Path(os.getenv("INSIGHT_LOG_DIR") or (Path.home() / ".insight" / "engine_logs"))
         embedding_path = cls._resolve_embedding_path()
         return cls(
@@ -126,4 +151,5 @@ class EngineConfig:
             embedding_path=embedding_path,
             embedding_model=os.getenv("INSIGHT_ENGINE_EMBEDDING_MODEL", "nomic-embed-text-v1.5"),
             embedding_auto_download=_env_bool("INSIGHT_ENGINE_EMBEDDING_AUTO_DOWNLOAD", False),
+            auth_token=auth_token,
         )

@@ -232,7 +232,6 @@ export function SettingsModal(props: {
   const modelLoadStartRef = useRef<number | null>(null);
   const modelApplyPhaseRef = useRef(modelApplyPhase);
   const modelValidationCacheRef = useRef<{path: string, time: number} | null>(null);
-  const validateDebounceRef = useRef<number | null>(null);
   const [activeTab, setActiveTab] = useState<"general" | "model" | "retrieval" | "raw" | "storage">(initialTab);
   const rawLogsOpen = activeTab === "raw";
   const ragDefaultsSaveRef = useRef<number | null>(null);
@@ -1622,11 +1621,6 @@ export function SettingsModal(props: {
                           : "Raw server is off. Starting it will load the model a second time."
                       )}
                     </div>
-                    {rawEngineError || rawEngineStatus?.error ? (
-                      <div className="settings-hint err settings-raw-hint">
-                        {rawEngineError || rawEngineStatus?.error}
-                      </div>
-                    ) : null}
                   </div>
 
                   <div className="settings-raw-config">
@@ -1819,6 +1813,12 @@ export function SettingsModal(props: {
 
                 <div className="settings-raw-right">
                   <div className="settings-raw-console settings-scrollable" ref={rawLogRef}>
+                    {rawEngineError || rawEngineStatus?.error ? (
+                      <div className="settings-raw-line settings-raw-line-error">
+                        <span className="settings-raw-time">error</span>
+                        <span className="settings-raw-text">{rawEngineError || rawEngineStatus?.error}</span>
+                      </div>
+                    ) : null}
                     {rawEngineLogs.length ? (
                       rawEngineLogs.map((entry, idx) => (
                         <div key={`${entry.ts}-${idx}`} className="settings-raw-line">

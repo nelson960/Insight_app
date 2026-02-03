@@ -597,6 +597,7 @@ def raw_engine_start() -> Dict[str, Any]:
     status = _raw_engine_mgr().status()
     if status.get("running") or status.get("starting"):
         return status
+    logger.info("Raw server start requested")
     store, should_close = _settings_store()
     try:
         settings = store.list_settings()
@@ -621,20 +622,24 @@ def raw_engine_start() -> Dict[str, Any]:
     store, should_close = _settings_store()
     try:
         record = _load_model_record_if_current(store, prefix="raw_engine", path=p)
+        if record is None:
+            record = _load_model_record_if_current(store, prefix="llm", path=p)
+            if record:
+                logger.info("Raw server start using cached LLM model record")
     finally:
         if should_close:
             store.close()
     if record is None:
-        record, err = _validate_chat_template_record(p)
-        if err:
-            return {"ok": False, "error": err}
-        if record:
-            store, should_close = _settings_store()
-            try:
-                _persist_model_record(store, prefix="raw_engine", record=record)
-            finally:
-                if should_close:
-                    store.close()
+        # Skip chat template validation here to avoid blocking the IPC loop.
+        # Raw engine startup will validate and surface errors via raw server logs.
+        logger.warning("Raw server start skipping template validation (no cached record)")
+    else:
+        store, should_close = _settings_store()
+        try:
+            _persist_model_record(store, prefix="raw_engine", record=record)
+        finally:
+            if should_close:
+                store.close()
 
     host = raw_engine_settings.get("raw_engine_host", RAW_ENGINE_DEFAULTS["raw_engine_host"])
     port = raw_engine_settings.get("raw_engine_port", RAW_ENGINE_DEFAULTS["raw_engine_port"])

@@ -881,11 +881,20 @@ export function Canvas({
   }
 
   function getDockAvoidZone(): { x: number; y: number; w: number; h: number } | null {
+    if (!dockVisible) return null;
     const root = rootRef.current;
     const dock = dockRef.current;
     if (!root || !dock) return null;
-    const rootRect = root.getBoundingClientRect();
-    const dockRect = dock.getBoundingClientRect();
+    if (!dock.isConnected) return null;
+    let rootRect: DOMRect;
+    let dockRect: DOMRect;
+    try {
+      rootRect = root.getBoundingClientRect();
+      dockRect = dock.getBoundingClientRect();
+    } catch {
+      return null;
+    }
+    if (!dockRect.width || !dockRect.height) return null;
     const { x, y, scale } = vpRef.current;
     if (!scale) return null;
     const pad = 12 / scale;
@@ -937,7 +946,7 @@ export function Canvas({
     if (!onSpawnHint) return;
     const viewW = viewRef.current.w;
     const viewH = viewRef.current.h;
-    const { x, y, scale } = vpRef.current;
+    const { scale } = vpRef.current;
     const bw = boardRef.current.w;
     const bh = boardRef.current.h;
     if (!viewW || !viewH || !scale) return;
@@ -1026,7 +1035,11 @@ export function Canvas({
   }, [links, noteById, vp.scale, dpr, hiddenChatIds, effectiveGroupColorByChatId, fadingLinkToChatIds]);
 
   const dock = (
-    <div className="canvas-dock" ref={dockRef} onPointerDown={(e) => e.stopPropagation()}>
+    <div
+      className={`canvas-dock ${dockVisible ? "is-visible" : "is-hidden"}`}
+      ref={dockRef}
+      onPointerDown={(e) => e.stopPropagation()}
+    >
       <div className="canvas-dock-row">
         <button
           className="canvas-dock-btn"
@@ -1219,9 +1232,7 @@ export function Canvas({
         })}
       </div>
       </div>
-      {dockVisible && typeof document !== "undefined" && document.body
-        ? createPortal(dock, document.body)
-        : null}
+      {typeof document !== "undefined" && document.body ? createPortal(dock, document.body) : null}
     </>
   );
 }

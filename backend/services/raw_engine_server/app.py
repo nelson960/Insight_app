@@ -26,6 +26,14 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Insight Raw Engine API", version="0.1.0")
 
+    if config.auth_token:
+        @app.middleware("http")
+        async def _require_token(request: Request, call_next):
+            token = request.headers.get("x-insight-token")
+            if token != config.auth_token:
+                return JSONResponse(status_code=403, content={"ok": False, "error": "auth_required"})
+            return await call_next(request)
+
     def _preview(text: str) -> str:
         limit = max(0, int(config.log_preview_chars))
         if limit <= 0:

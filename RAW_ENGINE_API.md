@@ -8,6 +8,10 @@ Base URL (default):
 http://127.0.0.1:11435
 ```
 
+Auth (optional):
+- If `INSIGHT_ENGINE_TOKEN` is set, include header `x-insight-token: <token>` on all requests.
+- If `INSIGHT_ENGINE_HOST` is set to a non-loopback address without a token, the server will force `127.0.0.1`.
+
 If the configured port is busy, the server will try the next available port and print the fallback to stderr.
 
 ---

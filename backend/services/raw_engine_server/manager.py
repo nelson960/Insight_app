@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import re
 import subprocess
@@ -11,9 +12,13 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
+from backend.runtime_utils import is_packaged
+
 
 _UVICORN_RE = re.compile(r"Uvicorn running on https?://([^:]+):(\d+)")
 _FALLBACK_RE = re.compile(r"falling back to (\d+)")
+
+logger = logging.getLogger(__name__)
 
 
 class RawEngineServerManager:
@@ -35,6 +40,11 @@ class RawEngineServerManager:
         self._start_requested_at: Optional[float] = None
         atexit.register(self.stop)
 
+    def _build_command(self) -> List[str]:
+        if is_packaged():
+            return [sys.executable, "--raw-server"]
+        return [sys.executable, "-m", "backend.raw_engine_server"]
+
     def _project_root(self) -> Path:
         return Path(__file__).resolve().parents[3]
 
@@ -55,12 +65,16 @@ class RawEngineServerManager:
                     self._port = int(uvicorn_match.group(2))
                 except Exception:
                     pass
+                logger.info("Raw server ready on %s:%s", self._host, self._port)
             fallback_match = _FALLBACK_RE.search(line)
             if fallback_match:
                 try:
                     self._port = int(fallback_match.group(1))
                 except Exception:
                     pass
+                logger.warning("Raw server port fallback to %s", self._port)
+        if "Traceback" in line or "Error" in line or "ERROR" in line:
+            logger.warning("Raw server log: %s", line)
 
     def _drain_output(self, process: subprocess.Popen[str]) -> None:
         stream = process.stdout
@@ -76,6 +90,12 @@ class RawEngineServerManager:
             self._exit_code = exit_code
             if exit_code is not None and exit_code != 0:
                 self._start_error = f"Raw server exited with code {exit_code}"
+        if exit_code is None:
+            return
+        if exit_code == 0:
+            logger.info("Raw server exited cleanly")
+        else:
+            logger.error("Raw server exited with code %s", exit_code)
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
@@ -109,6 +129,8 @@ class RawEngineServerManager:
             return list(self._logs)[-limit:]
 
     def start(self, env_overrides: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        cmd: List[str] | None = None
+        cmd_str: str | None = None
         with self._lock:
             if self._process and self._process.poll() is None:
                 return self.status()
@@ -135,12 +157,25 @@ class RawEngineServerManager:
             self._host = requested_host
             self._port = requested_port
             self._log_dir = self._resolve_log_dir()
-            self._command = "python -m backend.raw_engine_server"
+            cmd = self._build_command()
+            if is_packaged():
+                env["INSIGHT_ENGINE_MODE"] = "raw"
+            cmd_str = " ".join(cmd)
+            self._command = cmd_str
+
+        if cmd_str:
+            self._record_line(f"[manager] starting raw server: {cmd_str}")
+            logger.info(
+                "Raw server start requested host=%s port=%s command=%s",
+                requested_host,
+                requested_port,
+                cmd_str,
+            )
 
         def _worker() -> None:
             try:
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "backend.raw_engine_server"],
+                    cmd or [sys.executable, "-m", "backend.raw_engine_server"],
                     cwd=str(self._project_root()),
                     env=env,
                     stdout=subprocess.PIPE,
@@ -156,6 +191,8 @@ class RawEngineServerManager:
                     self._started_at = None
                     self._starting = False
                     self._start_error = str(exc)
+                self._record_line(f"[manager] raw server failed to start: {exc}")
+                logger.exception("Failed to start raw server: %s", exc)
                 return
 
             with self._lock:
