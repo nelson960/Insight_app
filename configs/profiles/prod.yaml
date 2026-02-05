@@ -1,0 +1,14 @@
+runtime:
+  profile: "prod"
+
+llm:
+  desktop:
+    ctx_size_default: 32768
+  raw_engine:
+    host_default: "127.0.0.1"
+    port_default: 11435
+    log_prompts_default: false
+    log_completions_default: false
+
+observability:
+  log_level: "INFO"

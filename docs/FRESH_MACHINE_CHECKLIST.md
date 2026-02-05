@@ -555,10 +555,13 @@ The packaged app is considered stable when ALL of the following pass:
 ### macOS arm64 (Apple Silicon)
 
 ```bash
-cd /Users/nelson/py/insight/insight_app
+cd /path/to/insight_app
 
 # Activate Python environment
-conda activate ml
+# Example:
+# source .venv/bin/activate
+# or
+# conda activate <your_env_name>
 
 # Build Python backend
 pyinstaller --noconfirm --clean backend/insight_engine_portable.spec

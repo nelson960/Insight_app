@@ -587,6 +587,56 @@ def health_state(full: bool = Query(False)) -> Dict[str, Any]:
     return get_startup_health_report()
 
 
+@router.get("/contract")
+def contract_state(
+    verify_hashes: bool = Query(False, description="Verify SHA256 hashes (can be slow for large GGUF files)."),
+    allow_missing_artifacts: bool = Query(
+        False,
+        description="Treat missing model artifacts as warnings (useful in CI/dev without large model files).",
+    ),
+    persist: bool = Query(True, description="Persist snapshot to ~/.insight/contracts/effective_contract_latest.json"),
+    profile: Optional[str] = Query(None, description="Optional profile override (dev/prod)."),
+) -> Dict[str, Any]:
+    """
+    Build and optionally persist an effective runtime contract snapshot.
+
+    This captures user-controlled settings + contract files into one hashable record.
+    """
+    store, should_close = _settings_store()
+    try:
+        settings = store.list_settings()
+    finally:
+        if should_close:
+            store.close()
+
+    try:
+        from backend.services.mlops import (
+            build_effective_contract_snapshot,
+            write_effective_contract_snapshot,
+        )
+
+        workspace = get_workspace().base
+        snapshot = build_effective_contract_snapshot(
+            settings=settings,
+            workspace=workspace,
+            verify_hashes=bool(verify_hashes),
+            allow_missing_artifacts=bool(allow_missing_artifacts),
+            profile=profile,
+        )
+        persisted_path = None
+        if persist:
+            persisted_path = str(write_effective_contract_snapshot(snapshot, workspace=workspace))
+        return {
+            "ok": bool(snapshot.get("validation", {}).get("ok")),
+            "contract_id": snapshot.get("contract_id"),
+            "persisted_path": persisted_path,
+            "snapshot": snapshot,
+        }
+    except Exception as exc:
+        logger.exception("Failed to build effective contract snapshot")
+        return {"ok": False, "error": str(exc)}
+
+
 @router.get("/raw_engine/status")
 def raw_engine_status() -> Dict[str, Any]:
     return _raw_engine_mgr().status()

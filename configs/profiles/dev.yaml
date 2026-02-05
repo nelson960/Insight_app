@@ -1,0 +1,13 @@
+runtime:
+  profile: "dev"
+
+llm:
+  desktop:
+    # Keep the current default runtime behavior in dev for reproducibility.
+    ctx_size_default: 32768
+  raw_engine:
+    host_default: "127.0.0.1"
+    port_default: 11435
+
+observability:
+  log_level: "INFO"

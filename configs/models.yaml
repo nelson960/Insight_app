@@ -1,0 +1,33 @@
+# Insight model artifact registry
+# Update checksums with:
+#   python3 scripts/mlops/compute_checksums.py --yaml <path1> <path2> ...
+
+artifact_registry:
+  version: 1
+  generated_at: "2026-02-04"
+
+variables:
+  REPO_ROOT: "${REPO_ROOT}"
+  WORKSPACE: "${WORKSPACE}"
+
+llm_models:
+  - id: "qwen2.5-7b-instruct-q4_0"
+    kind: "gguf"
+    path: "${REPO_ROOT}/models/Qwen2.5-7B-Instruct_q4_0.gguf"
+    sha256: "3b2d4ea7ee3d18c6f061f7cb44b7d2ab92eabcf3bea1ef40eb1760f5f875dfbf"
+    required: true
+    default_for:
+      desktop: true
+      raw_engine: false
+
+embedding_models:
+  - id: "nomic-embed-text-v1.5-onnx"
+    kind: "onnx"
+    vector_dim: 768
+    normalize_embeddings: true
+    required: true
+    files:
+      - path: "${WORKSPACE}/em_models/nomic-embed-text/onnx/model.onnx"
+        sha256: "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
+      - path: "${WORKSPACE}/em_models/nomic-embed-text/tokenizer.json"
+        sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"

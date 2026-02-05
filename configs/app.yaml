@@ -1,0 +1,90 @@
+# Insight Artifact Contract
+# This file pins runtime behavior knobs that directly affect RAG output quality.
+# Keep this versioned in git and change it intentionally.
+
+artifact_contract:
+  version: 1
+  name: "insight-ml-contract"
+
+runtime:
+  default_profile: "dev"
+
+embedding:
+  model_id: "nomic-embed-text-v1.5-onnx"
+  embedding_version: 1
+  vector_dim: 768
+  normalize_embeddings: true
+  max_length: 2048
+  providers:
+    - "CPUExecutionProvider"
+  batch_size: 8
+  prefer_local: true
+  model_dir:
+    workspace: "${WORKSPACE}/em_models/nomic-embed-text"
+    dev_fallback: "${REPO_ROOT}/backend/em_models/nomic-embed-text"
+
+ingestion:
+  chunker:
+    strategy: "code_aware"
+    chunk_size_tokens: 1200
+    chunk_overlap_tokens: 120
+    approx_chars_per_token: 4
+  extraction:
+    pdf_ocr_fallback: true
+    image_ocr_enabled: true
+
+vector_index:
+  chunks:
+    collection_name: "insight_chunks"
+    distance: "Cosine"
+    vector_size: 768
+    storage_path: "${WORKSPACE}/qdrant"
+    prefer_grpc: false
+  memories:
+    collection_name: "insight_memories"
+    distance: "Cosine"
+    default_vector_size: 768
+
+retrieval:
+  primary_k: 12
+  primary_k_selection: 6
+  primary_k_summary: 16
+  all_documents_total_k: 14
+  secondary_k_total: 0
+  small_doc_cite_k: 6
+
+prompt_policy:
+  context_pack_ephemeral: true
+  forbid_internal_identifiers_in_model_prompt: true
+  rag_ready_gate:
+    enabled: true
+    status_code: 409
+  scope_modes:
+    - "focused"
+    - "all"
+    - "raw_large"
+
+llm:
+  desktop:
+    model_id: "qwen2.5-7b-instruct-q4_0"
+    ctx_size_allowed:
+      - 8192
+      - 32768
+    ctx_size_default: 32768
+    gpu_layers_default: 99
+    timeout_seconds: 120.0
+  raw_engine:
+    model_id: "qwen2.5-7b-instruct-q4_0"
+    host_default: "127.0.0.1"
+    port_default: 11435
+    ctx_size_default: 32768
+    max_tokens_default: 1024
+    embedding_model: "nomic-embed-text-v1.5"
+    log_preview_chars_default: 400
+    log_prompts_default: false
+    log_completions_default: false
+
+observability:
+  contract_id_from_resolved_config: true
+  include_contract_id_in_logs: true
+  include_contract_id_in_diagnostics: true
