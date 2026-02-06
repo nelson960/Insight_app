@@ -1,11 +1,12 @@
-# Insight — Private, Local AI Workspace for Document Q&A (RAG + On-Device LLM)
+# Insight — Private, Local AI Workspace for Document Intelligence
 
-**Insight** is a local-first desktop app for asking questions over your own files (PDFs, notes, logs) **without sending anything to the cloud**.
+**Insight** is a local-first desktop workspace for turning your files (PDFs, notes, logs) into **cited answers and reusable artifacts**, powered by **your own model** and **without sending anything to the cloud**.
 
-- **Runs fully offline**: embeddings + retrieval + on-device GGUF inference
-- **Document-grounded answers**: focused vs all-docs scope, compare mode, selection-first follow-ups
-- **Fast + stateful**: streaming + per-chat KV snapshot resume (no prompt replay)
-- **Built like a workspace**: canvas UI with linked cards and isolated context per card
+- **Bring your own LLM**: model-agnostic local inference (GGUF or localhost Raw API)
+- **Drop in files, get cited answers**: focused vs all-docs scope, compare mode, selection-first follow-ups
+- **Canvas-style workspace**: chats, documents, and outputs side-by-side
+- **Artifacts, not just chat**: summaries, extracted tables, comparisons, drafts
+- **Private + fast**: runs fully offline with streaming + per-chat KV snapshot resume (no prompt replay)
 
 > **Status:** Beta. Stable on **macOS (Apple Silicon)**.
 
@@ -50,11 +51,13 @@ Insight is for people who need **private, explainable answers over local documen
 
 ## What Makes Insight Different
 
+- Model-agnostic local inference (bring your own LLM)
 - Scope is first-class (focused doc vs all docs)
-- Retrieved evidence is injected ephemerally (clean history/KV)
+- Cited, document-grounded answers with ephemeral evidence injection (clean history/KV)
 - RAG-ready gating prevents answering before ingestion completes
 - Large-file fallback for logs/text via ripgrep windows
 - Dual access: desktop IPC (full RAG) + localhost HTTP raw engine
+- Artifact-first outputs (summaries, tables, comparisons, drafts)
 
 ## Engineering Highlights
 
