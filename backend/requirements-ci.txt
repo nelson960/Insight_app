@@ -2,3 +2,4 @@ anyio
 fastapi
 httpx
 pyyaml
+qdrant-client
