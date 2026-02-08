@@ -23,6 +23,7 @@ def _make_config(tmp_dir: str, *, ctx_size: int = 64, default_max_tokens: int = 
         host="127.0.0.1",
         port=11435,
         model_path=Path("stub.gguf"),
+        auth_token=None,
         ctx_size=ctx_size,
         n_threads=None,
         n_gpu_layers=None,
