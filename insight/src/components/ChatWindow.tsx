@@ -657,8 +657,7 @@ export function ChatWindow({
       return;
     }
 
-    void ensureChatUiLoaded(chatId);
-    return subscribeChatUi(chatId, () => {
+    const unsubscribe = subscribeChatUi(chatId, () => {
       const snap = getChatUiSnapshot(chatId);
 
       // Update markdown streaming state for the active request, if any.
@@ -686,6 +685,8 @@ export function ChatWindow({
 
       setChatUi(snap);
     });
+    void ensureChatUiLoaded(chatId);
+    return unsubscribe;
   }, [chatId]);
 
   // Cleanup abort controller on unmount

@@ -75,6 +75,7 @@ class SQLiteMetadataStore:
     """
     Persistent SQLite store for ingestion metadata, chunk payloads, and basic job tracking.
     """
+    _TEXT_MIGRATION_SETTING_KEY = "text_at_rest_migrated_v1"
 
     def __init__(self, db_path: Path | str, *, config: Optional[SQLiteConfig] = None) -> None:
         self._db_path = Path(db_path)
@@ -96,8 +97,9 @@ class SQLiteMetadataStore:
         self._connection = _ThreadLocalConnectionProxy(self)
         self._lock = threading.Lock()
         self._initialize()
-        if self._text_encryption_active:
+        if self._text_encryption_active and self._should_run_text_migration():
             self._migrate_plaintext_text_columns()
+            self._mark_text_migration_done()
         logger.info("SQLiteMetadataStore ready at %s", self._db_path)
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -202,6 +204,22 @@ class SQLiteMetadataStore:
             except Exception:
                 pass
             logger.info("Migrated %d plaintext SQLite cells to encrypted text-at-rest.", migrated_cells)
+
+    def _should_run_text_migration(self) -> bool:
+        if not self._text_encryption_active:
+            return False
+        try:
+            return not bool(self.get_setting(self._TEXT_MIGRATION_SETTING_KEY, False))
+        except Exception:
+            return True
+
+    def _mark_text_migration_done(self) -> None:
+        if not self._text_encryption_active:
+            return
+        try:
+            self.set_setting(self._TEXT_MIGRATION_SETTING_KEY, True)
+        except Exception:
+            logger.debug("Failed to set text migration marker", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # Schema setup

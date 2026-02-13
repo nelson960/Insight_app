@@ -191,6 +191,123 @@ def _ipc_token_required() -> Optional[str]:
     return require_ipc_token()
 
 
+def _truncate_text(s: str, max_len: int = 200) -> str:
+    text = (s or "").strip()
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len]
+    space = cut.rfind(" ")
+    if space > 0:
+        return cut[:space] + "..."
+    return cut + "..."
+
+
+def _extract_title_from_content_json(content_json: str) -> Optional[str]:
+    try:
+        v = json.loads(content_json or "")
+    except Exception:
+        return None
+    text = ""
+    if isinstance(v, dict):
+        raw = v.get("text")
+        if isinstance(raw, str):
+            text = raw
+    elif isinstance(v, str):
+        text = v
+    text = text.strip()
+    if not text:
+        return None
+    first = text.splitlines()[0].strip() if text.splitlines() else text
+    if not first:
+        return None
+    return first[:48] + ("..." if len(first) > 48 else "")
+
+
+def _extract_last_message_preview(content_json: str) -> Optional[str]:
+    try:
+        v = json.loads(content_json or "")
+    except Exception:
+        return None
+    text = None
+    if isinstance(v, dict):
+        raw = v.get("text")
+        if isinstance(raw, str):
+            text = raw
+    elif isinstance(v, str):
+        text = v
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return _truncate_text(text, 200)
+
+
+def _parse_message_row(content_json: str, citations_json: str | None) -> dict[str, Any]:
+    content = content_json or ""
+    attachments: list[str] = []
+    selection: Optional[dict[str, Any]] = None
+    focus_document_id: Optional[str] = None
+    versions: Optional[list[str]] = None
+    active_version_index: Optional[int] = None
+    sources: Optional[list[Any]] = None
+
+    parsed: Any = None
+    try:
+        parsed = json.loads(content_json or "")
+    except Exception:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        text = parsed.get("text")
+        if isinstance(text, str):
+            content = text
+        if isinstance(parsed.get("attachments"), list):
+            attachments = [x for x in parsed.get("attachments") if isinstance(x, str)]
+        sel = parsed.get("selection")
+        if isinstance(sel, dict):
+            selection = sel
+        fid = parsed.get("focus_document_id")
+        if isinstance(fid, str) and fid.strip():
+            focus_document_id = fid.strip()
+        vers = parsed.get("versions")
+        if isinstance(vers, list):
+            clean = [x for x in vers if isinstance(x, str)]
+            if clean:
+                versions = clean
+        idx = parsed.get("activeVersionIndex")
+        if isinstance(idx, int) and idx >= 0:
+            active_version_index = idx
+        arr = parsed.get("versionSources")
+        if isinstance(arr, list) and active_version_index is not None:
+            if 0 <= active_version_index < len(arr):
+                picked = arr[active_version_index]
+                if isinstance(picked, list):
+                    sources = picked
+    elif isinstance(parsed, str):
+        content = parsed
+
+    if sources is None and isinstance(citations_json, str) and citations_json.strip():
+        try:
+            c = json.loads(citations_json)
+            if isinstance(c, list):
+                sources = c
+        except Exception:
+            pass
+
+    out: dict[str, Any] = {"content": content}
+    if attachments:
+        out["attachments"] = attachments
+    if selection is not None:
+        out["selection"] = selection
+    if focus_document_id:
+        out["focus_document_id"] = focus_document_id
+    if versions:
+        out["versions"] = versions
+    if active_version_index is not None:
+        out["activeVersionIndex"] = active_version_index
+    if sources is not None:
+        out["sources"] = sources
+    return out
+
+
 @router.post("")
 async def chat_entry(
     request: Request,
@@ -387,6 +504,143 @@ def _run_planner(payload: dict):
 def list_sessions():
     mgr = AppDependencies.session_manager()
     return {"sessions": mgr.list_sessions()}
+
+
+@router.get("/session_summaries")
+def session_summaries():
+    store = AppDependencies.sqlite_store()
+    conn = store._connection
+    sessions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    rows = conn.execute(
+        "SELECT chat_id, MAX(created_at) AS last_ts FROM messages GROUP BY chat_id ORDER BY last_ts DESC"
+    ).fetchall()
+    for row in rows:
+        chat_id = str(row["chat_id"] or "").strip()
+        if not chat_id or chat_id in seen:
+            continue
+        seen.add(chat_id)
+        last_ts = row["last_ts"]
+
+        title = None
+        trow = conn.execute(
+            "SELECT content_json FROM messages WHERE chat_id=? AND role='user' ORDER BY created_at ASC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        if trow is not None:
+            title = _extract_title_from_content_json(store._decrypt_db_text(trow["content_json"]))
+
+        last_message_content = None
+        lrow = conn.execute(
+            "SELECT content_json FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        if lrow is not None:
+            last_message_content = _extract_last_message_preview(store._decrypt_db_text(lrow["content_json"]))
+
+        frow = conn.execute(
+            "SELECT COUNT(DISTINCT file_id) AS c FROM chat_files WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+        file_count = int((frow["c"] if frow is not None else 0) or 0)
+
+        item: dict[str, Any] = {
+            "chat_id": chat_id,
+            "last_message_at": last_ts,
+            "file_count": file_count,
+        }
+        if title:
+            item["title"] = title
+        if last_message_content:
+            item["last_message_content"] = last_message_content
+        sessions.append(item)
+
+    rows = conn.execute(
+        "SELECT chat_id, MAX(created_at) AS last_ts FROM chat_files GROUP BY chat_id ORDER BY last_ts DESC"
+    ).fetchall()
+    for row in rows:
+        chat_id = str(row["chat_id"] or "").strip()
+        if not chat_id or chat_id in seen:
+            continue
+        seen.add(chat_id)
+        last_ts = row["last_ts"]
+
+        title = None
+        trow = conn.execute(
+            "SELECT content_json FROM messages WHERE chat_id=? AND role='user' ORDER BY created_at ASC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        if trow is not None:
+            title = _extract_title_from_content_json(store._decrypt_db_text(trow["content_json"]))
+        if not title:
+            frow = conn.execute(
+                "SELECT f.filename FROM chat_files cf JOIN files f ON f.id = cf.file_id WHERE cf.chat_id=? ORDER BY cf.created_at ASC LIMIT 1",
+                (chat_id,),
+            ).fetchone()
+            if frow is not None:
+                filename = str(frow["filename"] or "").strip()
+                if filename:
+                    title = filename
+
+        last_message_content = None
+        lrow = conn.execute(
+            "SELECT content_json FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        if lrow is not None:
+            last_message_content = _extract_last_message_preview(store._decrypt_db_text(lrow["content_json"]))
+
+        crow = conn.execute(
+            "SELECT COUNT(DISTINCT file_id) AS c FROM chat_files WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+        file_count = int((crow["c"] if crow is not None else 0) or 0)
+
+        item: dict[str, Any] = {
+            "chat_id": chat_id,
+            "last_message_at": last_ts,
+            "file_count": file_count,
+        }
+        if title:
+            item["title"] = title
+        if last_message_content:
+            item["last_message_content"] = last_message_content
+        sessions.append(item)
+
+    return {"sessions": sessions}
+
+
+@router.post("/session_messages")
+def session_messages(payload: Dict[str, Any] = Body(...)):
+    chat_id = payload.get("chat_id")
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        raise HTTPException(status_code=400, detail="chat_id is required")
+    chat_id = chat_id.strip()
+
+    store = AppDependencies.sqlite_store()
+    conn = store._connection
+    rows = conn.execute(
+        "SELECT id, role, content_json, citations_json, created_at FROM messages WHERE chat_id=? ORDER BY created_at ASC",
+        (chat_id,),
+    ).fetchall()
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        content_json = store._decrypt_db_text(row["content_json"])
+        citations_json = store._decrypt_db_text(row["citations_json"]) if row["citations_json"] else ""
+        parsed = _parse_message_row(content_json, citations_json)
+        item: dict[str, Any] = {
+            "id": row["id"],
+            "role": row["role"],
+            "content": parsed.get("content", ""),
+            "created_at": row["created_at"],
+        }
+        for k in ("attachments", "selection", "focus_document_id", "versions", "activeVersionIndex", "sources"):
+            if k in parsed:
+                item[k] = parsed[k]
+        out.append(item)
+    return {"messages": out}
 
 
 @router.get("/context/{chat_id}")

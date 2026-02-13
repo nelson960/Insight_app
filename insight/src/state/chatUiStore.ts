@@ -161,7 +161,9 @@ export function getChatUiSnapshot(chatId: string | null): ChatUiSnapshot {
 
 export async function ensureChatUiLoaded(chatId: string) {
   if (!chatId) return;
-  await ensureBridge();
+  void ensureBridge().catch((err) => {
+    console.error("[chatUiStore/ensureBridge] Failed to initialize listeners:", err);
+  });
   const s = ensureState(chatId);
   if (s.loaded) return;
   if (s.loadPromise) return s.loadPromise;

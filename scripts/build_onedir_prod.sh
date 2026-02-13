@@ -56,6 +56,7 @@ INSIGHT_DIR="${REPO_ROOT}/insight"
 TAURI_DIR="${INSIGHT_DIR}/src-tauri"
 BACKEND_DIST="${BACKEND_DIR}/dist/insight-engine"
 DIST_DIR="${REPO_ROOT}/dist/onedir"
+APP_VERSION="unknown"
 
 # Flags
 SKIP_SIGN=false
@@ -166,13 +167,17 @@ check_prerequisites() {
         success "python3: $(python3 --version)"
     fi
 
-    # Check PyInstaller
-    if ! command -v pyinstaller &> /dev/null; then
-        warning "pyinstaller not found in PATH"
-        info "Install with: pip install pyinstaller"
-        ((missing++))
+    # Check PyInstaller unless explicitly skipped.
+    if [[ "$SKIP_PYINSTALLER" == "true" ]]; then
+        info "pyinstaller check skipped (--no-pyinstaller)"
     else
-        success "pyinstaller: $(pyinstaller --version)"
+        if ! command -v pyinstaller &> /dev/null; then
+            warning "pyinstaller not found in PATH"
+            info "Install with: pip install pyinstaller"
+            ((missing++))
+        else
+            success "pyinstaller: $(pyinstaller --version)"
+        fi
     fi
 
     # Check Node.js
@@ -479,7 +484,7 @@ create_onedir_package() {
 
     # Create a README
     bold "Creating README..."
-    cat > "$DIST_DIR/README.txt" << 'EOF'
+    cat > "$DIST_DIR/README.txt" << EOF
 INSIGHT - Onedir Production Build
 ================================
 
@@ -496,7 +501,7 @@ Application data is stored in:
 Logs are stored in:
   ~/.insight/logs/
 
-Version: 0.1.0
+Version: ${APP_VERSION}
 Platform: macOS (onedir)
 EOF
 
@@ -507,6 +512,24 @@ EOF
     info "Total size: $size"
 
     echo ""
+}
+
+resolve_app_version() {
+    local version=""
+
+    if [[ -f "${INSIGHT_DIR}/package.json" ]]; then
+        version="$(awk -F'\"' '/"version"[[:space:]]*:/ { print $4; exit }' "${INSIGHT_DIR}/package.json")"
+    fi
+
+    if [[ -z "$version" && -f "${TAURI_DIR}/tauri.conf.json" ]]; then
+        version="$(awk -F'\"' '/"version"[[:space:]]*:/ { print $4; exit }' "${TAURI_DIR}/tauri.conf.json")"
+    fi
+
+    if [[ -z "$version" ]]; then
+        version="unknown"
+    fi
+
+    echo "$version"
 }
 
 #-------------------------------------------------------------------------------
@@ -553,6 +576,8 @@ main() {
     info "Distribution: $DIST_DIR"
     info "Skip signing: $SKIP_SIGN"
     info "Architecture: ${FORCE_ARCH:-auto-detect}"
+    APP_VERSION="$(resolve_app_version)"
+    info "Version: $APP_VERSION"
     echo ""
 
     # Check prerequisites

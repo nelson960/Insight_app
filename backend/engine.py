@@ -178,6 +178,7 @@ _IPC_ALLOWED_ENDPOINTS: Dict[str, List[str]] = {
         "/settings/raw_engine/logs",
         "/settings/index/validate/",
         "/chat/sessions",
+        "/chat/session_summaries",
         "/chat/context/",
         "/files/chat/",
         "/files/progress/",
@@ -190,6 +191,7 @@ _IPC_ALLOWED_ENDPOINTS: Dict[str, List[str]] = {
     ],
     "POST": [
         "/chat",
+        "/chat/session_messages",
         "/chat/branch",
         "/files/upload",
         "/files/ingest_path",

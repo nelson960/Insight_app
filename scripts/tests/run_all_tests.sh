@@ -2,7 +2,7 @@
 #
 # Insight Comprehensive Test Runner
 #
-# Runs all test suites and generates a master report
+# Runs sidecar integration suites against a built Insight.app.
 #
 
 set -euo pipefail
@@ -21,415 +21,290 @@ warning() { echo -e "${YELLOW}⚠${NC} $*"; }
 error() { echo -e "${RED}✗${NC} $*" >&2; }
 header() { echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n${BLUE}$*${NC}\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"; }
 
-# Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_PATH="${1:-/Users/nelson/py/insight/insight_app/dist/onedir/Insight.app}"
-RUN_ALL="${2:-false}"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-# Test results tracking (bash 3.2 compatible - use temp file)
-TEST_RESULTS_FILE="/tmp/insight_test_results_$$"
-echo "" > "$TEST_RESULTS_FILE"
+APP_PATH=""
+RUN_ALL="false"
+RUN_QUICK="false"
+RUN_SMOKE="false"
+RUN_STRESS="false"
+RUN_CONCURRENT="false"
+RUN_MEMORY="false"
+RUN_EDGE="false"
+
+# Tunables
+STRESS_ITERATIONS="40"
+CONCURRENT_WORKERS="8"
+CONCURRENT_ITERATIONS="30"
+MEMORY_DURATION="180"
+MEMORY_INTERVAL="5"
+KEEP_ARTIFACTS="false"
+ARTIFACTS_BASE=""
 
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
-TESTS_SKIPPED=0
 
-run_test_suite() {
-    local suite_name="$1"
-    local script_path="$2"
-    local should_run="${3:-false}"
-
-    header "Running: $suite_name"
-
-    if [[ "$should_run" != "true" && "$RUN_ALL" != "true" ]]; then
-        warning "SKIPPED: $suite_name (use --all or -a to run)"
-        ((TESTS_SKIPPED++))
-        echo "$suite_name:SKIPPED" >> "$TEST_RESULTS_FILE"
-        return 0
-    fi
-
-    if [[ ! -x "$script_path" ]]; then
-        chmod +x "$script_path"
-    fi
-
-    local start=$(date +%s)
-
-    if "$script_path" "$APP_PATH"; then
-        local duration=$(($(date +%s) - start))
-        success "PASSED: $suite_name (${duration}s)"
-        ((TESTS_PASSED++))
-        echo "$suite_name:PASSED (${duration}s)" >> "$TEST_RESULTS_FILE"
-    else
-        local duration=$(($(date +%s) - start))
-        error "FAILED: $suite_name (${duration}s)"
-        ((TESTS_FAILED++))
-        echo "$suite_name:FAILED (${duration}s)" >> "$TEST_RESULTS_FILE"
-    fi
-
-    ((TESTS_RUN++))
-    echo ""
-}
-
-check_prerequisites() {
-    header "Checking Prerequisites"
-
-    local missing=0
-
-    # Check if app exists
-    if [[ ! -d "$APP_PATH" ]]; then
-        error "App not found at: $APP_PATH"
-        ((missing++))
-    else
-        success "App found: $APP_PATH"
-    fi
-
-    # Check if app is running
-    if pgrep -f "Insight.app/Contents/MacOS/insight" >/dev/null 2>&1; then
-        success "App is running"
-    else
-        warning "App is not running"
-        info "Start the app with: open $APP_PATH"
-    fi
-
-    # Check test scripts
-    local scripts=(
-        "stress_test.sh"
-        "concurrent_test.sh"
-        "memory_leak_test.sh"
-        "edge_case_test.sh"
-    )
-
-    for script in "${scripts[@]}"; do
-        local path="$SCRIPT_DIR/$script"
-        if [[ -f "$path" ]]; then
-            success "Test script found: $script"
-        else
-            error "Test script missing: $script"
-            ((missing++))
-        fi
-    done
-
-    if [[ $missing -gt 0 ]]; then
-        error "Missing $missing prerequisite(s)"
-        exit 1
-    fi
-
-    echo ""
-}
-
-quick_smoke_test() {
-    header "Quick Smoke Test"
-
-    bold "Checking basic app functionality..."
-
-    local tests_failed=0
-
-    # Test 1: App process
-    if pgrep -f "Insight.app/Contents/MacOS/insight" >/dev/null 2>&1; then
-        success "App process is running"
-    else
-        error "App process not found"
-        ((tests_failed++))
-    fi
-
-    # Test 2: Workspace directory
-    if [[ -d "$HOME/.insight" ]]; then
-        success "Workspace directory exists"
-    else
-        warning "Workspace directory not found (will be created on first run)"
-    fi
-
-    # Test 3: Log directory
-    if [[ -d "$HOME/.insight/logs" ]]; then
-        success "Log directory exists"
-
-        # Check for recent errors
-        local error_count=$(grep -hi "error\|exception" "$HOME/.insight/logs"/*.log 2>/dev/null | wc -l | tr -d ' ')
-        if [[ $error_count -gt 0 ]]; then
-            warning "Found $error_count error(s) in recent logs"
-        else
-            success "No errors in recent logs"
-        fi
-    else
-        warning "Log directory not found"
-    fi
-
-    # Test 4: Memory usage
-    local pid=$(pgrep -f "Insight.app/Contents/MacOS/insight" | head -1)
-    if [[ -n "$pid" ]]; then
-        local rss=$(ps -p "$pid" -o rss= 2>/dev/null || echo "0")
-        local mb=$((rss / 1024))
-        info "Memory usage: ${mb} MB"
-
-        if [[ $mb -gt 2000 ]]; then
-            warning "High memory usage: ${mb} MB"
-        else
-            success "Memory usage normal: ${mb} MB"
-        fi
-    fi
-
-    if [[ $tests_failed -eq 0 ]]; then
-        success "Smoke test passed"
-        return 0
-    else
-        error "Smoke test failed: $tests_failed check(s)"
-        return 1
-    fi
-}
-
-generate_master_report() {
-    header "Master Test Report"
-
-    local report_file="/tmp/insight_test_report_$(date +%Y%m%d_%H%M%S).txt"
-
-    cat > "$report_file" <<EOF
-Insight Comprehensive Test Report
-==================================
-
-Date: $(date)
-App: $APP_PATH
-Hostname: $(hostname)
-Platform: $(uname -s) $(uname -m)
-
-EXECUTIVE SUMMARY
------------------
-Total Test Suites: $TESTS_RUN
-Passed: $TESTS_PASSED
-Failed: $TESTS_FAILED
-Skipped: $TESTS_SKIPPED
-
-DETAILED RESULTS
-----------------
-EOF
-
-    if [[ -f "$TEST_RESULTS_FILE" ]]; then
-        while IFS= read -r line; do
-            if [[ -n "$line" ]]; then
-                local suite_name=$(echo "$line" | cut -d: -f1)
-                local result=$(echo "$line" | cut -d: -f2-)
-                printf "%-30s %s\n" "$suite_name:" "$result" >> "$report_file"
-            fi
-        done < "$TEST_RESULTS_FILE"
-    fi
-
-    cat >> "$report_file" <<EOF
-
-RECOMMENDATIONS
----------------
-EOF
-
-    if [[ $TESTS_FAILED -eq 0 ]]; then
-        cat >> "$report_file" <<EOF
-✓ All automated tests passed
-✓ App is ready for distribution
-✓ No critical issues detected
-
-Optional:
-- Run manual UI testing
-- Test on fresh macOS installation
-- Verify offline functionality
-EOF
-    else
-        cat >> "$report_file" <<EOF
-✗ Some tests failed - review detailed logs
-✗ Fix critical issues before distribution
-✗ Re-run tests after fixes
-
-Next Steps:
-1. Review failed test logs
-2. Fix identified issues
-3. Re-run this test suite
-4. Perform manual testing
-EOF
-    fi
-
-    cat >> "$report_file" <<EOF
-
-TEST ARTIFACTS
---------------
-Test logs and reports are preserved in:
-- /tmp/insight_*_test_*/
-
-For detailed analysis of each test suite, refer to individual test reports.
-
----
-Generated by Insight Test Runner
-Version: 1.0.0
-EOF
-
-    cat "$report_file"
-
-    # Save report to project root too
-    local project_report="/Users/nelson/py/insight/insight_app/TEST_REPORT_$(date +%Y%m%d_%H%M%S).txt"
-    cp "$report_file" "$project_report"
-    success "Report saved to: $project_report"
-
-    # Cleanup temp file
-    rm -f "$TEST_RESULTS_FILE"
-
-    echo ""
-}
+RESULTS_FILE="/tmp/insight_test_results_$$"
+: > "$RESULTS_FILE"
 
 show_usage() {
     cat <<EOF
-Usage: $(basename "$0") [OPTIONS] [APP_PATH]
+Usage: $(basename "$0") [OPTIONS]
 
-Options:
-  -a, --all              Run all test suites (including long-running tests)
-  -q, --quick            Run quick smoke test only
-  -h, --help             Show this help message
+Suite selection:
+  -a, --all                     Run all suites: smoke + stress + concurrent + memory + edge
+  -q, --quick                   Run smoke suite only
+      --stress                  Run stress suite
+      --concurrent              Run concurrent suite
+      --memory                  Run memory suite
+      --edge-case               Run edge suite
 
-Arguments:
-  APP_PATH               Path to Insight.app (default: auto-detect)
+General options:
+      --app PATH                Path to Insight.app (auto-detect if omitted)
+      --keep-artifacts          Keep suite artifact directories
+      --artifacts-dir DIR       Base directory for suite artifacts
+
+Suite tuning:
+      --stress-iterations N     Stress loop count (default: $STRESS_ITERATIONS)
+      --workers N               Concurrent workers (default: $CONCURRENT_WORKERS)
+      --concurrent-iterations N Concurrent loops per worker (default: $CONCURRENT_ITERATIONS)
+      --memory-duration SEC     Memory test duration (default: $MEMORY_DURATION)
+      --memory-interval SEC     Memory sample interval (default: $MEMORY_INTERVAL)
 
 Examples:
-  # Run quick smoke test
   $(basename "$0") --quick
-
-  # Run all tests
   $(basename "$0") --all
-
-  # Run specific tests
-  $(basename "$0") /path/to/Insight.app
-
-Test Suites:
-  --stress               Run stress tests (document operations)
-  --concurrent           Run concurrent operations tests
-  --memory               Run memory leak detection
-  --edge-case            Run edge case tests
-
-Notes:
-  - Stress and memory tests can take 5-10 minutes each
-  - Quick smoke test completes in <30 seconds
-  - Test results are preserved in /tmp/insight_*_test_*/
-
+  $(basename "$0") --stress --concurrent --workers 12
+  $(basename "$0") --app /path/to/Insight.app --memory --memory-duration 300
 EOF
 }
 
-main() {
-    header "Insight Comprehensive Test Suite"
+run_suite() {
+    local suite_name="$1"
+    shift
 
-    # Parse arguments
-    local run_quick=false
-    local run_stress=false
-    local run_concurrent=false
-    local run_memory=false
-    local run_edge=false
+    header "Running: $suite_name"
+    local start
+    start=$(date +%s)
 
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -a|--all)
-                RUN_ALL=true
-                shift
-                ;;
-            -q|--quick)
-                run_quick=true
-                shift
-                ;;
-            --stress)
-                run_stress=true
-                shift
-                ;;
-            --concurrent)
-                run_concurrent=true
-                shift
-                ;;
-            --memory)
-                run_memory=true
-                shift
-                ;;
-            --edge-case)
-                run_edge=true
-                shift
-                ;;
-            -h|--help)
-                show_usage
-                exit 0
-                ;;
-            -*)
-                error "Unknown option: $1"
-                show_usage
-                exit 1
-                ;;
-            *)
-                APP_PATH="$1"
-                shift
-                ;;
-        esac
-    done
-
-    # Auto-detect app if not specified
-    if [[ ! -d "$APP_PATH" ]]; then
-        local detected=$(find /Users/nelson/py/insight/insight_app/dist -name "Insight.app" -type d 2>/dev/null | head -1)
-        if [[ -n "$detected" ]]; then
-            APP_PATH="$detected"
-            info "Auto-detected app: $APP_PATH"
-        fi
-    fi
-
-    echo -e "${BLUE}Configuration:${NC}"
-    info "App: $APP_PATH"
-    info "Run All: $RUN_ALL"
-    echo ""
-
-    # Check prerequisites
-    check_prerequisites
-
-    # Run quick smoke test
-    if [[ "$run_quick" == "true" ]]; then
-        quick_smoke_test
-        exit $?
-    fi
-
-    # Always run smoke test first
-    quick_smoke_test || warning "Smoke test had issues, continuing..."
-
-    # Run specific or all test suites
-    if [[ "$RUN_ALL" == "true" ]] || [[ "$run_stress" == "true" ]]; then
-        run_test_suite "Stress Test" "$SCRIPT_DIR/stress_test.sh" true
-    fi
-
-    if [[ "$RUN_ALL" == "true" ]] || [[ "$run_concurrent" == "true" ]]; then
-        run_test_suite "Concurrent Operations" "$SCRIPT_DIR/concurrent_test.sh" true
-    fi
-
-    if [[ "$RUN_ALL" == "true" ]] || [[ "$run_memory" == "true" ]]; then
-        run_test_suite "Memory Leak Detection" "$SCRIPT_DIR/memory_leak_test.sh" true
-    fi
-
-    if [[ "$RUN_ALL" == "true" ]] || [[ "$run_edge" == "true" ]]; then
-        run_test_suite "Edge Case Tests" "$SCRIPT_DIR/edge_case_test.sh" true
-    fi
-
-    # Generate master report
-    generate_master_report
-
-    # Final summary
-    header "Test Suite Complete"
-
-    if [[ $TESTS_RUN -eq 0 ]]; then
-        warning "No tests were run"
-        info "Use --all to run all test suites, or --help for options"
+    if "$@"; then
+        local duration=$(( $(date +%s) - start ))
+        success "PASSED: $suite_name (${duration}s)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo "$suite_name:PASSED (${duration}s)" >> "$RESULTS_FILE"
     else
-        echo "Test Suites Run: $TESTS_RUN"
-        success "Passed: $TESTS_PASSED"
-        if [[ $TESTS_FAILED -gt 0 ]]; then
-            error "Failed: $TESTS_FAILED"
-        fi
-        if [[ $TESTS_SKIPPED -gt 0 ]]; then
-            info "Skipped: $TESTS_SKIPPED"
-        fi
-        echo ""
-
-        if [[ $TESTS_FAILED -eq 0 ]]; then
-            success "All tests passed! ✓"
-            exit 0
-        else
-            error "Some tests failed ✗"
-            exit 1
-        fi
+        local duration=$(( $(date +%s) - start ))
+        error "FAILED: $suite_name (${duration}s)"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo "$suite_name:FAILED (${duration}s)" >> "$RESULTS_FILE"
     fi
+
+    TESTS_RUN=$((TESTS_RUN + 1))
+    echo ""
 }
 
-main "$@"
+suite_cmd() {
+    local suite="$1"
+    local cmd=("$PYTHON_BIN" "$SCRIPT_DIR/engine_test_runner.py" --suite "$suite")
+
+    if [[ -n "$APP_PATH" ]]; then
+        cmd+=(--app "$APP_PATH")
+    fi
+    if [[ "$KEEP_ARTIFACTS" == "true" ]]; then
+        cmd+=(--keep-artifacts)
+    fi
+    if [[ -n "$ARTIFACTS_BASE" ]]; then
+        cmd+=(--artifacts-dir "$ARTIFACTS_BASE/$suite")
+    fi
+
+    case "$suite" in
+        stress)
+            cmd+=(--iterations "$STRESS_ITERATIONS")
+            ;;
+        concurrent)
+            cmd+=(--workers "$CONCURRENT_WORKERS" --iterations "$CONCURRENT_ITERATIONS")
+            ;;
+        memory)
+            cmd+=(--duration "$MEMORY_DURATION" --interval "$MEMORY_INTERVAL")
+            ;;
+    esac
+
+    "${cmd[@]}"
+}
+
+generate_report() {
+    header "Master Test Report"
+
+    local ts
+    ts="$(date +%Y%m%d_%H%M%S)"
+    local report_tmp="/tmp/insight_test_report_${ts}.txt"
+    local report_project="$REPO_ROOT/TEST_REPORT_${ts}.txt"
+
+    {
+        echo "Insight Comprehensive Test Report"
+        echo "================================="
+        echo ""
+        echo "Date: $(date)"
+        echo "App: ${APP_PATH:-auto-detect}"
+        echo "Repository: $REPO_ROOT"
+        echo "Platform: $(uname -s) $(uname -m)"
+        echo ""
+        echo "Summary"
+        echo "-------"
+        echo "Suites run: $TESTS_RUN"
+        echo "Passed: $TESTS_PASSED"
+        echo "Failed: $TESTS_FAILED"
+        echo ""
+        echo "Detailed Results"
+        echo "----------------"
+        cat "$RESULTS_FILE"
+        echo ""
+        if [[ $TESTS_FAILED -eq 0 ]]; then
+            echo "Outcome: PASS"
+        else
+            echo "Outcome: FAIL"
+        fi
+    } > "$report_tmp"
+
+    cp "$report_tmp" "$report_project"
+    cat "$report_tmp"
+    success "Report saved to: $report_project"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a|--all)
+            RUN_ALL="true"
+            shift
+            ;;
+        -q|--quick)
+            RUN_QUICK="true"
+            shift
+            ;;
+        --stress)
+            RUN_STRESS="true"
+            shift
+            ;;
+        --concurrent)
+            RUN_CONCURRENT="true"
+            shift
+            ;;
+        --memory)
+            RUN_MEMORY="true"
+            shift
+            ;;
+        --edge-case)
+            RUN_EDGE="true"
+            shift
+            ;;
+        --app)
+            APP_PATH="$2"
+            shift 2
+            ;;
+        --keep-artifacts)
+            KEEP_ARTIFACTS="true"
+            shift
+            ;;
+        --artifacts-dir)
+            ARTIFACTS_BASE="$2"
+            shift 2
+            ;;
+        --stress-iterations)
+            STRESS_ITERATIONS="$2"
+            shift 2
+            ;;
+        --workers)
+            CONCURRENT_WORKERS="$2"
+            shift 2
+            ;;
+        --concurrent-iterations)
+            CONCURRENT_ITERATIONS="$2"
+            shift 2
+            ;;
+        --memory-duration)
+            MEMORY_DURATION="$2"
+            shift 2
+            ;;
+        --memory-interval)
+            MEMORY_INTERVAL="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            error "Unknown option: $1"
+            show_usage
+            exit 1
+            ;;
+    esac
+done
+
+header "Insight Comprehensive Test Suite"
+
+if [[ "$RUN_ALL" == "true" ]]; then
+    RUN_SMOKE="true"
+    RUN_STRESS="true"
+    RUN_CONCURRENT="true"
+    RUN_MEMORY="true"
+    RUN_EDGE="true"
+fi
+
+if [[ "$RUN_QUICK" == "true" ]]; then
+    # Quick means smoke-only.
+    RUN_SMOKE="true"
+    RUN_STRESS="false"
+    RUN_CONCURRENT="false"
+    RUN_MEMORY="false"
+    RUN_EDGE="false"
+fi
+
+# If no explicit selection, default to smoke.
+if [[ "$RUN_QUICK" != "true" && "$RUN_STRESS" != "true" && "$RUN_CONCURRENT" != "true" && "$RUN_MEMORY" != "true" && "$RUN_EDGE" != "true" ]]; then
+    RUN_SMOKE="true"
+fi
+
+echo -e "${BLUE}Configuration:${NC}"
+info "App: ${APP_PATH:-auto-detect}"
+info "Smoke: $RUN_SMOKE"
+info "Quick: $RUN_QUICK"
+info "Stress: $RUN_STRESS"
+info "Concurrent: $RUN_CONCURRENT"
+info "Memory: $RUN_MEMORY"
+info "Edge: $RUN_EDGE"
+info "Artifacts: ${ARTIFACTS_BASE:-temporary}"
+info "Python: $PYTHON_BIN"
+echo ""
+
+if [[ "$RUN_SMOKE" == "true" ]]; then
+    run_suite "Smoke" suite_cmd smoke
+fi
+if [[ "$RUN_STRESS" == "true" ]]; then
+    run_suite "Stress" suite_cmd stress
+fi
+if [[ "$RUN_CONCURRENT" == "true" ]]; then
+    run_suite "Concurrent" suite_cmd concurrent
+fi
+if [[ "$RUN_MEMORY" == "true" ]]; then
+    run_suite "Memory" suite_cmd memory
+fi
+if [[ "$RUN_EDGE" == "true" ]]; then
+    run_suite "Edge" suite_cmd edge
+fi
+
+generate_report
+
+header "Test Suite Complete"
+if [[ $TESTS_FAILED -eq 0 ]]; then
+    success "All selected suites passed"
+    rm -f "$RESULTS_FILE"
+    exit 0
+fi
+
+error "Some suites failed"
+rm -f "$RESULTS_FILE"
+exit 1

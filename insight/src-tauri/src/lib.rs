@@ -6,27 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
-use rusqlite::Connection;
 
 type SharedEngine = Arc<EngineProcess>;
-
-/// Get the workspace directory for the current build type.
-///
-/// - Dev/debug builds: returns `<project_root>/storage`
-/// - Release builds: returns `~/.insight`
-fn get_workspace_dir() -> Result<PathBuf, String> {
-    if cfg!(debug_assertions) {
-        // Dev mode: use project-local storage
-        let root = resolve_project_root()
-            .map_err(|e| format!("Failed to resolve project root: {}", e))?;
-        Ok(root.join("storage"))
-    } else {
-        // Release mode: use ~/.insight
-        Ok(dirs::home_dir()
-            .ok_or_else(|| String::from("couldn't find home dir"))?
-            .join(".insight"))
-    }
-}
 
 fn shutdown_engine(app: &tauri::AppHandle) {
     // Cleanup the file watcher if it exists
@@ -37,30 +18,6 @@ fn shutdown_engine(app: &tauri::AppHandle) {
     // Shutdown the engine process
     let engine = app.state::<SharedEngine>();
     engine.shutdown();
-}
-
-fn _extract_title_from_content_json(content_json: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(content_json).ok()?;
-    let text = v
-        .get("text")
-        .and_then(|t| t.as_str())
-        .or_else(|| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if text.is_empty() {
-        return None;
-    }
-    let first_line = text.lines().next().unwrap_or(text).trim();
-    if first_line.is_empty() {
-        return None;
-    }
-    // Keep titles compact for the sidebar.
-    let mut out = first_line.to_string();
-    const MAX: usize = 48;
-    if out.chars().count() > MAX {
-        out = out.chars().take(MAX).collect::<String>() + "…";
-    }
-    Some(out)
 }
 
 #[tauri::command]
@@ -89,214 +46,34 @@ async fn engine_request(
 }
 
 #[tauri::command]
-fn list_sessions() -> Result<Value, String> {
-    let workspace = get_workspace_dir()?;
-    let mut sessions = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    // Prefer SQLite transcript store for session listing (clean UI chats).
-    let db_path = workspace.join("db.sqlite");
-    if db_path.exists() {
-        if let Ok(conn) = Connection::open(db_path) {
-            // Query for chats with messages, including last message timestamp and content
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT chat_id, MAX(created_at) AS last_ts FROM messages GROUP BY chat_id ORDER BY last_ts DESC",
-            ) {
-                let rows = stmt.query_map([], |row| {
-                    let chat_id: String = row.get(0)?;
-                    let last_ts: String = row.get(1)?;
-                    Ok((chat_id, last_ts))
-                });
-                if let Ok(rows) = rows {
-                    for row in rows.flatten() {
-                        let (chat_id, last_ts) = row;
-                        if seen.insert(chat_id.clone()) {
-                            let mut title: Option<String> = None;
-                            if let Ok(mut tstmt) = conn.prepare(
-                                "SELECT content_json FROM messages WHERE chat_id=? AND role='user' ORDER BY created_at ASC LIMIT 1",
-                            ) {
-                                if let Ok(mut trows) = tstmt.query([chat_id.clone()]) {
-                                    if let Ok(Some(r)) = trows.next() {
-                                        let content_json: String = r.get(0).unwrap_or_default();
-                                        title = _extract_title_from_content_json(&content_json);
-                                    }
-                                }
-                            }
-
-                            // Get last message content (any role)
-                            let mut last_message_content: Option<String> = None;
-                            if let Ok(mut lstmt) = conn.prepare(
-                                "SELECT content_json FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
-                            ) {
-                                if let Ok(mut lrows) = lstmt.query([chat_id.clone()]) {
-                                    if let Ok(Some(r)) = lrows.next() {
-                                        let content_json: String = r.get(0).unwrap_or_default();
-                                        // Extract text from content_json
-                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content_json) {
-                                            if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
-                                                last_message_content = Some(truncate_string(text, 200));
-                                            } else if let Some(text) = v.as_str() {
-                                                last_message_content = Some(truncate_string(text, 200));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Get file count
-                            let mut file_count: i64 = 0;
-                            if let Ok(mut fstmt) = conn.prepare(
-                                "SELECT COUNT(DISTINCT cf.file_id) FROM chat_files cf WHERE cf.chat_id=?",
-                            ) {
-                                if let Ok(mut frows) = fstmt.query([chat_id.clone()]) {
-                                    if let Ok(Some(r)) = frows.next() {
-                                        file_count = r.get(0).unwrap_or(0);
-                                    }
-                                }
-                            }
-
-                            let mut session_obj = serde_json::json!({
-                                "chat_id": chat_id,
-                                "last_message_at": last_ts,
-                                "file_count": file_count
-                            });
-                            if let Some(t) = title {
-                                session_obj["title"] = serde_json::json!(t);
-                            }
-                            if let Some(msg) = last_message_content {
-                                session_obj["last_message_content"] = serde_json::json!(msg);
-                            }
-                            sessions.push(session_obj);
-                        }
-                    }
-                }
-            }
-
-            // Also include chats that have files/documents attached even if they have no messages yet.
-            // This ensures cards persist when the user only uploads/edits documents without chatting.
-            //
-            // IMPORTANT: use `chat_files` mapping (multi-chat sharing) rather than legacy `files.chat_id`.
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT chat_id, MAX(created_at) AS last_ts FROM chat_files GROUP BY chat_id ORDER BY last_ts DESC",
-            ) {
-                let rows = stmt.query_map([], |row| {
-                    let chat_id: String = row.get(0)?;
-                    let last_ts: String = row.get(1)?;
-                    Ok((chat_id, last_ts))
-                });
-                if let Ok(rows) = rows {
-                    for row in rows.flatten() {
-                        let (chat_id, last_ts) = row;
-                        if !seen.insert(chat_id.clone()) {
-                            continue;
-                        }
-                        // Best-effort title: first user message if present, else first filename.
-                        let mut title: Option<String> = None;
-                        if let Ok(mut tstmt) = conn.prepare(
-                            "SELECT content_json FROM messages WHERE chat_id=? AND role='user' ORDER BY created_at ASC LIMIT 1",
-                        ) {
-                            if let Ok(mut trows) = tstmt.query([chat_id.clone()]) {
-                                if let Ok(Some(r)) = trows.next() {
-                                    let content_json: String = r.get(0).unwrap_or_default();
-                                    title = _extract_title_from_content_json(&content_json);
-                                }
-                            }
-                        }
-                        if title.is_none() {
-                            if let Ok(mut fstmt) = conn.prepare(
-                                "SELECT f.filename FROM chat_files cf JOIN files f ON f.id = cf.file_id WHERE cf.chat_id=? ORDER BY cf.created_at ASC LIMIT 1",
-                            ) {
-                                if let Ok(mut frows) = fstmt.query([chat_id.clone()]) {
-                                    if let Ok(Some(r)) = frows.next() {
-                                        let filename: String = r.get(0).unwrap_or_default();
-                                        let f = filename.trim();
-                                        if !f.is_empty() {
-                                            title = Some(f.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Get last message content if messages exist
-                        let mut last_message_content: Option<String> = None;
-                        if let Ok(mut lstmt) = conn.prepare(
-                            "SELECT content_json FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
-                        ) {
-                            if let Ok(mut lrows) = lstmt.query([chat_id.clone()]) {
-                                if let Ok(Some(r)) = lrows.next() {
-                                    let content_json: String = r.get(0).unwrap_or_default();
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content_json) {
-                                        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
-                                            last_message_content = Some(truncate_string(text, 200));
-                                        } else if let Some(text) = v.as_str() {
-                                            last_message_content = Some(truncate_string(text, 200));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Get file count
-                        let mut file_count: i64 = 0;
-                        if let Ok(mut fstmt) = conn.prepare(
-                            "SELECT COUNT(DISTINCT cf.file_id) FROM chat_files cf WHERE cf.chat_id=?",
-                        ) {
-                            if let Ok(mut frows) = fstmt.query([chat_id.clone()]) {
-                                if let Ok(Some(r)) = frows.next() {
-                                    file_count = r.get(0).unwrap_or(0);
-                                }
-                            }
-                        }
-
-                        let mut session_obj = serde_json::json!({
-                            "chat_id": chat_id,
-                            "last_message_at": last_ts,
-                            "file_count": file_count
-                        });
-                        if let Some(t) = title {
-                            session_obj["title"] = serde_json::json!(t);
-                        }
-                        if let Some(msg) = last_message_content {
-                            session_obj["last_message_content"] = serde_json::json!(msg);
-                        }
-                        sessions.push(session_obj);
-                    }
-                }
-            }
+async fn list_sessions(state: tauri::State<'_, SharedEngine>) -> Result<Value, String> {
+    let engine = state.inner().clone();
+    let req = EngineRequest {
+        request_id: None,
+        endpoint: "/chat/session_summaries".into(),
+        method: "GET".into(),
+        payload: Value::Null,
+        stream: false,
+    };
+    let resp = tauri::async_runtime::spawn_blocking(move || engine.send(&req))
+        .await
+        .map_err(|e| format!("list_sessions join error: {e}"));
+    match resp {
+        Ok(Ok(r)) if r.ok => Ok(r.data),
+        Ok(Ok(r)) => {
+            eprintln!(
+                "[WARN] list_sessions backend error status={} err={:?}",
+                r.status, r.error
+            );
+            Ok(serde_json::json!({ "sessions": [] }))
         }
-    }
-
-    // Fallback: include any KV sessions that may not have a transcript yet.
-    let kv_dir = workspace.join("kv_sessions");
-    if kv_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(kv_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".kv") || name.ends_with(".json") || name.ends_with(".bin") {
-                        let chat_id = name.split('.').next().unwrap_or(name).to_string();
-                        if seen.insert(chat_id.clone()) {
-                            sessions.push(serde_json::json!({ "chat_id": chat_id }));
-                        }
-                    }
-                }
-            }
+        Ok(Err(e)) => {
+            eprintln!("[WARN] list_sessions backend send failed: {}", e);
+            Ok(serde_json::json!({ "sessions": [] }))
         }
-    }
-    Ok(serde_json::json!({ "sessions": sessions }))
-}
-
-// Helper function to truncate a string to a maximum length
-fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        // Truncate at a word boundary if possible
-        let truncated = &s[..max_len];
-        if let Some(last_space) = truncated.rfind(' ') {
-            truncated[..last_space].to_string() + "..."
-        } else {
-            truncated.to_string() + "..."
+        Err(e) => {
+            eprintln!("[WARN] list_sessions join failed: {}", e);
+            Ok(serde_json::json!({ "sessions": [] }))
         }
     }
 }
@@ -336,122 +113,39 @@ fn engine_emit_event(event_name: String, payload: Value, app: tauri::AppHandle) 
 }
 
 #[tauri::command]
-fn get_session_messages(chat_id: String) -> Result<Value, String> {
-    let workspace = get_workspace_dir()?;
-    let db_path = workspace.join("db.sqlite");
-    if !db_path.exists() {
-        return Ok(serde_json::json!({ "messages": [] }));
+async fn get_session_messages(
+    chat_id: String,
+    state: tauri::State<'_, SharedEngine>,
+) -> Result<Value, String> {
+    let engine = state.inner().clone();
+    let req = EngineRequest {
+        request_id: None,
+        endpoint: "/chat/session_messages".into(),
+        method: "POST".into(),
+        payload: serde_json::json!({ "chat_id": chat_id }),
+        stream: false,
+    };
+    let resp = tauri::async_runtime::spawn_blocking(move || engine.send(&req))
+        .await
+        .map_err(|e| format!("get_session_messages join error: {e}"));
+    match resp {
+        Ok(Ok(r)) if r.ok => Ok(r.data),
+        Ok(Ok(r)) => {
+            eprintln!(
+                "[WARN] get_session_messages backend error status={} err={:?}",
+                r.status, r.error
+            );
+            Ok(serde_json::json!({ "messages": [] }))
+        }
+        Ok(Err(e)) => {
+            eprintln!("[WARN] get_session_messages backend send failed: {}", e);
+            Ok(serde_json::json!({ "messages": [] }))
+        }
+        Err(e) => {
+            eprintln!("[WARN] get_session_messages join failed: {}", e);
+            Ok(serde_json::json!({ "messages": [] }))
+        }
     }
-
-    let conn = Connection::open(db_path).map_err(|e| format!("Failed to open db.sqlite: {e}"))?;
-    let mut stmt = conn
-        .prepare("SELECT id, role, content_json, citations_json, created_at FROM messages WHERE chat_id=? ORDER BY created_at ASC")
-        .map_err(|e| format!("Failed to prepare query: {e}"))?;
-
-    let mut out: Vec<Value> = Vec::new();
-    let rows = stmt
-        .query_map([chat_id], |row| {
-            let id: String = row.get(0)?;
-            let role: String = row.get(1)?;
-            let content_json: String = row.get(2)?;
-            let citations_json: Option<String> = row.get(3)?;
-            let created_at: String = row.get(4)?;
-            Ok((id, role, content_json, citations_json, created_at))
-        })
-        .map_err(|e| format!("Query failed: {e}"))?;
-
-    for row in rows.flatten() {
-        let (id, role, content_json, citations_json, created_at) = row;
-        let content: String;
-        let mut attachments: Vec<String> = Vec::new();
-        let mut selection: Option<Value> = None;
-        let mut focus_document_id: Option<String> = None;
-        let mut versions: Option<Vec<String>> = None;
-        let mut active_version_index: Option<usize> = None;
-        let mut version_sources: Option<Vec<Value>> = None;
-        match serde_json::from_str::<serde_json::Value>(&content_json) {
-            Ok(v) => {
-                if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
-                    content = text.to_string();
-                } else if let Some(text) = v.as_str() {
-                    content = text.to_string();
-                } else {
-                    content = content_json.clone();
-                }
-                if let Some(arr) = v.get("attachments").and_then(|a| a.as_array()) {
-                    for item in arr {
-                        if let Some(s) = item.as_str() {
-                            attachments.push(s.to_string());
-                        }
-                    }
-                }
-                if let Some(sel) = v.get("selection") {
-                    if sel.is_object() {
-                        selection = Some(sel.clone());
-                    }
-                }
-                if let Some(fid) = v.get("focus_document_id").and_then(|x| x.as_str()) {
-                    focus_document_id = Some(fid.to_string());
-                }
-                if let Some(vers) = v.get("versions").and_then(|a| a.as_array()) {
-                    let list: Vec<String> = vers
-                        .iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect();
-                    if !list.is_empty() {
-                        versions = Some(list);
-                    }
-                }
-                if let Some(idx) = v.get("activeVersionIndex").and_then(|i| i.as_u64()) {
-                    active_version_index = Some(idx as usize);
-                }
-                if let Some(arr) = v.get("versionSources").and_then(|a| a.as_array()) {
-                    if let Some(idx) = active_version_index {
-                        if let Some(entry) = arr.get(idx) {
-                            if entry.is_array() {
-                                version_sources = Some(entry.as_array().cloned().unwrap_or_default());
-                            }
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                // Fallback: treat as plain text
-                content = content_json.clone();
-            }
-        }
-        let mut msg = serde_json::json!({ "id": id, "role": role, "content": content, "created_at": created_at });
-        if !attachments.is_empty() {
-            msg["attachments"] = serde_json::json!(attachments);
-        }
-        if let Some(sel) = selection {
-            msg["selection"] = sel;
-        }
-        if let Some(fid) = focus_document_id {
-            msg["focus_document_id"] = serde_json::json!(fid);
-        }
-        if let Some(vers) = versions {
-            msg["versions"] = serde_json::json!(vers);
-        }
-        if let Some(idx) = active_version_index {
-            msg["activeVersionIndex"] = serde_json::json!(idx);
-        }
-        if let Some(vs) = version_sources {
-            msg["sources"] = serde_json::json!(vs);
-        } else if let Some(raw) = citations_json {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    if v.is_array() {
-                        msg["sources"] = v;
-                    }
-                }
-            }
-        }
-        out.push(msg);
-    }
-
-    Ok(serde_json::json!({ "messages": out }))
 }
 
 #[tauri::command]

@@ -7,6 +7,7 @@ import { ChatWindow } from "./components/ChatWindow";
 import { SettingsModal, ThemeMode } from "./components/SettingsModal";
 import { FirstRunSetupModal } from "./components/FirstRunSetupModal";
 import { useSessions } from "./state/useSessions";
+import { ensureChatUiLoaded } from "./state/chatUiStore";
 import { engine } from "./api/engine";
 import { setTheme as setAppTheme } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -601,13 +602,26 @@ function App() {
     () => sortedSessions.filter((s) => !deletedChatIdSet.has(s.chat_id)),
     [sortedSessions, deletedChatIdSet]
   );
+  const warmChatUi = useCallback((chatId?: string | null) => {
+    if (!chatId) return;
+    void ensureChatUiLoaded(chatId);
+  }, []);
 
   // Pick the first session automatically when loaded.
   useEffect(() => {
     if (!loading && visibleSessions.length > 0 && !activeChat) {
-      setActiveChat(visibleSessions[0].chat_id);
+      const first = visibleSessions[0].chat_id;
+      warmChatUi(first);
+      setActiveChat(first);
     }
-  }, [visibleSessions, loading, activeChat]);
+  }, [visibleSessions, loading, activeChat, warmChatUi]);
+
+  useEffect(() => {
+    if (loading || visibleSessions.length === 0) return;
+    const warmIds = visibleSessions.slice(0, 3).map((s) => s.chat_id);
+    const timers = warmIds.map((chatId, idx) => window.setTimeout(() => warmChatUi(chatId), idx * 40));
+    return () => timers.forEach((id) => window.clearTimeout(id));
+  }, [visibleSessions, loading, warmChatUi]);
 
   useEffect(() => {
     notesRef.current = notes;
@@ -628,6 +642,7 @@ function App() {
 
   function focusChat(chatId: string) {
     if (!chatId) return;
+    warmChatUi(chatId);
     setActiveChat(chatId);
     setNotes((prev) => {
       const nextZ = (prev.reduce((m, n) => Math.max(m, n.z), 0) || 0) + 1;
@@ -813,6 +828,7 @@ function App() {
     removeSession(chatId);
     if (activeChat === chatId) {
       const remaining = visibleSessions.filter((s) => s.chat_id !== chatId);
+      warmChatUi(remaining.length ? remaining[0].chat_id : null);
       setActiveChat(remaining.length ? remaining[0].chat_id : null);
     }
     setNotes((prev) => prev.filter((n) => n.chatId !== chatId));
@@ -876,6 +892,7 @@ function App() {
 
     if (activeChat && ids.includes(activeChat)) {
       const remaining = visibleSessions.filter((s) => !ids.includes(s.chat_id));
+      warmChatUi(remaining.length ? remaining[0].chat_id : null);
       setActiveChat(remaining.length ? remaining[0].chat_id : null);
     }
     setNotes((prev) => prev.filter((n) => !ids.includes(n.chatId)));
@@ -938,6 +955,7 @@ function App() {
       if (typeof childId !== "string" || !childId) return;
 
       addLocalChat(childId);
+      warmChatUi(childId);
       setActiveChat(childId);
 
       if (typeof parentId === "string" && parentId) {
@@ -992,7 +1010,7 @@ function App() {
     }
     window.addEventListener("insight:open-card", onOpenCard as any);
     return () => window.removeEventListener("insight:open-card", onOpenCard as any);
-  }, [addLocalChat]);
+  }, [addLocalChat, warmChatUi]);
 
   return (
     <div className="app-root">
@@ -1006,6 +1024,7 @@ function App() {
             onFocusChat={focusChat}
             onUpdateNote={updateNote}
             onOpenChat={(chatId) => {
+              warmChatUi(chatId);
               setActiveChat(chatId);
               setOverlayChatId(chatId);
               setOverlayChatClosing(false);
@@ -1013,6 +1032,7 @@ function App() {
             }}
             onCreateChatAt={createChatCardAt}
             onOpenCard={(chatId) => {
+              warmChatUi(chatId);
               setActiveChat(chatId);
               setOverlayCardId(chatId);
               setOverlayCardClosing(false);
@@ -1136,6 +1156,7 @@ function App() {
                     sessions={visibleSessions}
                     loadingSessions={loading}
                     onOpenCard={(chatId) => {
+                      warmChatUi(chatId);
                       setActiveChat(chatId);
                       setOverlayCardId(chatId);
                       setOverlayCardClosing(false);

@@ -19,6 +19,7 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 _embedding_prefetch_started = False
+_sqlite_warmup_started = False
 
 _IPC_HEADER = "x-insight-ipc"
 _IPC_VALUE = "1"
@@ -181,6 +182,43 @@ def _prefetch_embedding_assets() -> None:
     threading.Thread(target=worker, name="insight-prefetch-embeddings", daemon=True).start()
 
 
+def _warmup_sqlite_store() -> None:
+    """Best-effort background warmup for SQLite + encryption key path."""
+
+    def worker() -> None:
+        start = time.time()
+        try:
+            from backend.api.deps import AppDependencies
+
+            store = AppDependencies.sqlite_store()
+            try:
+                store._connection.execute("SELECT 1").fetchone()
+            except Exception:
+                pass
+            elapsed_ms = (time.time() - start) * 1000.0
+            logger.info("SQLite warmup ready in %.1fms", elapsed_ms)
+            if _boot_trace_available:
+                try:
+                    log_boot_step("sqlite_warmup_done", status="OK", elapsed_ms=f"{elapsed_ms:.1f}")
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("SQLite warmup failed: %s", exc)
+            if _boot_trace_available:
+                try:
+                    from backend.services.boot_trace import log_boot_error
+
+                    log_boot_error("sqlite_warmup", exc)
+                except Exception:
+                    pass
+
+    global _sqlite_warmup_started
+    if _sqlite_warmup_started:
+        return
+    _sqlite_warmup_started = True
+    threading.Thread(target=worker, name="insight-warmup-sqlite", daemon=True).start()
+
+
 def create_app() -> FastAPI:
     if _boot_trace_available:
         try:
@@ -300,5 +338,8 @@ def create_app() -> FastAPI:
     #
     # To re-enable auto-download (not recommended), uncomment:
     # _prefetch_embedding_assets()
+
+    # Warm SQLite/encryption path in the background so first chat open is instant.
+    _warmup_sqlite_store()
 
     return app
