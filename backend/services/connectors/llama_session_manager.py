@@ -220,6 +220,10 @@ class LlamaSessionManager:
         self._model_policy = self._build_model_policy(self._model_family)
         self._force_system_into_user = bool(self._model_policy.get("force_system_into_user"))
         self._llm_timeout_sec = self._read_timeout_env("INSIGHT_LLM_TIMEOUT_SEC", self._DEFAULT_LLM_TIMEOUT_SEC)
+        # Dedicated flag for printing the fully assembled prompt in terminal.
+        # Avoid using INSIGHT_LOG_PROMPTS here because that flag is shared by
+        # raw-engine logging and can create noisy output.
+        self._log_full_prompt_terminal = self._read_bool_env("INSIGHT_LLM_LOG_FULL_PROMPT", False)
         self._strip_reasoning = bool(self._model_policy.get("strip_reasoning", True))
         self._reasoning_tags = list(self._model_policy.get("reasoning_tags") or list(_DEFAULT_REASONING_TAGS))
         try:
@@ -688,15 +692,17 @@ class LlamaSessionManager:
         Yields tokens from the "dirty" run (which includes ephemeral context pack),
         but commits only clean user + assistant text to persistent KV on completion.
         """
-        logger.info(
-            "ask_stream_with_context start chat=%s request_id=%s skip_user=%s user_chars=%d run_user_chars=%d ctx_chars=%d",
-            session_id,
-            request_id or "-",
-            bool(skip_user_message),
-            len(user_text or ""),
-            len(run_user_text or ""),
-            len(context_pack or ""),
-        )
+        verbose_trace = not bool(getattr(self, "_log_full_prompt_terminal", False))
+        if verbose_trace:
+            logger.info(
+                "ask_stream_with_context start chat=%s request_id=%s skip_user=%s user_chars=%d run_user_chars=%d ctx_chars=%d",
+                session_id,
+                request_id or "-",
+                bool(skip_user_message),
+                len(user_text or ""),
+                len(run_user_text or ""),
+                len(context_pack or ""),
+            )
         lock = self._locks.setdefault(session_id, threading.RLock())
         with lock:
             with self._sessions_lock:
@@ -776,6 +782,12 @@ class LlamaSessionManager:
                 run_messages.append({"role": "user", "content": run_user})
 
                 run_prompt = self._render_prompt(run_messages, add_generation_prompt=True)
+                if self._log_full_prompt_terminal:
+                    self._emit_full_prompt_event(
+                        session_id=session_id,
+                        request_id=request_id,
+                        prompt=run_prompt,
+                    )
                 run_tokens = self._tokenize_prompt(run_prompt)
                 if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
                     delta = run_tokens[len(clean_tokens) :]
@@ -818,16 +830,17 @@ class LlamaSessionManager:
                         available_total = int(self.ctx_size) - int(prompt_tokens) - int(margin)
                         if available_total > 0:
                             hard_total = min(int(max_tokens) * 2, 1024, int(available_total))
-                    logger.info(
-                        "ask_stream_with_context output_budget chat=%s request_id=%s prompt_tokens=%d requested=%d clamped=%d hard_total=%d ctx=%d",
-                        session_id,
-                        request_id or "-",
-                        prompt_tokens,
-                        requested_max_tokens,
-                        int(max_tokens),
-                        int(hard_total),
-                        int(self.ctx_size or 0),
-                    )
+                    if verbose_trace:
+                        logger.info(
+                            "ask_stream_with_context output_budget chat=%s request_id=%s prompt_tokens=%d requested=%d clamped=%d hard_total=%d ctx=%d",
+                            session_id,
+                            request_id or "-",
+                            prompt_tokens,
+                            requested_max_tokens,
+                            int(max_tokens),
+                            int(hard_total),
+                            int(self.ctx_size or 0),
+                        )
                     session["last_output_budget"] = int(hard_total)
                     session["last_reserved_output"] = int(max_tokens)
 
@@ -870,13 +883,19 @@ class LlamaSessionManager:
                             cancelled = True
                     if timeout_state.get("timed_out"):
                         cancelled = True
-                        logger.warning(
-                            "ask_stream_with_context timed out chat=%s request_id=%s",
-                            session_id,
-                            request_id or "-",
-                        )
+                        if verbose_trace:
+                            logger.warning(
+                                "ask_stream_with_context timed out chat=%s request_id=%s",
+                                session_id,
+                                request_id or "-",
+                            )
                     elif cancelled:
-                        logger.info("ask_stream_with_context cancelled chat=%s request_id=%s", session_id, request_id or "-")
+                        if verbose_trace:
+                            logger.info(
+                                "ask_stream_with_context cancelled chat=%s request_id=%s",
+                                session_id,
+                                request_id or "-",
+                            )
                     else:
                         logger.exception(
                             "ask_stream_with_context error chat=%s request_id=%s",
@@ -925,13 +944,14 @@ class LlamaSessionManager:
                 else:
                     session.pop("last_gen_tps", None)
                     session.pop("last_ttft_ms", None)
-                logger.info(
-                    "ask_stream_with_context llama done chat=%s request_id=%s tokens=%d cancelled=%s",
-                    session_id,
-                    request_id or "-",
-                    gen_tokens,
-                    cancelled,
-                )
+                if verbose_trace:
+                    logger.info(
+                        "ask_stream_with_context llama done chat=%s request_id=%s tokens=%d cancelled=%s",
+                        session_id,
+                        request_id or "-",
+                        gen_tokens,
+                        cancelled,
+                    )
                 try:
                     emit_event(
                         "llm_generation_done",
@@ -1000,6 +1020,32 @@ class LlamaSessionManager:
             return float(default)
         return float(val) if float(val) >= 0 else 0.0
 
+    @staticmethod
+    def _read_bool_env(key: str, default: bool) -> bool:
+        raw = os.environ.get(key)
+        if raw is None:
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _emit_full_prompt_event(
+        *,
+        session_id: str,
+        request_id: Optional[str],
+        prompt: str,
+    ) -> None:
+        try:
+            emit_event(
+                "llm_full_prompt",
+                chat_id=session_id,
+                request_id=request_id or "",
+                chars=len(prompt or ""),
+                prompt=prompt or "",
+            )
+        except Exception:
+            # Prompt logging must never break generation.
+            pass
+
     def _start_llm_timeout(self, timeout_sec: float) -> tuple[Optional[threading.Timer], Dict[str, bool], bool]:
         state = {"timed_out": False}
         if not timeout_sec or timeout_sec <= 0:
@@ -1035,14 +1081,11 @@ class LlamaSessionManager:
 
     def _format_context_pack(self, context_pack: str) -> str:
         # This is injected as a system message for a single generation only.
-        # Keep this string stable so tokenization/prefix-matching behaves predictably.
-        rules = (
-            "RULES:\n"
-            "- Answer ONLY using the text inside this CONTEXT PACK or the user-provided selection.\n"
-            "- If the answer is not explicitly supported by the provided text, say you don't know.\n"
-            "- Do not use outside knowledge or make assumptions.\n\n"
-        )
-        return "CONTEXT PACK (ephemeral; do not store in history):\n" + rules + (context_pack or "").strip()
+        # Keep this wrapper minimal; task policy belongs to the assembler payload.
+        body = (context_pack or "").strip()
+        if not body:
+            return ""
+        return "ASSEMBLED CONTEXT (ephemeral; do not store in history):\n" + body
 
     def _budget_context_pack(
         self,

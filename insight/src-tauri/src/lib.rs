@@ -10,10 +10,6 @@ use rusqlite::Connection;
 
 type SharedEngine = Arc<EngineProcess>;
 
-fn ipc_debug() -> bool {
-    std::env::var("INSIGHT_IPC_DEBUG").is_ok()
-}
-
 /// Get the workspace directory for the current build type.
 ///
 /// - Dev/debug builds: returns `<project_root>/storage`
@@ -35,10 +31,7 @@ fn get_workspace_dir() -> Result<PathBuf, String> {
 fn shutdown_engine(app: &tauri::AppHandle) {
     // Cleanup the file watcher if it exists
     if let Some(watcher_mutex) = app.try_state::<Mutex<notify::RecommendedWatcher>>() {
-        if let Ok(_watcher) = watcher_mutex.lock() {
-            // The watcher will be properly dropped when the mutex is released
-            eprintln!("[INFO] File watcher cleaned up");
-        }
+        drop(watcher_mutex.lock());
     }
 
     // Shutdown the engine process
@@ -77,10 +70,6 @@ async fn engine_request(
     payload: Option<Value>,
     state: tauri::State<'_, SharedEngine>,
 ) -> Result<EngineResponse, String> {
-    // Avoid spamming logs for the Settings busy poll endpoint.
-    if ipc_debug() && endpoint != "/settings/busy" {
-        eprintln!("[cmd] engine_request endpoint={endpoint}");
-    }
     let engine = state.inner().clone();
     let req = EngineRequest {
         request_id: None,
@@ -319,26 +308,14 @@ async fn engine_stream_request(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedEngine>,
 ) -> Result<(), String> {
-    if ipc_debug() {
-        eprintln!("[cmd] engine_stream_request request_id={request_id}");
-    }
     // Start streaming in the background and return immediately, otherwise the
     // WebView may not process emitted events until the command resolves.
     let engine = state.inner().clone();
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if ipc_debug() {
-            eprintln!("[cmd] stream thread start request_id={request_id}");
-        }
         let res = engine
             .stream(&request_id, "/chat", &payload, &app)
             .map_err(|e| format!("stream error: {}", e));
-        if ipc_debug() {
-            match &res {
-                Ok(_) => eprintln!("[cmd] stream thread done request_id={request_id} ok"),
-                Err(e) => eprintln!("[cmd] stream thread done request_id={request_id} err={e}"),
-            }
-        }
         res
     });
     Ok(())
@@ -349,9 +326,6 @@ fn engine_cancel_request(
     request_id: String,
     state: tauri::State<'_, SharedEngine>,
 ) -> Result<(), String> {
-    if ipc_debug() {
-        eprintln!("[cmd] engine_cancel_request request_id={request_id}");
-    }
     let engine = state.inner();
     engine.cancel(&request_id).map_err(|e| e.to_string())
 }
@@ -706,7 +680,6 @@ pub fn run() {
                     }
                 }
                 if let Some(sidecar_path) = resolved {
-                    eprintln!("[INFO] Using bundled engine: {}", sidecar_path.display());
                     EngineProcess::spawn_from_binary(&sidecar_path)
                         .map_err(|e| format!("Failed to spawn bundled engine ({}): {}", sidecar_path.display(), e))?
                 } else {
@@ -746,7 +719,6 @@ pub fn run() {
             if let Ok(watcher) = spawn_kv_watcher(app.app_handle().clone(), kv_dir.clone()) {
                 // Keep watcher alive in state
                 app.manage(Mutex::new(watcher));
-                eprintln!("[INFO] Watching KV sessions directory: {}", kv_dir.display());
             } else {
                 eprintln!("[WARNING] Failed to spawn KV sessions watcher");
             }

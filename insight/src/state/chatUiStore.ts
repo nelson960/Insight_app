@@ -68,8 +68,27 @@ type StreamIndexEntry = {
 const states = new Map<string, ChatUiState>();
 const listenersByChat = new Map<string, Set<() => void>>();
 const streamIndex = new Map<string, StreamIndexEntry>(); // request_id -> message info
+const pendingSourcesByRequest = new Map<string, Source[]>(); // (chat_id::request_id) -> pending sources
 
 let bridgeInit: Promise<void> | null = null;
+
+function requestKey(chatId: string, requestId: string): string {
+  return `${chatId}::${requestId}`;
+}
+
+function applyPendingSourcesInternal(chatId: string, requestId: string): boolean {
+  const key = requestKey(chatId, requestId);
+  const pending = pendingSourcesByRequest.get(key);
+  if (!pending || pending.length === 0) return false;
+  const s = ensureState(chatId);
+  const idx = s.messages.findIndex((m) => m.role === "assistant" && m.request_id === requestId);
+  if (idx < 0) return false;
+  const prev = s.messages[idx];
+  const next = { ...prev, sources: pending };
+  s.messages = [...s.messages.slice(0, idx), next, ...s.messages.slice(idx + 1)];
+  pendingSourcesByRequest.delete(key);
+  return true;
+}
 
 function ensureState(chatId: string): ChatUiState {
   const existing = states.get(chatId);
@@ -223,6 +242,7 @@ export function beginStreamTurn(opts: {
   s.activeRequestId = requestId;
   // No changes to beginStreamTurn, it behaves as before
   streamIndex.set(requestId, { chatId, userMessageId: userMsg.id, messageId: assistantMsgId });
+  applyPendingSourcesInternal(chatId, requestId);
   emit(chatId);
 }
 
@@ -254,6 +274,7 @@ export function beginAssistantGeneration(opts: {
   s.lastError = null;
   s.activeRequestId = requestId;
   streamIndex.set(requestId, { chatId, messageId: assistantMsgId });
+  applyPendingSourcesInternal(chatId, requestId);
   emit(chatId);
 }
 
@@ -264,6 +285,7 @@ export function cancelStreamTurn(chatId: string) {
   if (!rid) return;
   const entry = streamIndex.get(rid);
   if (entry) entry.cancelled = true;
+  pendingSourcesByRequest.delete(requestKey(chatId, rid));
   s.isStreaming = false;
   s.activeRequestId = null;
   emit(chatId);
@@ -283,6 +305,7 @@ export function rollbackStreamTurn(chatId: string, requestId: string) {
   if (s.activeRequestId === requestId) s.activeRequestId = null;
   s.isStreaming = false;
   streamIndex.delete(requestId);
+  pendingSourcesByRequest.delete(requestKey(chatId, requestId));
   emit(chatId);
 }
 
@@ -295,6 +318,8 @@ function appendTokenInternal(chatId: string, requestId: string, token: string) {
   if (idx < 0) return;
   const prev = s.messages[idx];
   const newContent = (prev.content || "") + token;
+  const pendingKey = requestKey(chatId, requestId);
+  const pending = pendingSourcesByRequest.get(pendingKey);
 
   // Update content and also the active version if it exists
   let versions = prev.versions;
@@ -303,8 +328,11 @@ function appendTokenInternal(chatId: string, requestId: string, token: string) {
     versions[prev.activeVersionIndex] = newContent;
   }
 
-  const next = { ...prev, content: newContent, versions };
+  const next = { ...prev, content: newContent, versions, sources: pending ?? prev.sources };
   s.messages = [...s.messages.slice(0, idx), next, ...s.messages.slice(idx + 1)];
+  if (pending && pending.length > 0) {
+    pendingSourcesByRequest.delete(pendingKey);
+  }
   emit(chatId);
 }
 
@@ -315,6 +343,7 @@ function endStreamInternal(chatId: string, requestId: string) {
   }
   s.isStreaming = false;
   streamIndex.delete(requestId);
+  pendingSourcesByRequest.delete(requestKey(chatId, requestId));
   emit(chatId);
 }
 
@@ -322,10 +351,14 @@ function attachSourcesInternal(chatId: string, requestId: string, sources: any[]
   if (!chatId || !requestId || !Array.isArray(sources) || sources.length === 0) return;
   const s = ensureState(chatId);
   const idx = s.messages.findIndex((m) => m.role === "assistant" && m.request_id === requestId);
-  if (idx < 0) return;
+  if (idx < 0) {
+    pendingSourcesByRequest.set(requestKey(chatId, requestId), sources as Source[]);
+    return;
+  }
   const prev = s.messages[idx];
   const next = { ...prev, sources };
   s.messages = [...s.messages.slice(0, idx), next, ...s.messages.slice(idx + 1)];
+  pendingSourcesByRequest.delete(requestKey(chatId, requestId));
   emit(chatId);
 }
 
@@ -589,6 +622,7 @@ export function prepareRegeneration(
   s.lastError = null;
   s.activeRequestId = requestId;
 
+  applyPendingSourcesInternal(chatId, requestId);
   emit(chatId);
 
   return { userMessage: userMsg, assistantMessageId };
@@ -617,6 +651,7 @@ export function rollbackRegenerationTurn(chatId: string, requestId: string) {
   if (s.activeRequestId === requestId) s.activeRequestId = null;
   s.isStreaming = false;
   streamIndex.delete(requestId);
+  pendingSourcesByRequest.delete(requestKey(chatId, requestId));
   emit(chatId);
 }
 

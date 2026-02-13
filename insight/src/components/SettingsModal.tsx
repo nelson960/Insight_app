@@ -9,7 +9,6 @@ type SettingsState = {
   llm_model_path: string;
   llm_gpu_layers: number;
   llm_ctx_size: number;
-  rag_default_mode: "small_doc" | "rag";
   rag_default_detail: number;
   raw_engine_host: string;
   raw_engine_port: number;
@@ -157,7 +156,6 @@ export function SettingsModal(props: {
     llm_model_path: "",
     llm_gpu_layers: 99,
     llm_ctx_size: 32768,
-    rag_default_mode: "small_doc",
     rag_default_detail: 3,
     raw_engine_host: "127.0.0.1",
     raw_engine_port: 11435,
@@ -177,7 +175,6 @@ export function SettingsModal(props: {
     llm_model_path: "",
     llm_gpu_layers: 99,
     llm_ctx_size: 32768,
-    rag_default_mode: "small_doc",
     rag_default_detail: 3,
     raw_engine_host: "127.0.0.1",
     raw_engine_port: 11435,
@@ -1516,36 +1513,6 @@ export function SettingsModal(props: {
           {activeTab === "retrieval" ? (
             <section className="settings-section">
               <h2 className="section-header">Retrieval</h2>
-            <div className="setting-item">
-              <div className="setting-info">
-                <div className="label">Document Mode</div>
-                <div className="description">Small‑Doc uses full text if fits else retrieval.</div>
-              </div>
-              <div className="setting-control">
-                <div className="segmented-control">
-                  <button
-                    className={`segment ${settings.rag_default_mode === "small_doc" ? "active" : ""}`}
-                    type="button"
-                    onClick={() => {
-                      setSettings((p) => ({ ...p, rag_default_mode: "small_doc" }));
-                      saveSettingsPatch({ rag_default_mode: "small_doc" });
-                    }}
-                  >
-                    Small‑Doc
-                  </button>
-                  <button
-                    className={`segment ${settings.rag_default_mode === "rag" ? "active" : ""}`}
-                    type="button"
-                    onClick={() => {
-                      setSettings((p) => ({ ...p, rag_default_mode: "rag" }));
-                      saveSettingsPatch({ rag_default_mode: "rag" });
-                    }}
-                  >
-                    RAG
-                  </button>
-                </div>
-              </div>
-            </div>
             <div className="setting-item stack">
               <div className="setting-info">
                 <div className="label">Detail ↔ Precision</div>

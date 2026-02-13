@@ -167,7 +167,6 @@ fn wait_for_engine_ready(stderr_log_path: &Path, timeout_secs: u64) -> Result<()
         if current_size > last_size || !file_ready_found {
             if let Ok(content) = fs::read_to_string(stderr_log_path) {
                 if content.contains("ASGI engine ready") || content.contains("startup_health_check") {
-                    eprintln!("[INFO] Engine ready in {:.1}s", elapsed.as_secs_f64());
                     return Ok(());
                 }
                 file_ready_found = true; // File exists, check it again
@@ -743,7 +742,6 @@ impl Drop for EngineProcess {
 
 fn spawn_stdout_router(mut stdout: BufReader<ChildStdout>, state: Arc<RouterState>) {
     std::thread::spawn(move || {
-        let debug = std::env::var("INSIGHT_IPC_DEBUG").is_ok();
         loop {
             let mut line = String::new();
             let read = match stdout.read_line(&mut line) {
@@ -796,6 +794,21 @@ fn spawn_stdout_router(mut stdout: BufReader<ChildStdout>, state: Arc<RouterStat
                         if let Err(e) = app.emit("llm_stream_end", parsed.clone()) {
                             eprintln!("[ERROR] Failed to emit llm_stream_end: {}", e);
                         }
+                    } else if name == "llm_full_prompt" {
+                        let chat_id = parsed
+                            .get("chat_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let request_id = parsed
+                            .get("request_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let chars = parsed.get("chars").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let prompt = parsed.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                        eprintln!(
+                            "\n[LLM FULL PROMPT] chat={} request_id={} chars={}\n{}\n[/LLM FULL PROMPT]\n",
+                            chat_id, request_id, chars, prompt
+                        );
                     } else if name == "chat_sources" {
                         if let Err(e) = app.emit("chat-sources", parsed.clone()) {
                             eprintln!("[ERROR] Failed to emit chat-sources: {}", e);
@@ -808,14 +821,6 @@ fn spawn_stdout_router(mut stdout: BufReader<ChildStdout>, state: Arc<RouterStat
                 .get("request_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-
-            if debug {
-                if let Some(rid) = &request_id {
-                    eprintln!("[ipc] stdout <- request_id={} bytes={} line={}", rid, read, trimmed);
-                } else {
-                    eprintln!("[ipc] stdout <- bytes={} line={}", read, trimmed);
-                }
-            }
 
             // Streaming messages
             if parsed.get("stream_start").is_some()
