@@ -83,25 +83,42 @@ def _cache_raw_large_plaintext(
     mime_type: str,
     workspace: Any,
 ) -> None:
-    text_cache = workspace.cache / f"{file_id}.txt"
-    if text_cache.exists():
+    from backend.services.security import KeyManager, encrypt_bytes
+
+    text_cache_enc = workspace.cache / f"{file_id}.txt.enc"
+    if text_cache_enc.exists():
         return
-    text_cache.parent.mkdir(parents=True, exist_ok=True)
+    text_cache_enc.parent.mkdir(parents=True, exist_ok=True)
     text_suffixes = {".txt", ".log", ".json", ".md", ".csv", ".tsv", ".yaml", ".yml"}
+    plain_text_bytes: bytes = b""
     if mime_type.startswith("text/") or source_path.suffix.lower() in text_suffixes:
         try:
-            text_cache.write_bytes(source_path.read_bytes())
-            return
+            plain_text_bytes = source_path.read_bytes()
         except Exception:
-            pass
-    try:
-        from backend.services.extraction import create_extraction_service
+            plain_text_bytes = b""
+    if not plain_text_bytes:
+        try:
+            from backend.services.extraction import create_extraction_service
 
-        service = create_extraction_service()
-        result = service.extract(source_path, mime_type=mime_type)
-        text_cache.write_text(result.text or "", encoding="utf-8", errors="ignore")
+            service = create_extraction_service()
+            result = service.extract(source_path, mime_type=mime_type)
+            plain_text_bytes = (result.text or "").encode("utf-8", errors="ignore")
+        except Exception as exc:
+            logger.info("raw_large plaintext cache failed file_id=%s err=%s", file_id, exc)
+            plain_text_bytes = b""
+    if not plain_text_bytes:
+        return
+    try:
+        key = KeyManager(workspace).get_key()
+        text_cache_enc.write_bytes(encrypt_bytes(key, plain_text_bytes))
+        legacy_plain = workspace.cache / f"{file_id}.txt"
+        if legacy_plain.exists():
+            try:
+                legacy_plain.unlink()
+            except Exception:
+                pass
     except Exception as exc:
-        logger.info("raw_large plaintext cache failed file_id=%s err=%s", file_id, exc)
+        logger.warning("raw_large encrypted cache write failed file_id=%s err=%s", file_id, exc)
 
 
 def _enforce_chat_upload_size_policy(
@@ -530,6 +547,7 @@ async def delete_file_from_chat(chat_id: str, file_id: str):
 
     if not remaining_chats:
         fully_deleted = True
+        workspace = AppDependencies.workspace()
         try:
             deleted_file_rows = store.delete_file_everywhere(file_id)
         except Exception:
@@ -550,6 +568,22 @@ async def delete_file_from_chat(chat_id: str, file_id: str):
                     deleted_encrypted_bytes = True
             except Exception as exc:
                 logger.warning("Failed to delete encrypted file bytes for %s: %s", file_id, exc)
+        # Remove cached plaintext/encrypted derivatives for this file.
+        try:
+            for p in workspace.cache.glob(f"{file_id}*"):
+                if p.exists() and p.is_file():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+            for p in workspace.cache.glob(f".rawtmp_{file_id}_*"):
+                if p.exists() and p.is_file():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     emit_event(
         "files_changed",

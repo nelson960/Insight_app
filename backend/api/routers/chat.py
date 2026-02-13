@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import threading
-import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Annotated
@@ -14,6 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from backend.services.planner.models import PlannerRequest
 from backend.api.deps import AppDependencies
+from backend.services.ipc_auth import require_ipc_token
 from backend.services.ipc_events import emit_event
 from pathlib import Path
 
@@ -188,11 +188,7 @@ def _enforce_rag_ready(payload: dict) -> None:
 
 
 def _ipc_token_required() -> Optional[str]:
-    token = os.getenv("INSIGHT_IPC_TOKEN")
-    if not token:
-        return None
-    token = token.strip()
-    return token or None
+    return require_ipc_token()
 
 
 @router.post("")

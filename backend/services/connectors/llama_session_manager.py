@@ -27,6 +27,8 @@ from backend.services.llama_templates import (
     validate_chat_template_for_llm,
 )
 from backend.services.ipc_events import emit_event
+from backend.services.security import KeyManager, decrypt_bytes, decrypt_text, encrypt_bytes, encrypt_text
+from backend.core.workspace import Workspace
 
 try:
     import numpy as np  # type: ignore
@@ -135,6 +137,8 @@ class LlamaSessionManager:
     _COMPACT_PCT = 0.70
     _SAFETY_MARGIN = 128
     _DEFAULT_LLM_TIMEOUT_SEC = 120.0
+    _DEFAULT_FULL_PROMPT_LOG_MAX_CHARS = 12000
+    _KV_ENC_MAGIC = b"IKV1"
     """
     Single-model, multi-session manager using llama_cpp KV snapshots.
 
@@ -154,6 +158,7 @@ class LlamaSessionManager:
         persist_dir: Optional[Path] = None,
         ltm_store=None,
         metadata_store: Optional[SQLiteMetadataStore] = None,
+        encryption_key: Optional[bytes] = None,
     ) -> None:
         model_path = Path(model_path)
         if not model_path.exists():
@@ -220,10 +225,22 @@ class LlamaSessionManager:
         self._model_policy = self._build_model_policy(self._model_family)
         self._force_system_into_user = bool(self._model_policy.get("force_system_into_user"))
         self._llm_timeout_sec = self._read_timeout_env("INSIGHT_LLM_TIMEOUT_SEC", self._DEFAULT_LLM_TIMEOUT_SEC)
+        self._unsafe_debug = self._read_bool_env("INSIGHT_UNSAFE_DEBUG", False)
         # Dedicated flag for printing the fully assembled prompt in terminal.
         # Avoid using INSIGHT_LOG_PROMPTS here because that flag is shared by
         # raw-engine logging and can create noisy output.
-        self._log_full_prompt_terminal = self._read_bool_env("INSIGHT_LLM_LOG_FULL_PROMPT", False)
+        requested_full_prompt_logging = self._read_bool_env("INSIGHT_LLM_LOG_FULL_PROMPT", False)
+        if requested_full_prompt_logging and not self._unsafe_debug:
+            logger.warning(
+                "INSIGHT_LLM_LOG_FULL_PROMPT ignored because INSIGHT_UNSAFE_DEBUG is not enabled."
+            )
+        self._log_full_prompt_terminal = bool(requested_full_prompt_logging and self._unsafe_debug)
+        self._log_full_prompt_max_chars = self._read_int_env(
+            "INSIGHT_LLM_LOG_FULL_PROMPT_MAX_CHARS",
+            self._DEFAULT_FULL_PROMPT_LOG_MAX_CHARS,
+            min_value=256,
+            max_value=200000,
+        )
         self._strip_reasoning = bool(self._model_policy.get("strip_reasoning", True))
         self._reasoning_tags = list(self._model_policy.get("reasoning_tags") or list(_DEFAULT_REASONING_TAGS))
         try:
@@ -260,6 +277,12 @@ class LlamaSessionManager:
         self._install_abort_callback()
 
         self.persist_dir = Path(persist_dir) if persist_dir else None
+        self._persist_encryption_key = encryption_key
+        if self._persist_encryption_key is None:
+            self._persist_encryption_key = self._load_persist_encryption_key()
+        if self._persist_encryption_key is not None and len(self._persist_encryption_key) not in {16, 24, 32}:
+            logger.warning("Invalid KV/session encryption key length; disabling encrypted session persistence.")
+            self._persist_encryption_key = None
         self._metadata_store = metadata_store
         self.ltm_store = ltm_store
         self._persist_queue: Optional[queue.Queue[Optional[str]]] = None
@@ -787,6 +810,7 @@ class LlamaSessionManager:
                         session_id=session_id,
                         request_id=request_id,
                         prompt=run_prompt,
+                        max_chars=int(self._log_full_prompt_max_chars),
                     )
                 run_tokens = self._tokenize_prompt(run_prompt)
                 if clean_tokens and run_tokens[: len(clean_tokens)] == clean_tokens:
@@ -1028,19 +1052,121 @@ class LlamaSessionManager:
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
+    def _read_int_env(key: str, default: int, *, min_value: int, max_value: int) -> int:
+        raw = os.environ.get(key)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        try:
+            val = int(raw)
+        except Exception:
+            return int(default)
+        return max(int(min_value), min(int(max_value), int(val)))
+
+    @staticmethod
+    def _redact_debug_prompt(prompt: str, *, max_chars: int) -> str:
+        text = str(prompt or "")
+        if not text:
+            return ""
+        # Redact common credential-like fields and hard-limit payload size in terminal logs.
+        patterns = (
+            r"(?i)(authorization\s*:\s*)([^\s]+)",
+            r"(?i)(x-insight-ipc-token\s*:\s*)([^\s]+)",
+            r"(?i)(api[_-]?key\s*[:=]\s*)([^\s]+)",
+            r"(?i)(password\s*[:=]\s*)([^\s]+)",
+            r"(?i)(secret\s*[:=]\s*)([^\s]+)",
+        )
+        for pat in patterns:
+            text = re.sub(pat, r"\1[REDACTED]", text)
+        if len(text) > int(max_chars):
+            text = text[: int(max_chars)].rstrip() + "\n...[truncated]"
+        return text
+
+    def _load_persist_encryption_key(self) -> Optional[bytes]:
+        if not self.persist_dir:
+            return None
+        try:
+            ws = Workspace(base_dir=self.persist_dir.parent)
+            return KeyManager(ws).get_key()
+        except Exception as exc:
+            logger.warning("Failed to initialize session persistence encryption key: %s", exc)
+            return None
+
+    @property
+    def _persist_encryption_active(self) -> bool:
+        return bool(self._persist_encryption_key)
+
+    def _encrypt_json_payload(self, value: object) -> str:
+        payload = json.dumps(value, ensure_ascii=False)
+        if not self._persist_encryption_active:
+            return payload
+        return encrypt_text(payload, key=self._persist_encryption_key)
+
+    def _decrypt_json_payload(self, payload: str) -> str:
+        if not isinstance(payload, str):
+            return ""
+        if not self._persist_encryption_active:
+            return payload
+        return decrypt_text(payload, key=self._persist_encryption_key)
+
+    def _write_json_payload(self, path: Path, value: object, *, tmp_suffix: str) -> None:
+        tmp = path.parent / f"{path.name}{tmp_suffix}"
+        tmp.write_text(self._encrypt_json_payload(value))
+        tmp.replace(path)
+
+    def _read_json_payload(self, path: Path, *, default: object) -> object:
+        if not path.exists():
+            return default
+        try:
+            raw = path.read_text()
+        except Exception:
+            return default
+        # First try direct JSON (legacy/plaintext), then encrypted JSON.
+        try:
+            return json.loads(raw) if raw else default
+        except Exception:
+            pass
+        dec = self._decrypt_json_payload(raw)
+        try:
+            return json.loads(dec) if dec else default
+        except Exception:
+            return default
+
+    def _encrypt_kv_blob(self, blob: bytes) -> bytes:
+        if not self._persist_encryption_active:
+            return bytes(blob)
+        return self._KV_ENC_MAGIC + encrypt_bytes(self._persist_encryption_key or b"", bytes(blob))
+
+    def _decrypt_kv_blob(self, blob: bytes, *, encrypted_hint: bool) -> bytes:
+        if not blob:
+            return b""
+        encrypted = bool(encrypted_hint or blob.startswith(self._KV_ENC_MAGIC))
+        if not encrypted:
+            return blob
+        if blob.startswith(self._KV_ENC_MAGIC):
+            blob = blob[len(self._KV_ENC_MAGIC) :]
+        if not self._persist_encryption_active:
+            return b""
+        try:
+            return decrypt_bytes(self._persist_encryption_key or b"", blob)
+        except Exception:
+            return b""
+
+    @staticmethod
     def _emit_full_prompt_event(
         *,
         session_id: str,
         request_id: Optional[str],
         prompt: str,
+        max_chars: int,
     ) -> None:
         try:
+            redacted = LlamaSessionManager._redact_debug_prompt(prompt, max_chars=max_chars)
             emit_event(
                 "llm_full_prompt",
                 chat_id=session_id,
                 request_id=request_id or "",
-                chars=len(prompt or ""),
-                prompt=prompt or "",
+                chars=len(redacted or ""),
+                prompt=redacted or "",
             )
         except Exception:
             # Prompt logging must never break generation.
@@ -1756,14 +1882,16 @@ class LlamaSessionManager:
                 messages: List[Dict[str, str]] = []
                 if msg_path.exists():
                     try:
-                        messages = json.loads(msg_path.read_text()) or []
+                        loaded = self._read_json_payload(msg_path, default=[])
+                        messages = loaded if isinstance(loaded, list) else []
                     except Exception:
                         messages = []
                 meta_path = self.persist_dir / f"{session_id}.meta.json"
                 meta: Dict[str, object] = {}
                 if meta_path.exists():
                     try:
-                        meta = json.loads(meta_path.read_text()) or {}
+                        loaded_meta = self._read_json_payload(meta_path, default={})
+                        meta = loaded_meta if isinstance(loaded_meta, dict) else {}
                     except Exception:
                         meta = {}
 
@@ -1776,25 +1904,30 @@ class LlamaSessionManager:
                     )
 
                 if is_new_format:
-                    llama_state = path.read_bytes()
+                    encrypted_hint = bool(meta.get("kv_encrypted"))
+                    raw_blob = path.read_bytes()
+                    llama_state = self._decrypt_kv_blob(raw_blob, encrypted_hint=encrypted_hint)
                     size = int(meta.get("llama_state_size") or len(llama_state) or 0)
-                    n_tokens = int(meta.get("n_tokens") or 0)
-                    seed = int(meta.get("seed") or 0)
-                    input_ids = meta.get("input_ids")
-                    # Convert list → numpy array when available (matches llama_cpp internals).
-                    if np is not None and isinstance(input_ids, list):
-                        try:
-                            input_ids = np.array(input_ids, dtype=np.int32)  # type: ignore[call-arg]
-                        except Exception:
-                            input_ids = None
-                    state_obj = {
-                        "_kind": self._STATE_KIND_COMPACT,
-                        "llama_state": llama_state[:size],
-                        "llama_state_size": size,
-                        "n_tokens": n_tokens,
-                        "input_ids": input_ids,
-                        "seed": seed,
-                    }
+                    if not llama_state or size <= 0:
+                        state_obj = None
+                    else:
+                        n_tokens = int(meta.get("n_tokens") or 0)
+                        seed = int(meta.get("seed") or 0)
+                        input_ids = meta.get("input_ids")
+                        # Convert list → numpy array when available (matches llama_cpp internals).
+                        if np is not None and isinstance(input_ids, list):
+                            try:
+                                input_ids = np.array(input_ids, dtype=np.int32)  # type: ignore[call-arg]
+                            except Exception:
+                                input_ids = None
+                        state_obj = {
+                            "_kind": self._STATE_KIND_COMPACT,
+                            "llama_state": llama_state[:size],
+                            "llama_state_size": size,
+                            "n_tokens": n_tokens,
+                            "input_ids": input_ids,
+                            "seed": seed,
+                        }
                 else:
                     # Legacy persisted KV is not loaded; force a rebuild from clean messages later.
                     state_obj = None
@@ -2022,8 +2155,9 @@ class LlamaSessionManager:
                 size = int(state_obj.get("llama_state_size") or len(llama_state) or 0)
                 if isinstance(llama_state, (bytes, bytearray)) and size > 0:
                     tmp = kv_path.with_suffix(".kv.tmp")
+                    kv_blob = self._encrypt_kv_blob(bytes(llama_state)[:size])
                     with tmp.open("wb") as f:
-                        f.write(bytes(llama_state)[:size])
+                        f.write(kv_blob)
                     tmp.replace(kv_path)
                     state_meta = {
                         "kv_format": self._KV_FILE_FORMAT,
@@ -2031,6 +2165,7 @@ class LlamaSessionManager:
                         "llama_state_size": size,
                         "n_tokens": int(state_obj.get("n_tokens") or 0),
                         "seed": int(state_obj.get("seed") or 0),
+                        "kv_encrypted": bool(self._persist_encryption_active),
                     }
                     # Store input_ids as JSON-friendly list (restored on load).
                     input_ids = state_obj.get("input_ids")
@@ -2046,17 +2181,13 @@ class LlamaSessionManager:
             logger.warning("Failed to persist KV for %s: %s", session_id, exc)
 
         try:
-            tmp = msg_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(messages or [], ensure_ascii=False))
-            tmp.replace(msg_path)
+            self._write_json_payload(msg_path, messages or [], tmp_suffix=".tmp")
         except Exception as exc:
             logger.warning("Failed to persist messages for %s: %s", session_id, exc)
 
         try:
             merged_meta = {**(meta or {}), **state_meta}
-            tmp = meta_path.parent / (meta_path.name + ".tmp")
-            tmp.write_text(json.dumps(merged_meta, ensure_ascii=False))
-            tmp.replace(meta_path)
+            self._write_json_payload(meta_path, merged_meta, tmp_suffix=".tmp")
         except Exception as exc:
             logger.warning("Failed to persist metadata for %s: %s", session_id, exc)
 
@@ -2659,6 +2790,12 @@ class LlamaSessionManager:
                     threading.Thread(
                         target=self.ltm_store.save_memories,
                         args=(session_id, [summary_text]),
+                        kwargs={
+                            "memory_type": "summary",
+                            "confidence": 0.45,
+                            "importance": 0.60,
+                            "metadata": {"origin": "compaction_summary", "compaction_tick": comp_tick},
+                        },
                         daemon=True,
                     ).start()
                 except Exception as exc:

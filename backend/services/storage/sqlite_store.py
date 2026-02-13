@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -11,12 +12,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from backend.core.workspace import Workspace
 from backend.services.ingestion.models import (
     ChunkIndexStatus,
     FileIngestionStatus,
     IngestionErrorCode,
 )
 from backend.services.ipc_events import emit_event
+from backend.services.security import KeyManager, decrypt_text, encrypt_text
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,13 @@ logger = logging.getLogger(__name__)
 class SQLiteConfig:
     journal_mode: str = "WAL"
     busy_timeout_ms: int = 5000
+    encrypt_text_at_rest: bool = str(os.environ.get("INSIGHT_ENCRYPT_TEXT_AT_REST", "1")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    text_encryption_key: Optional[bytes] = None
 
 
 def _now_iso() -> str:
@@ -70,12 +80,24 @@ class SQLiteMetadataStore:
         self._db_path = Path(db_path)
         self._config = config or SQLiteConfig()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._encrypt_text_at_rest = bool(getattr(self._config, "encrypt_text_at_rest", True))
+        self._text_encryption_key: Optional[bytes] = getattr(self._config, "text_encryption_key", None)
+        if self._encrypt_text_at_rest and self._text_encryption_key is None:
+            self._text_encryption_key = self._load_default_text_encryption_key()
+        if self._text_encryption_key is not None and len(self._text_encryption_key) not in {16, 24, 32}:
+            logger.warning("Invalid text encryption key length; disabling text-at-rest encryption.")
+            self._text_encryption_key = None
+        if self._encrypt_text_at_rest and self._text_encryption_key is None:
+            logger.warning("Text-at-rest encryption requested but key unavailable; using plaintext fallback.")
+        self._fts_enabled = False
         self._local = threading.local()
         self._conn_lock = threading.Lock()
         self._connections: set[sqlite3.Connection] = set()
         self._connection = _ThreadLocalConnectionProxy(self)
         self._lock = threading.Lock()
         self._initialize()
+        if self._text_encryption_active:
+            self._migrate_plaintext_text_columns()
         logger.info("SQLiteMetadataStore ready at %s", self._db_path)
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -92,6 +114,94 @@ class SQLiteMetadataStore:
             with self._conn_lock:
                 self._connections.add(conn)
         return conn
+
+    def _load_default_text_encryption_key(self) -> Optional[bytes]:
+        try:
+            ws = Workspace(base_dir=self._db_path.parent)
+            return KeyManager(ws).get_key()
+        except Exception as exc:
+            logger.warning("Failed to initialize text encryption key: %s", exc)
+            return None
+
+    @property
+    def _text_encryption_active(self) -> bool:
+        return bool(self._encrypt_text_at_rest and self._text_encryption_key)
+
+    def _encrypt_db_text(self, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        text = value if isinstance(value, str) else str(value)
+        if not self._text_encryption_active:
+            return text
+        return encrypt_text(text, key=self._text_encryption_key)
+
+    def _decrypt_db_text(self, value: Optional[str]) -> str:
+        if not isinstance(value, str):
+            return ""
+        if not value:
+            return ""
+        if not self._text_encryption_active:
+            return value
+        return decrypt_text(value, key=self._text_encryption_key)
+
+    def _migrate_plaintext_text_columns(self) -> None:
+        """
+        Best-effort in-place migration for legacy plaintext rows.
+
+        This runs at startup when text-at-rest encryption is enabled and rewrites
+        known user-content columns only when values are not already encrypted.
+        """
+        if not self._text_encryption_active:
+            return
+
+        conn = self._connection
+        migration_plan: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
+            ("messages", ("content_json", "planner_payload_json", "citations_json"), ("id",)),
+            ("file_text", ("blocks_json", "plain_text"), ("file_id",)),
+            ("chunks", ("text", "metadata"), ("id",)),
+            ("doc_pages", ("doc_json",), ("chat_id", "file_id")),
+            ("ltm_memories", ("text", "metadata_json"), ("id",)),
+        ]
+        migrated_cells = 0
+
+        for table, cols, key_cols in migration_plan:
+            try:
+                select_cols = ", ".join([*key_cols, *cols])
+                rows = conn.execute(f"SELECT {select_cols} FROM {table}").fetchall()
+            except Exception:
+                continue
+
+            for row in rows:
+                updates: dict[str, str] = {}
+                for col in cols:
+                    raw = row[col]
+                    if not isinstance(raw, str) or not raw:
+                        continue
+                    enc = self._encrypt_db_text(raw)
+                    if enc is None or enc == raw:
+                        continue
+                    updates[col] = enc
+                if not updates:
+                    continue
+                set_sql = ", ".join(f"{c}=?" for c in updates.keys())
+                where_sql = " AND ".join(f"{k}=?" for k in key_cols)
+                params = [updates[c] for c in updates.keys()]
+                params.extend([row[k] for k in key_cols])
+                try:
+                    conn.execute(
+                        f"UPDATE {table} SET {set_sql} WHERE {where_sql}",
+                        tuple(params),
+                    )
+                    migrated_cells += len(updates)
+                except Exception:
+                    continue
+
+        if migrated_cells > 0:
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            logger.info("Migrated %d plaintext SQLite cells to encrypted text-at-rest.", migrated_cells)
 
     # ------------------------------------------------------------------ #
     # Schema setup
@@ -270,7 +380,11 @@ class SQLiteMetadataStore:
 
         # Best-effort FTS index for chunks so the backend can do fast keyword search
         # without loading full documents (used for hybrid retrieval and agent loops).
-        self._ensure_chunks_fts()
+        if self._text_encryption_active:
+            self._fts_enabled = False
+            logger.info("FTS disabled because text-at-rest encryption is enabled.")
+        else:
+            self._ensure_chunks_fts()
 
     def _ensure_chunks_fts(self) -> None:
         """
@@ -342,11 +456,14 @@ class SQLiteMetadataStore:
                     """
                 )
             conn.commit()
+            self._fts_enabled = True
         except sqlite3.OperationalError as exc:
             # SQLite build likely lacks FTS5.
             logger.info("FTS disabled (chunks_fts unavailable): %s", exc)
+            self._fts_enabled = False
         except Exception as exc:
             logger.warning("Failed to initialize chunks_fts: %s", exc)
+            self._fts_enabled = False
 
     # ------------------------------------------------------------------ #
     # App settings (simple key/value JSON)
@@ -431,6 +548,9 @@ class SQLiteMetadataStore:
         citations_json: Optional[str],
         created_at: str,
     ) -> None:
+        enc_content_json = self._encrypt_db_text(content_json) or ""
+        enc_planner_payload_json = self._encrypt_db_text(planner_payload_json)
+        enc_citations_json = self._encrypt_db_text(citations_json)
         with self._lock:
             self._connection.execute(
                 """
@@ -442,11 +562,11 @@ class SQLiteMetadataStore:
                     message_id,
                     chat_id,
                     role,
-                    content_json,
+                    enc_content_json,
                     model,
                     mode,
-                    planner_payload_json,
-                    citations_json,
+                    enc_planner_payload_json,
+                    enc_citations_json,
                     created_at,
                 ),
             )
@@ -463,11 +583,11 @@ class SQLiteMetadataStore:
         return {
             "id": row["id"],
             "role": row["role"],
-            "content_json": row["content_json"],
+            "content_json": self._decrypt_db_text(row["content_json"]),
             "created_at": row["created_at"],
             "model": row["model"],
             "mode": row["mode"],
-            "citations_json": row["citations_json"],
+            "citations_json": self._decrypt_db_text(row["citations_json"]),
         }
 
     def get_message_with_chat(self, message_id: str) -> Optional[Dict[str, Any]]:
@@ -482,23 +602,25 @@ class SQLiteMetadataStore:
             "id": row["id"],
             "chat_id": row["chat_id"],
             "role": row["role"],
-            "content_json": row["content_json"],
+            "content_json": self._decrypt_db_text(row["content_json"]),
             "created_at": row["created_at"],
         }
 
     def update_message_content(self, message_id: str, content_json: str) -> None:
+        enc_content_json = self._encrypt_db_text(content_json) or ""
         with self._lock:
             self._connection.execute(
                 "UPDATE messages SET content_json=? WHERE id=?",
-                (content_json, message_id),
+                (enc_content_json, message_id),
             )
             self._connection.commit()
 
     def update_message_citations(self, message_id: str, citations_json: Optional[str]) -> None:
+        enc_citations_json = self._encrypt_db_text(citations_json)
         with self._lock:
             self._connection.execute(
                 "UPDATE messages SET citations_json=? WHERE id=?",
-                (citations_json, message_id),
+                (enc_citations_json, message_id),
             )
             self._connection.commit()
 
@@ -550,7 +672,7 @@ class SQLiteMetadataStore:
                 {
                     "id": row["id"],
                     "role": row["role"],
-                    "content": row["content_json"],
+                    "content": self._decrypt_db_text(row["content_json"]),
                     "created_at": row["created_at"],
                     "model": row["model"],
                     "mode": row["mode"],
@@ -565,16 +687,29 @@ class SQLiteMetadataStore:
         Returns a simplified list of {"role": ..., "content": ...} where content is extracted
         from content_json["text"] when possible.
         """
-        sql = """
-            SELECT role, content_json
-            FROM messages
-            WHERE chat_id=?
-            ORDER BY created_at ASC
-        """
-        params: list[object] = [chat_id]
+        params: list[object]
         if isinstance(limit, int) and limit > 0:
-            sql += " LIMIT ?"
-            params.append(limit)
+            # Keep chronological order for callers while limiting to the most recent rows.
+            sql = """
+                SELECT role, content_json
+                FROM (
+                    SELECT role, content_json, created_at
+                    FROM messages
+                    WHERE chat_id=?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                ) recent
+                ORDER BY created_at ASC
+            """
+            params = [chat_id, int(limit)]
+        else:
+            sql = """
+                SELECT role, content_json
+                FROM messages
+                WHERE chat_id=?
+                ORDER BY created_at ASC
+            """
+            params = [chat_id]
 
         with self._lock:
             cursor = self._connection.execute(sql, tuple(params))
@@ -582,7 +717,7 @@ class SQLiteMetadataStore:
         out: List[Dict[str, str]] = []
         for row in rows:
             role = (row["role"] or "user").strip()
-            content_json = row["content_json"] or ""
+            content_json = self._decrypt_db_text(row["content_json"])
             text = ""
             try:
                 v = json.loads(content_json) if content_json else {}
@@ -713,6 +848,8 @@ class SQLiteMetadataStore:
     def upsert_file_text(self, file_id: str, *, text: str, blocks: Sequence[dict]) -> None:
         now = _now_iso()
         blocks_json = json.dumps(list(blocks) if blocks else [])
+        enc_blocks_json = self._encrypt_db_text(blocks_json) or ""
+        enc_plain_text = self._encrypt_db_text(text or "") or ""
         with self._lock:
             filename = ""
             try:
@@ -730,7 +867,7 @@ class SQLiteMetadataStore:
                 INSERT OR REPLACE INTO file_text (file_id, blocks_json, plain_text, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (file_id, blocks_json, text or "", created_at, now),
+                (file_id, enc_blocks_json, enc_plain_text, created_at, now),
             )
             self._connection.commit()
             for chat_id in self.list_chat_ids_for_file(file_id):
@@ -760,15 +897,16 @@ class SQLiteMetadataStore:
         row = cursor.fetchone()
         if not row:
             return None
+        blocks_raw = self._decrypt_db_text(row["blocks_json"])
         blocks = []
         try:
-            blocks = json.loads(row["blocks_json"]) if row["blocks_json"] else []
+            blocks = json.loads(blocks_raw) if blocks_raw else []
         except Exception:
             blocks = []
         return {
             "file_id": row["file_id"],
             "blocks": blocks,
-            "plain_text": row["plain_text"] or "",
+            "plain_text": self._decrypt_db_text(row["plain_text"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -798,6 +936,8 @@ class SQLiteMetadataStore:
                 metadata_val = _get(chunk, "metadata", {}) or {}
                 tags_json = json.dumps(sorted(set(tags_val)))
                 metadata_json = json.dumps(metadata_val)
+                enc_chunk_text = self._encrypt_db_text(_get(chunk, "text")) or ""
+                enc_metadata_json = self._encrypt_db_text(metadata_json) or ""
                 created_at = None
                 created = _get(chunk, "created_at")
                 if created:
@@ -817,13 +957,13 @@ class SQLiteMetadataStore:
                         chunk_id,
                         file_id,
                         seq or 0,
-                        _get(chunk, "text"),
+                        enc_chunk_text,
                         _get(chunk, "user_id"),
                         _get(chunk, "chat_id"),
                         _get(chunk, "source"),
                         tags_json,
                         created_at or now,
-                        metadata_json,
+                        enc_metadata_json,
                         embedding_model,
                         embedding_version,
                         _get(chunk, "embedding_id"),
@@ -1008,14 +1148,21 @@ class SQLiteMetadataStore:
         rows = cursor.fetchall()
         results: list[dict[str, object]] = []
         for row in rows:
-            tags = json.loads(row["tags"]) if row["tags"] else []
-            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            try:
+                tags = json.loads(row["tags"]) if row["tags"] else []
+            except Exception:
+                tags = []
+            metadata_raw = self._decrypt_db_text(row["metadata"])
+            try:
+                metadata = json.loads(metadata_raw) if metadata_raw else {}
+            except Exception:
+                metadata = {}
             results.append(
                 {
                     "id": row["id"],
                     "file_id": row["file_id"],
                     "seq": row["seq"],
-                    "text": row["text"],
+                    "text": self._decrypt_db_text(row["text"]),
                     "user_id": row["user_id"],
                     "chat_id": row["chat_id"],
                     "source": row["source"],
@@ -1063,7 +1210,8 @@ class SQLiteMetadataStore:
         for row in rows:
             meta = {}
             try:
-                meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                metadata_raw = self._decrypt_db_text(row["metadata"])
+                meta = json.loads(metadata_raw) if metadata_raw else {}
             except Exception:
                 meta = {}
             out.append(
@@ -1071,7 +1219,7 @@ class SQLiteMetadataStore:
                     "id": row["id"],
                     "file_id": row["file_id"],
                     "seq": row["seq"],
-                    "text": row["text"],
+                    "text": self._decrypt_db_text(row["text"]),
                     "metadata": meta,
                     "filename": row["filename"],
                 }
@@ -1116,10 +1264,48 @@ class SQLiteMetadataStore:
         q = (query or "").strip()
         if not q:
             return []
+        limit = max(1, min(int(top_k or 50), 500))
+        terms = [t.lower() for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{1,80}", q)]
+        terms = terms[:8]
+        if not terms:
+            return []
+
+        if not self._fts_enabled:
+            # Security mode fallback: scan SQLite chunk text directly and score by
+            # keyword hits after decrypting rows in-process.
+            params: list[object] = []
+            sql = "SELECT id, file_id, text FROM chunks"
+            if isinstance(file_id, str) and file_id.strip():
+                sql += " WHERE file_id=?"
+                params.append(file_id.strip())
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(max(limit * 20, 500))
+            try:
+                cursor = self._connection.execute(sql, tuple(params))
+                rows = cursor.fetchall()
+            except Exception:
+                return []
+            scored: list[dict[str, object]] = []
+            for row in rows:
+                cid = row["id"]
+                fid = row["file_id"]
+                if not isinstance(cid, str) or not isinstance(fid, str):
+                    continue
+                text = self._decrypt_db_text(row["text"]).lower()
+                if not text:
+                    continue
+                score = 0.0
+                for term in terms:
+                    score += float(text.count(term))
+                if score <= 0:
+                    continue
+                scored.append({"chunk_id": cid, "file_id": fid, "score": -score})
+            scored.sort(key=lambda x: float(x.get("score") or 0.0))
+            return scored[:limit]
+
         match = self._to_fts_query(q)
         if not match:
             return []
-        limit = max(1, min(int(top_k or 50), 500))
 
         sql = """
             SELECT chunk_id, file_id, bm25(chunks_fts) AS score
@@ -1171,13 +1357,17 @@ class SQLiteMetadataStore:
             )
             rows = cursor.fetchall()
             for row in rows:
-                meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                metadata_raw = self._decrypt_db_text(row["metadata"])
+                try:
+                    meta = json.loads(metadata_raw) if metadata_raw else {}
+                except Exception:
+                    meta = {}
                 results[fid].append(
                     {
                         "chunk_id": row["id"],
                         "file_id": row["file_id"],
                         "seq": row["seq"],
-                        "text": row["text"],
+                        "text": self._decrypt_db_text(row["text"]),
                         "metadata": meta,
                         "created_at": row["created_at"],
                     }
@@ -1200,8 +1390,10 @@ class SQLiteMetadataStore:
         out: list[str] = []
         for row in rows:
             t = row["text"] if isinstance(row, sqlite3.Row) else row[0]
-            if isinstance(t, str) and t.strip():
-                out.append(t)
+            if isinstance(t, str):
+                dec = self._decrypt_db_text(t)
+                if dec.strip():
+                    out.append(dec)
         return out
 
     def bump_chunk_usage(self, _chunk_ids: Sequence[str], _weight: int = 1) -> None:  # pragma: no cover - usage accounting not required
@@ -1548,8 +1740,9 @@ class SQLiteMetadataStore:
         if not row:
             return None
         doc = None
+        doc_json_raw = self._decrypt_db_text(row["doc_json"])
         try:
-            doc = json.loads(row["doc_json"]) if row["doc_json"] else None
+            doc = json.loads(doc_json_raw) if doc_json_raw else None
         except Exception:
             doc = None
         return {
@@ -1557,7 +1750,7 @@ class SQLiteMetadataStore:
             "file_id": row["file_id"],
             "title": row["title"] or "",
             "doc": doc,
-            "doc_json": row["doc_json"] or "",
+            "doc_json": doc_json_raw,
             "is_user_edited": bool(row["is_user_edited"]) if row["is_user_edited"] is not None else False,
             "source_file_updated_at": row["source_file_updated_at"],
             "created_at": row["created_at"],
@@ -1576,6 +1769,7 @@ class SQLiteMetadataStore:
     ) -> None:
         now = _now_iso()
         doc_json = json.dumps(doc or {})
+        enc_doc_json = self._encrypt_db_text(doc_json) or ""
         with self._lock:
             cursor = self._connection.execute(
                 "SELECT created_at FROM doc_pages WHERE chat_id=? AND file_id=?",
@@ -1594,7 +1788,7 @@ class SQLiteMetadataStore:
                     chat_id,
                     file_id,
                     title or "",
-                    doc_json,
+                    enc_doc_json,
                     1 if is_user_edited else 0,
                     source_file_updated_at,
                     created_at,
@@ -1637,6 +1831,8 @@ class SQLiteMetadataStore:
         created_at = int(created_at if created_at is not None else time.time())
         updated_at = created_at
         metadata_json = json.dumps(metadata) if metadata else None
+        enc_text = self._encrypt_db_text(text) or ""
+        enc_metadata_json = self._encrypt_db_text(metadata_json)
         with self._lock:
             self._connection.execute(
                 """
@@ -1651,13 +1847,13 @@ class SQLiteMetadataStore:
                     chat_id,
                     user_id,
                     memory_type,
-                    text,
+                    enc_text,
                     embedding,
                     embedding_dim,
                     embedder_id,
                     confidence,
                     hash_value,
-                    metadata_json,
+                    enc_metadata_json,
                     created_at,
                     updated_at,
                 ),
@@ -1688,7 +1884,10 @@ class SQLiteMetadataStore:
         results: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
+            item["text"] = self._decrypt_db_text(item.get("text"))
             meta_raw = item.get("metadata_json")
+            meta_raw = self._decrypt_db_text(meta_raw) if isinstance(meta_raw, str) else None
+            item["metadata_json"] = meta_raw
             if meta_raw:
                 try:
                     item["metadata"] = json.loads(meta_raw)

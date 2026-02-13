@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import uuid
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +12,7 @@ from typing import Any, Dict, Iterable, Optional
 from backend.core.workspace import get_workspace
 from backend.services.planner.agent_tools import rg_search_in_file, read_raw_window
 from backend.services.extraction import create_extraction_service
-from backend.services.security import KeyManager, decrypt_bytes
+from backend.services.security import KeyManager, decrypt_bytes, encrypt_bytes
 from backend.services.storage.sqlite_store import SQLiteMetadataStore
 
 logger = logging.getLogger(__name__)
@@ -232,23 +234,82 @@ class RawLargeAgentLoop:
     def __init__(self, *, metadata_store: SQLiteMetadataStore) -> None:
         self._store = metadata_store
 
+    @staticmethod
+    def _tmp_plaintext_path(workspace: Any, file_id: str) -> Path:
+        return workspace.cache / f".rawtmp_{file_id}_{uuid.uuid4().hex}.txt"
+
+    @staticmethod
+    def _is_tmp_plaintext_path(path: Path) -> bool:
+        return isinstance(path, Path) and path.name.startswith(".rawtmp_")
+
+    def _write_temp_plaintext(self, *, workspace: Any, file_id: str, plaintext: bytes) -> Optional[Path]:
+        if not plaintext:
+            return None
+        try:
+            tmp = self._tmp_plaintext_path(workspace, file_id)
+            tmp.write_bytes(plaintext)
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            return tmp
+        except Exception:
+            return None
+
     def _resolve_plaintext_path(self, *, file_id: str, record: dict[str, Any]) -> Optional[Path]:
         """
-        Ensure a plaintext copy exists in the workspace cache (so rg can read it).
+        Resolve a temporary plaintext path for raw-large searching.
 
-        - Preferred: `storage/cache/{file_id}.txt` if available, else `{file_id}{suffix}`.
-        - Fallback: decrypt `stored_path` into cache on demand (best-effort).
+        At-rest cache is encrypted (`{file_id}.txt.enc`). Plaintext is materialized as
+        a short-lived temp file only for the active query.
         """
         filename = str(record.get("filename") or "")
         suffix = Path(filename).suffix or ".txt"
         workspace = get_workspace()
+        key = KeyManager(workspace).get_key()
         text_cache = workspace.cache / f"{file_id}.txt"
-        if _text_cache_is_fresh(text_cache, record):
-            return text_cache
+        text_cache_enc = workspace.cache / f"{file_id}.txt.enc"
         cache_path = workspace.cache / f"{file_id}{suffix}"
+
+        if _text_cache_is_fresh(text_cache_enc, record):
+            try:
+                encrypted = text_cache_enc.read_bytes()
+                plaintext = decrypt_bytes(key, encrypted)
+                tmp = self._write_temp_plaintext(workspace=workspace, file_id=file_id, plaintext=plaintext)
+                if tmp:
+                    return tmp
+            except Exception:
+                pass
+
+        if _text_cache_is_fresh(text_cache, record):
+            # Legacy plaintext cache (migrate on read).
+            try:
+                plaintext = text_cache.read_bytes()
+                text_cache_enc.write_bytes(encrypt_bytes(key, plaintext))
+                try:
+                    text_cache.unlink()
+                except Exception:
+                    pass
+                tmp = self._write_temp_plaintext(workspace=workspace, file_id=file_id, plaintext=plaintext)
+                if tmp:
+                    return tmp
+            except Exception:
+                pass
+
         if cache_path.exists() and _text_cache_is_fresh(cache_path, record):
-            # If we somehow cached plaintext under a suffix, prefer it as a fallback.
-            return cache_path if cache_path.suffix.lower() in {".txt", ".log", ".json", ".md", ".csv", ".tsv"} else text_cache
+            # Legacy plaintext cached under original suffix.
+            try:
+                plaintext = cache_path.read_bytes()
+                text_cache_enc.write_bytes(encrypt_bytes(key, plaintext))
+                try:
+                    cache_path.unlink()
+                except Exception:
+                    pass
+                tmp = self._write_temp_plaintext(workspace=workspace, file_id=file_id, plaintext=plaintext)
+                if tmp:
+                    return tmp
+            except Exception:
+                pass
 
         stored_path = str(record.get("stored_path") or "")
         is_encrypted_raw = record.get("is_encrypted")
@@ -265,8 +326,11 @@ class RawLargeAgentLoop:
             file_text = self._store.get_file_text(file_id)
             plain = (file_text or {}).get("plain_text") if isinstance(file_text, dict) else None
             if isinstance(plain, str) and plain.strip():
-                text_cache.write_text(plain, encoding="utf-8", errors="ignore")
-                return text_cache
+                plain_bytes = plain.encode("utf-8", errors="ignore")
+                text_cache_enc.write_bytes(encrypt_bytes(key, plain_bytes))
+                tmp = self._write_temp_plaintext(workspace=workspace, file_id=file_id, plaintext=plain_bytes)
+                if tmp:
+                    return tmp
         except Exception:
             pass
 
@@ -274,42 +338,50 @@ class RawLargeAgentLoop:
             return None
 
         source_path: Optional[Path] = None
-        if not is_encrypted:
-            p = Path(stored_path)
-            source_path = p if p.exists() else None
-        else:
+        plaintext_bytes: Optional[bytes] = None
+        if is_encrypted:
             try:
-                key = KeyManager(workspace).get_key()
                 encrypted = Path(stored_path).read_bytes()
-                plaintext = decrypt_bytes(key, encrypted)
-                cache_path.write_bytes(plaintext)
-                source_path = cache_path
+                plaintext_bytes = decrypt_bytes(key, encrypted)
             except Exception as exc:
                 logger.info("raw_large decrypt failed file_id=%s err=%s", file_id, exc)
-                source_path = None
+                plaintext_bytes = None
+        else:
+            p = Path(stored_path)
+            source_path = p if p.exists() else None
 
-        if source_path is None or not source_path.exists():
+        if plaintext_bytes is None and (source_path is None or not source_path.exists()):
             return None
 
-        # If the source is already plain text, cache it and return.
-        text_suffixes = {".txt", ".log", ".json", ".md", ".csv", ".tsv", ".yaml", ".yml"}
-        mime = str(record.get("mime") or "")
-        if mime.startswith("text/") or source_path.suffix.lower() in text_suffixes:
+        if plaintext_bytes is None and source_path is not None:
+            # If the source is already plain text, use bytes directly.
+            text_suffixes = {".txt", ".log", ".json", ".md", ".csv", ".tsv", ".yaml", ".yml"}
+            mime = str(record.get("mime") or "")
+            if mime.startswith("text/") or source_path.suffix.lower() in text_suffixes:
+                try:
+                    plaintext_bytes = source_path.read_bytes()
+                except Exception:
+                    plaintext_bytes = None
+
+        if plaintext_bytes is None and source_path is not None:
+            # Otherwise, extract to plaintext.
             try:
-                text_cache.write_bytes(source_path.read_bytes())
-                return text_cache
-            except Exception:
-                pass
+                mime = str(record.get("mime") or "")
+                service = create_extraction_service()
+                result = service.extract(source_path, mime_type=mime or None)
+                plaintext_bytes = (result.text or "").encode("utf-8", errors="ignore")
+            except Exception as exc:
+                logger.info("raw_large extract failed file_id=%s err=%s", file_id, exc)
+                plaintext_bytes = None
 
-        # Otherwise, extract to plaintext cache using the extractor pipeline.
-        try:
-            service = create_extraction_service()
-            result = service.extract(source_path, mime_type=mime or None)
-            text_cache.write_text(result.text or "", encoding="utf-8", errors="ignore")
-            return text_cache
-        except Exception as exc:
-            logger.info("raw_large extract failed file_id=%s err=%s", file_id, exc)
+        if not plaintext_bytes:
             return None
+
+        try:
+            text_cache_enc.write_bytes(encrypt_bytes(key, plaintext_bytes))
+        except Exception:
+            pass
+        return self._write_temp_plaintext(workspace=workspace, file_id=file_id, plaintext=plaintext_bytes)
 
     def build_evidence_hits(
         self,
@@ -327,6 +399,15 @@ class RawLargeAgentLoop:
         if not path:
             logger.warning("raw_large no plaintext path file_id=%s request_id=%s", file_id, request_id)
             return []
+        cleanup_tmp = self._is_tmp_plaintext_path(path)
+
+        def _finish(out: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            if cleanup_tmp:
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+            return out
 
         phrases, id_terms, keywords, terms = _extract_term_sets(query, limit=int(cfg.max_patterns))
         if not terms:
@@ -335,7 +416,7 @@ class RawLargeAgentLoop:
         terms = [t for t in terms if t]
         if not terms:
             logger.info("raw_large no searchable terms; using overview file_id=%s request_id=%s", file_id, request_id)
-            return _build_overview_hits(path=path, file_id=file_id, filename=filename, cfg=cfg)
+            return _finish(_build_overview_hits(path=path, file_id=file_id, filename=filename, cfg=cfg))
 
         all_hits: list[tuple[int, str]] = []  # (line, text)
         for term in terms[: max(1, int(cfg.max_patterns))]:
@@ -473,7 +554,7 @@ class RawLargeAgentLoop:
         hits_out = selected[: max(1, int(cfg.max_windows))]
         if not hits_out:
             logger.info("raw_large no hits; using overview file_id=%s request_id=%s", file_id, request_id)
-            return _build_overview_hits(path=path, file_id=file_id, filename=filename, cfg=cfg)
+            return _finish(_build_overview_hits(path=path, file_id=file_id, filename=filename, cfg=cfg))
         total_tokens = sum(_approx_tokens(h.get("text") or "") for h in hits_out)
         logger.debug(
             "raw_large windows query_len=%d file=%s terms=%d hits=%d windows=%d tokens=%d request_id=%s",
@@ -485,7 +566,7 @@ class RawLargeAgentLoop:
             total_tokens,
             request_id,
         )
-        return hits_out
+        return _finish(hits_out)
 
 
 def resolve_raw_large_plaintext_path(

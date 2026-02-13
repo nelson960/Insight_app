@@ -104,7 +104,16 @@ class AppDependencies:
                 if container._sqlite_store is None:
                     from backend.services.storage.sqlite_store import SQLiteConfig, create_sqlite_store
 
-                    container._sqlite_store = create_sqlite_store(cls.workspace().db, config=SQLiteConfig())
+                    key: bytes | None = None
+                    try:
+                        key = cls.key_manager().get_key()
+                    except Exception as exc:
+                        logger.warning("Failed to initialize SQLite text encryption key: %s", exc)
+                        key = None
+                    container._sqlite_store = create_sqlite_store(
+                        cls.workspace().db,
+                        config=SQLiteConfig(text_encryption_key=key),
+                    )
         return container._sqlite_store
 
     @classmethod
@@ -260,6 +269,12 @@ class AppDependencies:
                 gpu_layers = 99
 
             persist_dir = Path(cls.workspace().base) / "kv_sessions"
+            session_encryption_key: bytes | None = None
+            try:
+                session_encryption_key = cls.key_manager().get_key()
+            except Exception as exc:
+                logger.warning("Failed to initialize session persistence encryption key: %s", exc)
+                session_encryption_key = None
 
             try:
                 container._session_manager = LlamaSessionManager(
@@ -269,6 +284,7 @@ class AppDependencies:
                     persist_dir=persist_dir,
                     ltm_store=AppDependencies.ltm_store(),
                     metadata_store=sqlite_store,
+                    encryption_key=session_encryption_key,
                 )
                 if _boot_trace_available:
                     try:
@@ -311,7 +327,16 @@ class AppDependencies:
 
             try:
                 client = cls.vector_index().client  # reuse same Qdrant client to avoid lock conflicts
-                container._ltm_store = LtmQdrantStore(client=client, embedder=cls.query_embedder())
+                ltm_key: bytes | None = None
+                try:
+                    ltm_key = cls.key_manager().get_key()
+                except Exception:
+                    ltm_key = None
+                container._ltm_store = LtmQdrantStore(
+                    client=client,
+                    embedder=cls.query_embedder(),
+                    encryption_key=ltm_key,
+                )
             except Exception as exc:
                 logger.warning("Falling back to SQLite LTM store: %s", exc)
                 try:

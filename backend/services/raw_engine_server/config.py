@@ -136,6 +136,13 @@ class EngineConfig:
             host = "127.0.0.1"
         log_dir = Path(os.getenv("INSIGHT_LOG_DIR") or (Path.home() / ".insight" / "engine_logs"))
         embedding_path = cls._resolve_embedding_path()
+        unsafe_debug = _env_bool("INSIGHT_UNSAFE_DEBUG", False)
+        log_prompts = unsafe_debug and _env_bool("INSIGHT_LOG_PROMPTS", False)
+        log_completions = unsafe_debug and _env_bool("INSIGHT_LOG_COMPLETIONS", False)
+        if (not unsafe_debug) and (_env_bool("INSIGHT_LOG_PROMPTS", False) or _env_bool("INSIGHT_LOG_COMPLETIONS", False)):
+            logger.warning(
+                "Raw-engine prompt/completion logging requested but blocked because INSIGHT_UNSAFE_DEBUG is not enabled."
+            )
         return cls(
             host=host,
             port=int(os.getenv("INSIGHT_ENGINE_PORT", "11435")),
@@ -145,8 +152,8 @@ class EngineConfig:
             n_gpu_layers=_env_int("INSIGHT_ENGINE_GPU_LAYERS"),
             default_max_tokens=int(os.getenv("INSIGHT_ENGINE_MAX_TOKENS", "1024")),
             log_dir=log_dir,
-            log_prompts=_env_bool("INSIGHT_LOG_PROMPTS", False),
-            log_completions=_env_bool("INSIGHT_LOG_COMPLETIONS", False),
+            log_prompts=log_prompts,
+            log_completions=log_completions,
             log_preview_chars=int(os.getenv("INSIGHT_LOG_PREVIEW_CHARS", "400")),
             embedding_path=embedding_path,
             embedding_model=os.getenv("INSIGHT_ENGINE_EMBEDDING_MODEL", "nomic-embed-text-v1.5"),

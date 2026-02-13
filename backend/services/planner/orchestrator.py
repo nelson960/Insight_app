@@ -40,7 +40,8 @@ RAG_SECONDARY_K_TOTAL = 0
 SMALL_RAG_COVERAGE_SAMPLE_CHUNKS = 5
 RAG_SCORE_MIN_STRICT = float(os.environ.get("INSIGHT_RAG_SCORE_MIN_STRICT", "0.80"))
 RAG_SCORE_MIN_RELAXED = float(os.environ.get("INSIGHT_RAG_SCORE_MIN_RELAXED", "0.70"))
-LTM_SCORE_MIN = float(os.environ.get("INSIGHT_LTM_SCORE_MIN", "0.18"))
+LTM_TOPK_CHAT = max(1, int(os.environ.get("INSIGHT_LTM_TOPK_CHAT", "3")))
+LTM_TOPK_DOC = max(1, int(os.environ.get("INSIGHT_LTM_TOPK_DOC", "1")))
 
 RAG_DETAIL_MAP: dict[int, tuple[int, int]] = {
     1: (3, 0),
@@ -1634,30 +1635,17 @@ class InsightOrchestrator:
             has_selection_text=has_selection_text,
         )
 
-        if route in {"selection_rag", "rag", "raw_large"}:
-            ltm_k = 2 if has_selection_text else 5
-            ltm_query = (retrieval_query or "").strip()
-            if route == "selection_rag" and isinstance(selection_for_prompt, dict):
-                sel_text = selection_for_prompt.get("text")
-                if isinstance(sel_text, str) and sel_text.strip():
-                    ltm_query = (ltm_query + "\n" + sel_text.strip()[:1200]).strip()
+        if self._is_chitchat_query(user_message):
+            ltm_hits = []
+        else:
+            ltm_top_k = LTM_TOPK_DOC if route in {"rag", "selection_rag", "raw_large", "small_doc"} else LTM_TOPK_CHAT
+            ltm_query = ((retrieval_query or "").strip() if route != "chat" else (user_message or "").strip())
+            if not ltm_query:
+                ltm_query = (user_message or "").strip()
             try:
-                ltm_hits = []
-                for hit in self.ltm_store.retrieve(chat_id, ltm_query, top_k=ltm_k):
-                    text = getattr(hit, "text", None)
-                    if not isinstance(text, str) or not text.strip():
-                        continue
-                    try:
-                        score = float(getattr(hit, "score", 0.0) or 0.0)
-                    except Exception:
-                        score = 0.0
-                    if score < LTM_SCORE_MIN:
-                        continue
-                    ltm_hits.append(hit)
+                ltm_hits = self.ltm_store.retrieve(chat_id, ltm_query, top_k=ltm_top_k)
             except Exception:
                 ltm_hits = []
-        else:
-            ltm_hits = []
 
         logger.info(
             "Planner route chat=%s route=%s intent=%s doc_anchored=%s retrieval=%s small_doc=%s raw_large=%s rq_chars=%d request_id=%s",
@@ -1991,7 +1979,7 @@ class InsightOrchestrator:
             pass
 
         context_pack = ""
-        if route != "chat":
+        if route != "chat" or ltm_hits:
             if small_doc_mode and small_doc_pack:
                 small_doc_name = (
                     scope_files[0]
