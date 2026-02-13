@@ -3,3 +3,4 @@ fastapi
 httpx
 pyyaml
 qdrant-client
+cryptography
