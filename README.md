@@ -67,6 +67,8 @@ Insight is for people who need **private, explainable answers over local documen
 - Context hygiene: ephemeral CONTEXT PACK and ingestion gating
 - Artifact contract + effective runtime contract snapshots for reproducibility
 
+Core agent loop code: [Core Agent](https://github.com/nelson960/Insight_online)
+
 ## Documentation
 
 - [Docs index](docs/INDEX.md)
